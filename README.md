@@ -26,7 +26,7 @@ listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
 main.go                CLI declaration and wiring
 internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
 internal/codex/        Codex app route: command matching and the WebSocket relay
-test/                  end-to-end and real-OpenSSH tests
+test/                  all tests, black-box through the exported API; testdata/ holds the captured Codex commands
 ```
 
 ## Install
@@ -92,7 +92,7 @@ minimum.
 
 ## Refreshing the Codex fixtures
 
-`internal/codex/testdata/codex-app-proxy.txt` is the exec string the Codex app
+`test/testdata/codex-app-proxy.txt` is the exec string the Codex app
 sends to open the app-server proxy, captured from a real client.
 `codex-app-probe.txt`, `codex-app-version.txt`, `codex-app-bootstrap.txt` and
 `codex-app-kill.txt` next to it are the exec strings for the other payloads,
@@ -107,7 +107,7 @@ the app can reach over SSH with a real sshd:
    for example `ForceCommand sh -c 'printf "%s\n" "$SSH_ORIGINAL_COMMAND" >> ~/commands.log; exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"'`.
 2. Connect the app to that host and let it run through its probes until it
    starts the proxy session.
-3. Copy the proxy line into `internal/codex/testdata/codex-app-proxy.txt` and
+3. Copy the proxy line into `test/testdata/codex-app-proxy.txt` and
    the other lines into the four other files, or, if only the launcher
    changed, regenerate them by wrapping each payload in the new launcher
    (`codex-app-unknown.txt` is always regenerated this way). Then update the
@@ -119,17 +119,41 @@ the app can reach over SSH with a real sshd:
 gofmt -l .
 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
 go vet ./...
-go test -race ./...
+go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out | tail -1
 ```
 
-Unit tests sit next to their package: shell quoting, command parsing against
-the fixtures, and SSH request handling with a fake route. The integration
-tests in `test/` cover an SSH client driving the server end to end
-(port-forward request, version probe, refusals, and the proxy route relayed
-to an upstream that checks the bearer token) and, when an `ssh` binary is on
-`PATH`, the same flows through real OpenSSH with comlink as its
-`ProxyCommand`. CI runs the same commands and then builds the binary and runs
-`--help` and `--version`.
+All tests live in `test/`, one package with a file per subject, and use only
+the exported API: `internal/` has no tests and nothing is exported for
+testing. Most tests run an SSH client against `sshd.Serve` with the Codex
+route and look at what the client sees: stdout bytes, stderr, the exit status
+and the route's log.
+
+- `codex_test.go`: the Codex commands, from the fixtures and crafted. The
+  version probe, the acknowledged setup commands, refusals (exit 127 naming
+  the unwrapped payload), the `printf '%b'` marker written to stdout first,
+  how the launcher wrapper is split off, and which answer wins when a
+  payload matches several commands.
+- `relay_test.go`: the proxy route. Messages relayed to an upstream that
+  checks the bearer token, the `Authorization` header absent without a
+  token, exit 1 with a redacted log line when the upstream cannot be reached
+  or refuses the token, and the clean and unclean close cases on each side.
+- `sshd_test.go`: the server with a stand-in route. The exec handoff,
+  one exec per session, malformed requests, the port-forward replies, the
+  refused shell, pty, subsystem and channel types, and `StdioConn`.
+- `config_test.go`: the `ssh-config` block, its shell quoting, and that `sh`
+  splits the `ProxyCommand` line back into the original arguments.
+- `hostkey_test.go`: host key creation under concurrent first runs, the
+  state path, and the error cases.
+- `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe,
+  a refusal and the proxy relay through real OpenSSH with the built binary
+  as its `ProxyCommand`.
+
+Coverage is measured across the module from `test/` with `-coverpkg=./...`;
+CI fails when the total statement coverage is below 80%. `main.go` is only
+exercised through the OpenSSH tests, which run the built binary, so it does
+not count towards the profile. CI runs the same commands and then builds the
+binary and runs `--help` and `--version`.
 
 ## Tooling
 

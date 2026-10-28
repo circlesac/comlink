@@ -16,23 +16,6 @@ const (
 	kindProbe                 // command -v codex: acknowledged with exit 0
 )
 
-func (k kind) String() string {
-	switch k {
-	case kindProxy:
-		return "proxy"
-	case kindBootstrap:
-		return "bootstrap"
-	case kindKill:
-		return "kill"
-	case kindVersion:
-		return "version"
-	case kindProbe:
-		return "probe"
-	default:
-		return "unknown"
-	}
-}
-
 // command is a parsed exec request.
 type command struct {
 	Kind    kind

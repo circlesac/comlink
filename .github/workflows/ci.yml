@@ -19,7 +19,12 @@ jobs:
         with:
           version: v2.15.0
       - run: go vet ./...
-      - run: go test -race ./...
+      - run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+      - name: coverage is at least 80%
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub("%", "", $NF); print $NF }')
+          awk -v total="$total" 'BEGIN { exit !(total >= 80) }'
       - name: build and run the binary
         run: |
           go build -o comlink .
