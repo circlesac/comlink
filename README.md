@@ -1,3 +1,112 @@
 # comlink
 
-SSH front door that relays coding-agent clients to WebSocket agent endpoints. See [AGENTS.md](AGENTS.md).
+SSH front door that relays coding-agent clients to WebSocket agent endpoints.
+
+A client that only knows how to reach a remote machine over SSH (today the
+Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
+`ProxyCommand` starts `comlink`, which speaks the server side of SSH on its
+own stdin/stdout, answers the few shell commands the client sends and relays
+the agent session to a WebSocket endpoint. There is no sshd, no shell and no
+listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
+
+## Boundaries
+
+- comlink does not implement any agent protocol. It recognises the command
+  that opens an agent session and moves WebSocket messages between the SSH
+  channel and the upstream endpoint. The protocol lives in the endpoint.
+- Each supported client is a route. The Codex app is the first route.
+- Commands are matched against what the client actually sends; nothing is
+  ever executed. An unrecognised command is logged to stderr and exits 127.
+- The upstream token is a secret: it is read from a file or the environment
+  and never printed, logged or placed in an error.
+
+## Install
+
+```sh
+go install github.com/circlesac/comlink@latest
+```
+
+or build from a checkout:
+
+```sh
+go build -o comlink .
+```
+
+## Setup
+
+Put the upstream bearer token in a file only you can read, then print the
+ssh config block and append it to `~/.ssh/config`:
+
+```sh
+mkdir -p ~/.config/comlink
+(umask 077; printf '%s' "$TOKEN" > ~/.config/comlink/token)
+comlink ssh-config --alias example-agent \
+  --upstream wss://agent.example.com/codex \
+  --token-file ~/.config/comlink/token >> ~/.ssh/config
+```
+
+The block looks like this (the token file is referenced by path only):
+
+```
+Host example-agent
+  User comlink
+  ProxyCommand /usr/local/bin/comlink stdio --upstream wss://agent.example.com/codex --token-file /home/alice/.config/comlink/token
+  StrictHostKeyChecking accept-new
+```
+
+Then add `example-agent` as an SSH connection in the Codex app. Without
+`--token-file`, `comlink stdio` reads the token from `$COMLINK_TOKEN`; with
+neither, the upstream is dialled without an `Authorization` header.
+
+Check the alias by hand:
+
+```sh
+ssh example-agent codex --version
+```
+
+`comlink stdio` generates an ed25519 host key on first run and keeps it at
+`$XDG_STATE_HOME/comlink/host_ed25519` (default
+`~/.local/state/comlink/host_ed25519`) so `StrictHostKeyChecking accept-new`
+pins a stable key. `--report-version` sets the Codex version reported to
+`codex --version` (default `0.165.0`); the app refuses versions below its
+minimum.
+
+## Refreshing `testdata/`
+
+`testdata/codex-app-proxy.txt` is the exec string the Codex app sends to open
+the app-server proxy, captured from a real client. The tests parse it and run
+the relay against it. When the app changes, record it again from a machine the
+app can reach over SSH with a real sshd:
+
+1. Add a `ForceCommand` wrapper to the sshd `Match` block for the recording
+   user that appends `$SSH_ORIGINAL_COMMAND` to a file, one command per line,
+   for example `ForceCommand sh -c 'printf "%s\n" "$SSH_ORIGINAL_COMMAND" >> ~/commands.log; exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"'`.
+2. Connect the app to that host and let it run through its probes until it
+   starts the proxy session.
+3. Copy the proxy line into `testdata/codex-app-proxy.txt` and the other
+   payloads into `command_test.go`, then update the contract in `AGENTS.md`.
+
+## Tests
+
+```sh
+gofmt -l .
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
+go vet ./...
+go test -race ./...
+```
+
+The suite covers command parsing against the fixture, an SSH client driving
+the server end to end (port-forward request, version probe, refusals, and the
+proxy route relayed to an upstream that checks the bearer token) and, when an
+`ssh` binary is on `PATH`, the same flows through real OpenSSH with comlink
+as its `ProxyCommand`. CI runs the same commands and then builds the binary
+and runs `--help` and `--version`.
+
+## Tooling
+
+| Package | Version | Release date | Deciding criterion |
+| --- | --- | --- | --- |
+| `github.com/alecthomas/kong` | v1.16.1 | 2026-08-09 | Chosen over urfave/cli v3 and cobra: the command is a typed struct declaration and help, usage and `--version` are generated from it; its only module requirements are test-only. |
+| `golang.org/x/crypto/ssh` | v0.58.0 | 2026-10-09 | The SSH server implementation; the maintained Go SSH library. |
+| `github.com/coder/websocket` | v1.8.15 | 2026-06-15 | Chosen over gorilla/websocket, whose last release (v1.5.3) is 2024-06-14, more than twelve months ago. |
+| `golangci-lint` | v2.15.0 | 2026-10-16 | Linter in the test gate with the default linter set and `gofmt`. |
