@@ -1,6 +1,7 @@
 package test
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,8 +12,18 @@ import (
 	"github.com/circlesac/comlink/internal/sshd"
 )
 
+// configBlock is sshd.ConfigBlock for an alias that must be accepted.
+func configBlock(t *testing.T, alias, exe, upstream, tokenFile string) string {
+	t.Helper()
+	block, err := sshd.ConfigBlock(alias, exe, upstream, tokenFile)
+	if err != nil {
+		t.Fatalf("ConfigBlock(%q): %v", alias, err)
+	}
+	return block
+}
+
 func TestConfigBlock(t *testing.T) {
-	got := sshd.ConfigBlock("example-agent", "/opt/com link/comlink", "wss://agent.example.com/codex?a=%20", "/home/u/token")
+	got := configBlock(t, "example-agent", "/opt/com link/comlink", "wss://agent.example.com/codex?a=%20", "/home/u/token")
 	want := "Host example-agent\n" +
 		"  User comlink\n" +
 		"  ProxyCommand '/opt/com link/comlink' stdio --upstream 'wss://agent.example.com/codex?a=%%20' --token-file /home/u/token\n" +
@@ -21,8 +32,30 @@ func TestConfigBlock(t *testing.T) {
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
 	}
-	if strings.Contains(sshd.ConfigBlock("a", "/x/comlink", "wss://h/", ""), "--token-file") {
+	if strings.Contains(configBlock(t, "a", "/x/comlink", "wss://h/", ""), "--token-file") {
 		t.Fatal("token-file flag printed without a token file")
+	}
+}
+
+// TestConfigBlockAlias: the alias is a Host pattern and part of the
+// HostKeyAlias, so only letters, digits, '-', '_' and '.' are accepted and
+// anything else is refused before a block is produced.
+func TestConfigBlockAlias(t *testing.T) {
+	for _, alias := range []string{"example-agent", "a", "Agent_2", "agent.example.com", "0-9_.-"} {
+		block := configBlock(t, alias, "/x/comlink", "wss://h/", "")
+		if !strings.HasPrefix(block, "Host "+alias+"\n") || !strings.Contains(block, "\n  HostKeyAlias comlink-"+alias+"\n") {
+			t.Errorf("alias %q: block\n%s", alias, block)
+		}
+	}
+	for _, alias := range []string{"", "two words", "agent\nHost *", "agent\r", "*", "agent?", "!agent", "agent,other", "tab\there", "agent/x", "ägent", `"agent"`} {
+		block, err := sshd.ConfigBlock(alias, "/x/comlink", "wss://h/", "")
+		if err == nil || block != "" {
+			t.Errorf("alias %q accepted: %q, %v", alias, block, err)
+			continue
+		}
+		if want := fmt.Sprintf("invalid alias %q: use only letters, digits, '-', '_' and '.'", alias); err.Error() != want {
+			t.Errorf("alias %q: error %q, want %q", alias, err, want)
+		}
 	}
 }
 
@@ -59,7 +92,7 @@ func TestConfigBlockQuotesArguments(t *testing.T) {
 		{"a;b", "'a;b'"},
 	}
 	for _, tc := range cases {
-		block := sshd.ConfigBlock("a", "/x/comlink", tc.in, "")
+		block := configBlock(t, "a", "/x/comlink", tc.in, "")
 		if want := "\n  ProxyCommand /x/comlink stdio --upstream " + tc.want + "\n"; !strings.Contains(block, want) {
 			t.Errorf("upstream %q: block\n%s\nwant %q", tc.in, block, want)
 		}
@@ -82,7 +115,7 @@ func TestConfigBlockProxyCommandSplitsBack(t *testing.T) {
 	}
 	upstream := `wss://agent.example.com/codex?a=%20&b=$HOME&c='quoted'`
 	tokenFile := `/home/u/50% dir/back\slash/token`
-	line := proxyCommand(t, sshd.ConfigBlock("example-agent", exe, upstream, tokenFile))
+	line := proxyCommand(t, configBlock(t, "example-agent", exe, upstream, tokenFile))
 	line = strings.ReplaceAll(line, "%%", "%") // ssh's token expansion
 
 	out, err := exec.Command("sh", "-c", line).Output()

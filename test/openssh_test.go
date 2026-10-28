@@ -3,11 +3,13 @@ package test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +53,102 @@ func opensshCommand(t *testing.T, bin, upstream, tokenFile, command string) *exe
 
 // quote single-quotes s for the shell ssh runs the ProxyCommand with.
 func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// TestBinaryStartupChecks runs the built binary directly. In stdio mode
+// stdin is empty, so it gets as far as the SSH handshake and stops there;
+// what it prints on stderr before that is the startup behaviour: a warning
+// for a token file others can read, and a clear failure when there is no
+// place for the host key. ssh-config refuses a bad alias before printing.
+func TestBinaryStartupChecks(t *testing.T) {
+	bin := buildComlink(t)
+	stdio := func(t *testing.T, dir string, env []string, tokenFile string) (stderr string, err error) {
+		t.Helper()
+		cmd := exec.Command(bin, "stdio", "--upstream", "ws://127.0.0.1:1/rpc", "--token-file", tokenFile)
+		cmd.Env = append(os.Environ(), env...)
+		cmd.Dir = dir
+		var errBuf bytes.Buffer
+		cmd.Stderr = &errBuf
+		err = cmd.Run() // stdin is empty: the handshake fails after startup
+		if strings.Contains(errBuf.String(), testToken) {
+			t.Fatal("stderr contains the token")
+		}
+		return errBuf.String(), err
+	}
+	warning := func(path string) string {
+		return "comlink: warning: token file " + path + " is readable by group or others; restrict it with chmod 600\n"
+	}
+
+	for _, mode := range []os.FileMode{0o644, 0o640, 0o604} {
+		t.Run(fmt.Sprintf("token file %04o", mode), func(t *testing.T) {
+			path := writeTokenFile(t, mode)
+			stderr, _ := stdio(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
+			if strings.Count(stderr, warning(path)) != 1 {
+				t.Fatalf("stderr %q, want one line %q", stderr, warning(path))
+			}
+			if !strings.Contains(stderr, "ssh handshake") {
+				t.Fatalf("stderr %q: comlink did not continue past the warning", stderr)
+			}
+		})
+	}
+	t.Run("token file 0600", func(t *testing.T) {
+		path := writeTokenFile(t, 0o600)
+		stderr, _ := stdio(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
+		if strings.Contains(stderr, "warning") {
+			t.Fatalf("stderr %q warns about a private token file", stderr)
+		}
+		if !strings.Contains(stderr, "ssh handshake") {
+			t.Fatalf("stderr %q: comlink did not reach the handshake", stderr)
+		}
+	})
+	t.Run("missing token file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "absent")
+		stderr, err := stdio(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
+		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() == 0 {
+			t.Fatalf("comlink stdio: %v, want a non-zero exit", err)
+		}
+		if !strings.Contains(stderr, "comlink: error: read token file: ") {
+			t.Fatalf("stderr %q, want the token file error", stderr)
+		}
+	})
+	t.Run("no home directory", func(t *testing.T) {
+		if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+			t.Skip("os.UserHomeDir reads $HOME only on darwin and linux")
+		}
+		dir := t.TempDir()
+		stderr, err := stdio(t, dir, []string{"HOME=", "XDG_STATE_HOME="}, writeTokenFile(t, 0o600))
+		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() == 0 {
+			t.Fatalf("comlink stdio: %v, want a non-zero exit", err)
+		}
+		if want := "comlink: error: locate host key: XDG_STATE_HOME is unset and the home directory is unknown: "; !strings.Contains(stderr, want) {
+			t.Fatalf("stderr %q, want %q", stderr, want)
+		}
+		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+			t.Fatalf("working directory holds %v (%v), want nothing created there", entries, err)
+		}
+	})
+	t.Run("ssh-config alias", func(t *testing.T) {
+		sshConfig := func(alias string) (stdout, stderr string, err error) {
+			cmd := exec.Command(bin, "ssh-config", "--alias", alias, "--upstream", "wss://agent.example.com/codex")
+			var outBuf, errBuf bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
+			err = cmd.Run()
+			return outBuf.String(), errBuf.String(), err
+		}
+		if stdout, stderr, err := sshConfig("example-agent"); err != nil || !strings.HasPrefix(stdout, "Host example-agent\n") {
+			t.Fatalf("valid alias: %v, stdout %q, stderr %q", err, stdout, stderr)
+		}
+		stdout, stderr, err := sshConfig("agent\nHost *")
+		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() == 0 {
+			t.Fatalf("invalid alias: %v, want a non-zero exit", err)
+		}
+		if stdout != "" {
+			t.Fatalf("invalid alias printed %q", stdout)
+		}
+		if want := `comlink: error: invalid alias "agent\nHost *": use only letters, digits, '-', '_' and '.'`; !strings.Contains(stderr, want) {
+			t.Fatalf("stderr %q, want %q", stderr, want)
+		}
+	})
+}
 
 func TestOpenSSHVersionProbe(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
@@ -157,4 +255,17 @@ func TestOpenSSHProxyRelay(t *testing.T) {
 	if strings.Contains(stderr.String(), testToken) {
 		t.Fatal("ssh stderr contains the token")
 	}
+}
+
+// writeTokenFile writes the test token to a file with the given mode.
+func writeTokenFile(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte(testToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

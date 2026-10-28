@@ -25,7 +25,7 @@ listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
 ```
 main.go                CLI declaration and wiring
 internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
-internal/codex/        Codex app route: command matching and the WebSocket relay
+internal/codex/        Codex app route: command matching, the WebSocket relay and the upstream token
 test/                  all tests, black-box through the exported API; testdata/ holds the captured Codex commands
 ```
 
@@ -71,9 +71,15 @@ Host example-agent
   StrictHostKeyChecking accept-new
 ```
 
+The alias may contain only letters, digits, `-`, `_` and `.`; `ssh-config`
+refuses anything else (spaces, newlines, the ssh patterns `*`, `?` and `!`)
+with a non-zero exit and prints nothing.
+
 Then add `example-agent` as an SSH connection in the Codex app. Without
 `--token-file`, `comlink stdio` reads the token from `$COMLINK_TOKEN`; with
-neither, the upstream is dialled without an `Authorization` header.
+neither, the upstream is dialled without an `Authorization` header. A token
+file that group or others can read is still used, but `comlink stdio` prints
+a one-line warning naming the file (never the token) to stderr.
 
 Check the alias by hand:
 
@@ -84,11 +90,13 @@ ssh example-agent codex --version
 `comlink stdio` generates an ed25519 host key on first run and keeps it at
 `$XDG_STATE_HOME/comlink/host_ed25519` (default
 `~/.local/state/comlink/host_ed25519`) so `StrictHostKeyChecking accept-new`
-pins a stable key. The block's `HostKeyAlias comlink-<alias>` stores that key
-in `known_hosts` under its own name, so it never collides with a real host
-called `<alias>`. `--report-version` sets the Codex version reported to
-`codex --version` (default `0.165.0`); the app refuses versions below its
-minimum.
+pins a stable key. When `XDG_STATE_HOME` is unset and the home directory
+cannot be determined, `comlink stdio` exits non-zero instead of keeping the
+key in the current directory. The block's `HostKeyAlias comlink-<alias>`
+stores that key in `known_hosts` under its own name, so it never collides
+with a real host called `<alias>`. `--report-version` sets the Codex version
+reported to `codex --version` (default `0.165.0`); the app refuses versions
+below its minimum.
 
 ## Refreshing the Codex fixtures
 
@@ -137,23 +145,30 @@ and the route's log.
 - `relay_test.go`: the proxy route. Messages relayed to an upstream that
   checks the bearer token, the `Authorization` header absent without a
   token, exit 1 with a redacted log line when the upstream cannot be reached
-  or refuses the token, and the clean and unclean close cases on each side.
+  or refuses the token, the clean and unclean close cases on each side
+  (1001 to the upstream when the client goes away without a close frame),
+  and a write blocked on a client that stopped reading being released when
+  the client's connection closes.
 - `sshd_test.go`: the server with a stand-in route. The exec handoff,
   one exec per session, malformed requests, the port-forward replies, the
   refused shell, pty, subsystem and channel types, and `StdioConn`.
-- `config_test.go`: the `ssh-config` block, its shell quoting, and that `sh`
-  splits the `ProxyCommand` line back into the original arguments.
+- `config_test.go`: the `ssh-config` block, its shell quoting, that `sh`
+  splits the `ProxyCommand` line back into the original arguments, and the
+  accepted and refused aliases.
 - `hostkey_test.go`: host key creation under concurrent first runs, the
-  state path, and the error cases.
+  state path (an error without `XDG_STATE_HOME` or a home directory), and
+  the error cases.
 - `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe,
   a refusal and the proxy relay through real OpenSSH with the built binary
-  as its `ProxyCommand`.
+  as its `ProxyCommand`; and the built binary run directly: the token file
+  permission warning, a missing token file, the missing home directory and a
+  refused alias.
 
 Coverage is measured across the module from `test/` with `-coverpkg=./...`;
 CI fails when the total statement coverage is below 80%. `main.go` is only
-exercised through the OpenSSH tests, which run the built binary, so it does
-not count towards the profile. CI runs the same commands and then builds the
-binary and runs `--help` and `--version`.
+exercised through the tests in `openssh_test.go`, which run the built binary,
+so it does not count towards the profile. CI runs the same commands and then
+builds the binary and runs `--help` and `--version`.
 
 ## Tooling
 

@@ -48,11 +48,15 @@ func main() {
 
 func (c *stdioCmd) Run() error {
 	logger := log.New(os.Stderr, "comlink: ", 0)
-	token, err := loadToken(c.TokenFile)
+	token, err := loadToken(c.TokenFile, logger)
 	if err != nil {
 		return err
 	}
-	signer, err := sshd.LoadOrCreateHostKey(sshd.HostKeyPath())
+	keyPath, err := sshd.HostKeyPath()
+	if err != nil {
+		return err
+	}
+	signer, err := sshd.LoadOrCreateHostKey(keyPath)
 	if err != nil {
 		return err
 	}
@@ -66,14 +70,18 @@ func (c *stdioCmd) Run() error {
 
 // loadToken returns the trimmed contents of path, or $COMLINK_TOKEN when path
 // is empty. An empty result means no token: the upstream is dialled without
-// an Authorization header.
-func loadToken(path string) (string, error) {
+// an Authorization header. A token file that group or others can read is
+// still used, with a warning naming the path (never the token).
+func loadToken(path string, logger *log.Logger) (string, error) {
 	if path == "" {
 		return strings.TrimSpace(os.Getenv("COMLINK_TOKEN")), nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read token file: %w", err)
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		logger.Printf("warning: token file %s is readable by group or others; restrict it with chmod 600", path)
 	}
 	return strings.TrimSpace(string(b)), nil
 }
@@ -83,6 +91,10 @@ func (c *sshConfigCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("locate comlink executable: %w", err)
 	}
-	_, err = io.WriteString(os.Stdout, sshd.ConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile))
+	block, err := sshd.ConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile)
+	if err != nil {
+		return err
+	}
+	_, err = io.WriteString(os.Stdout, block)
 	return err
 }

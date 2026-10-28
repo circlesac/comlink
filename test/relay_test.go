@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -331,7 +334,8 @@ func TestProxyUpstreamDroppingExitsOne(t *testing.T) {
 }
 
 // TestProxyClientDroppingExitsOne: the client ends the channel without a
-// close frame, so the command exits 1 and the upstream is closed.
+// close frame, so the command exits 1 and the upstream is told the client
+// went away (1001), not that something failed.
 func TestProxyClientDroppingExitsOne(t *testing.T) {
 	upstream := newEchoUpstream(t)
 	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
@@ -354,7 +358,125 @@ func TestProxyClientDroppingExitsOne(t *testing.T) {
 	if got := exitStatus(t, sess.Wait()); got != 1 {
 		t.Fatalf("exit status = %d, want 1", got)
 	}
+	if got := upstream.closeStatus(t); got != websocket.StatusGoingAway {
+		t.Fatalf("upstream close status = %d, want %d", got, websocket.StatusGoingAway)
+	}
 	if strings.Contains(logBuf.String(), "upstream failed") {
 		t.Fatalf("server log %q blames the upstream for the client's drop", logBuf.String())
+	}
+}
+
+// TestProxyClientFailureIsPassedOn: a client that closes with an error
+// status is a real failure, so the upstream gets 1011 and the command exits 1.
+func TestProxyClientFailureIsPassedOn(t *testing.T) {
+	upstream := newEchoUpstream(t)
+	client, _ := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
+	sess, conn := proxySession(t, client)
+	ws := dialOverConn(t, conn)
+
+	if err := ws.Close(websocket.StatusInternalError, "client broke"); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := exitStatus(t, sess.Wait()); got != 1 {
+		t.Fatalf("exit status = %d, want 1", got)
+	}
+	if got := upstream.closeStatus(t); got != websocket.StatusInternalError {
+		t.Fatalf("upstream close status = %d, want %d", got, websocket.StatusInternalError)
+	}
+}
+
+// sshChannelWindow is the receive window x/crypto/ssh grants each channel
+// (channelWindowSize). Without window adjustments from the client, comlink
+// can put at most this much data on the channel.
+const sshChannelWindow = 2 << 20
+
+// countingConn counts the bytes read from the connection and closes reached
+// once at least threshold bytes have arrived.
+type countingConn struct {
+	net.Conn
+	threshold int64
+	n         atomic.Int64
+	once      sync.Once
+	reached   chan struct{}
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if c.n.Add(int64(n)) >= c.threshold {
+		c.once.Do(func() { close(c.reached) })
+	}
+	return n, err
+}
+
+// TestProxyBlockedWriteEndsWhenClientConnectionCloses is the stuck-write
+// case: the client stops reading while the upstream sends a message several
+// times the SSH channel window, so comlink's write to the channel cannot
+// complete. Closing the client's connection, as the ssh process exiting
+// does, must release that write: Serve returns and the upstream is told the
+// client went away.
+func TestProxyBlockedWriteEndsWhenClientConnectionCloses(t *testing.T) {
+	upstream := newEchoUpstream(t)
+	var logBuf lockedBuffer
+	route := &codex.Route{
+		Upstream:      upstream.wsURL(),
+		Token:         testToken,
+		ReportVersion: "0.165.0",
+		Logger:        log.New(&logBuf, "comlink: ", 0),
+	}
+	signer := testSigner(t)
+	serverSide, clientSide := connPair(t)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- sshd.Serve(serverSide, signer, route) }()
+
+	counted := &countingConn{Conn: clientSide, threshold: sshChannelWindow, reached: make(chan struct{})}
+	sconn, chans, reqs, err := ssh.NewClientConn(counted, "comlink", &ssh.ClientConfig{
+		User:            "comlink",
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	client := ssh.NewClient(sconn, chans, reqs)
+	defer func() { _ = client.Close() }()
+	_, conn := proxySession(t, client)
+	ws := dialOverConn(t, conn)
+	defer func() { _ = ws.CloseNow() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// The upstream echoes this back; the client never reads it.
+	big := bytes.Repeat([]byte{0xCD}, 4*sshChannelWindow)
+	if err := ws.Write(ctx, websocket.MessageBinary, big); err != nil {
+		t.Fatal(err)
+	}
+	// Once a full window has reached the client unread, comlink has used up
+	// the window in the middle of writing the echo; the rest of it can only
+	// go out after window adjustments that never come.
+	select {
+	case <-counted.reached:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("client received %d bytes in 15s, want a full channel window", counted.n.Load())
+	}
+
+	if err := clientSide.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serve returned %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("serve did not return within 15s of the client connection closing")
+	}
+	if got := counted.n.Load(); got >= int64(len(big)) {
+		t.Fatalf("client received %d bytes, the whole %d-byte echo: the write never blocked", got, len(big))
+	}
+	if got := upstream.closeStatus(t); got != websocket.StatusGoingAway {
+		t.Fatalf("upstream close status = %d, want %d", got, websocket.StatusGoingAway)
+	}
+	if strings.Contains(logBuf.String(), testToken) {
+		t.Fatal("server log contains the upstream token")
 	}
 }

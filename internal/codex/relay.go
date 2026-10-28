@@ -25,7 +25,9 @@ const ReadLimit = 64 << 20
 // over the channel (an HTTP Upgrade to ws://codex-app-server/rpc followed by
 // JSON-RPC frames). That WebSocket is terminated here and every message is
 // relayed, type preserved, to the upstream WebSocket and back. It returns
-// the exit status for the command: 0 after a clean close, 1 otherwise.
+// the exit status for the command: 0 after a clean close, 1 otherwise. When
+// the client side ends without a close frame the upstream is told 1001
+// (going away); any other failure is passed on as 1011.
 func (r *Route) relay(ch ssh.Channel) int {
 	conn := newChannelConn(ch)
 	defer func() { _ = conn.Close() }()
@@ -76,8 +78,13 @@ func (r *Route) relay(ch ssh.Channel) int {
 	status := websocket.CloseStatus(first.err)
 	clean := status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway
 	code, reason := websocket.StatusInternalError, "peer failed"
-	if clean {
+	switch {
+	case clean:
 		code, reason = status, "peer closed"
+	case !first.upstream && status == -1:
+		// The SSH channel ended without a close frame: the client (the ssh
+		// process) went away rather than reporting a failure.
+		code, reason = websocket.StatusGoingAway, "client went away"
 	}
 	if first.upstream {
 		_ = client.Close(code, reason)

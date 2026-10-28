@@ -14,17 +14,19 @@ import (
 )
 
 // HostKeyPath is $XDG_STATE_HOME/comlink/host_ed25519, falling back to
-// ~/.local/state/comlink/host_ed25519.
-func HostKeyPath() string {
+// ~/.local/state/comlink/host_ed25519. It fails when XDG_STATE_HOME is unset
+// and the home directory cannot be determined, rather than keeping the key
+// relative to whatever directory comlink was started in.
+func HostKeyPath() (string, error) {
 	dir := os.Getenv("XDG_STATE_HOME")
 	if dir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			home = "."
+			return "", fmt.Errorf("locate host key: XDG_STATE_HOME is unset and the home directory is unknown: %w", err)
 		}
 		dir = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(dir, "comlink", "host_ed25519")
+	return filepath.Join(dir, "comlink", "host_ed25519"), nil
 }
 
 // LoadOrCreateHostKey reads the ed25519 host key at path, generating and
@@ -68,8 +70,18 @@ func LoadOrCreateHostKey(path string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("write host key %s: %w", path, err)
 	}
 	if err := os.Link(f.Name(), path); errors.Is(err, fs.ErrExist) {
-		// Another comlink won the race; use its key.
-		return LoadOrCreateHostKey(path)
+		// Another comlink won the race; use its key. Read it once rather than
+		// starting over: a name that exists for Link but not for ReadFile (a
+		// dangling symlink) would otherwise loop forever.
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read host key %s: %w", path, err)
+		}
+		signer, err := ssh.ParsePrivateKey(b)
+		if err != nil {
+			return nil, fmt.Errorf("parse host key %s: %w", path, err)
+		}
+		return signer, nil
 	} else if err != nil {
 		return nil, fmt.Errorf("create host key %s: %w", path, err)
 	}

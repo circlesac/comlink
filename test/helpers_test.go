@@ -172,16 +172,18 @@ func run(t *testing.T, client *ssh.Client, command string) (stdout, stderr strin
 }
 
 // echoUpstream is a WebSocket server that requires the bearer token and
-// echoes every message back with the same type.
+// echoes every message back with the same type. When a connection's read
+// ends, its close status (-1 without a close frame) is sent on closes.
 type echoUpstream struct {
 	*httptest.Server
-	mu    sync.Mutex
-	auths []string
+	mu     sync.Mutex
+	auths  []string
+	closes chan websocket.StatusCode
 }
 
 func newEchoUpstream(t *testing.T) *echoUpstream {
 	t.Helper()
-	u := &echoUpstream{}
+	u := &echoUpstream{closes: make(chan websocket.StatusCode, 16)}
 	u.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u.mu.Lock()
 		u.auths = append(u.auths, r.Header.Get("Authorization"))
@@ -198,6 +200,10 @@ func newEchoUpstream(t *testing.T) *echoUpstream {
 		for {
 			typ, data, err := c.Read(r.Context())
 			if err != nil {
+				select {
+				case u.closes <- websocket.CloseStatus(err):
+				default:
+				}
 				return
 			}
 			if err := c.Write(r.Context(), typ, data); err != nil {
@@ -215,6 +221,19 @@ func (u *echoUpstream) seenAuths() []string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return append([]string(nil), u.auths...)
+}
+
+// closeStatus waits for an upstream connection to end and returns the close
+// status it read. The wait is only the test's failure bound.
+func (u *echoUpstream) closeStatus(t *testing.T) websocket.StatusCode {
+	t.Helper()
+	select {
+	case status := <-u.closes:
+		return status
+	case <-time.After(10 * time.Second):
+		t.Fatal("upstream connection did not end within 10s")
+		return 0
+	}
 }
 
 // wsURLOf is the WebSocket address of an httptest server.
