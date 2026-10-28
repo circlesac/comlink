@@ -1,4 +1,4 @@
-package main
+package test
 
 import (
 	"bytes"
@@ -13,13 +13,16 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/circlesac/comlink/internal/shell"
+	"github.com/circlesac/comlink/internal/sshserver"
 )
 
 // buildComlink compiles the binary once per test run for the OpenSSH tests.
 func buildComlink(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "comlink")
-	build := exec.Command("go", "build", "-o", bin, ".")
+	build := exec.Command("go", "build", "-o", bin, "github.com/circlesac/comlink")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
@@ -34,7 +37,7 @@ func opensshCommand(t *testing.T, bin, upstream, tokenFile, command string) *exe
 	t.Helper()
 	cmd := exec.Command("ssh",
 		"-F", "/dev/null",
-		"-o", "ProxyCommand="+shellQuote(bin)+" stdio --upstream "+shellQuote(upstream)+" --token-file "+shellQuote(tokenFile),
+		"-o", "ProxyCommand="+shell.Quote(bin)+" stdio --upstream "+shell.Quote(upstream)+" --token-file "+shell.Quote(tokenFile),
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
@@ -128,7 +131,7 @@ func TestOpenSSHProxyRelay(t *testing.T) {
 		t.Fatalf("marker = %q, want %q", marker, fixtureMarker)
 	}
 
-	var conn net.Conn = &stdioConn{in: stdout, out: stdin}
+	var conn net.Conn = &sshserver.StdioConn{In: stdout, Out: stdin}
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -5,16 +5,17 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/alecthomas/kong"
+
+	"github.com/circlesac/comlink/internal/route/codex"
+	"github.com/circlesac/comlink/internal/sshconfig"
+	"github.com/circlesac/comlink/internal/sshserver"
 )
 
 type cli struct {
@@ -52,16 +53,15 @@ func (c *stdioCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	signer, err := loadOrCreateHostKey(hostKeyPath())
+	signer, err := sshserver.LoadOrCreateHostKey(sshserver.HostKeyPath())
 	if err != nil {
 		return err
 	}
-	return serve(&stdioConn{in: os.Stdin, out: os.Stdout}, options{
-		upstream:      c.Upstream,
-		token:         token,
-		reportVersion: c.ReportVersion,
-		hostKey:       signer,
-		logger:        logger,
+	return sshserver.Serve(&sshserver.StdioConn{In: os.Stdin, Out: os.Stdout}, signer, &codex.Route{
+		Upstream:      c.Upstream,
+		Token:         token,
+		ReportVersion: c.ReportVersion,
+		Logger:        logger,
 	})
 }
 
@@ -84,38 +84,6 @@ func (c *sshConfigCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("locate comlink executable: %w", err)
 	}
-	_, err = io.WriteString(os.Stdout, sshConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile))
+	_, err = io.WriteString(os.Stdout, sshconfig.Block(c.Alias, exe, c.Upstream, c.TokenFile))
 	return err
-}
-
-// stdioConn presents a reader/writer pair (the ProxyCommand's stdin and
-// stdout) as a net.Conn so the SSH server can run over it.
-type stdioConn struct {
-	in  io.Reader
-	out io.Writer
-}
-
-type stdioAddr struct{}
-
-func (stdioAddr) Network() string { return "stdio" }
-func (stdioAddr) String() string  { return "stdio" }
-
-func (c *stdioConn) Read(b []byte) (int, error)  { return c.in.Read(b) }
-func (c *stdioConn) Write(b []byte) (int, error) { return c.out.Write(b) }
-func (c *stdioConn) LocalAddr() net.Addr         { return stdioAddr{} }
-func (c *stdioConn) RemoteAddr() net.Addr        { return stdioAddr{} }
-func (c *stdioConn) SetDeadline(time.Time) error { return nil }
-
-func (c *stdioConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *stdioConn) SetWriteDeadline(time.Time) error { return nil }
-
-func (c *stdioConn) Close() error {
-	var errs []error
-	if cl, ok := c.in.(io.Closer); ok {
-		errs = append(errs, cl.Close())
-	}
-	if cl, ok := c.out.(io.Closer); ok {
-		errs = append(errs, cl.Close())
-	}
-	return errors.Join(errs...)
 }

@@ -1,4 +1,4 @@
-package main
+package test
 
 import (
 	"bytes"
@@ -18,6 +18,9 @@ import (
 
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/circlesac/comlink/internal/route/codex"
+	"github.com/circlesac/comlink/internal/sshserver"
 )
 
 const testToken = "test-token-do-not-print"
@@ -58,7 +61,7 @@ func newEchoUpstream(t *testing.T) *echoUpstream {
 		if err != nil {
 			return
 		}
-		c.SetReadLimit(readLimit)
+		c.SetReadLimit(codex.ReadLimit)
 		for {
 			typ, data, err := c.Read(r.Context())
 			if err != nil {
@@ -115,19 +118,19 @@ func connPair(t *testing.T) (serverSide, clientSide net.Conn) {
 	return serverSide, clientSide
 }
 
-// startServer runs comlink's SSH server over a loopback connection and
-// returns a connected x/crypto/ssh client plus the server's stderr log.
-func startServer(t *testing.T, opts options) (*ssh.Client, *lockedBuffer) {
+// startServer runs comlink's SSH server with the Codex route over a loopback
+// connection and returns a connected x/crypto/ssh client plus the server's
+// stderr log.
+func startServer(t *testing.T, route codex.Route) (*ssh.Client, *lockedBuffer) {
 	t.Helper()
 	var logBuf lockedBuffer
-	opts.hostKey = testSigner(t)
-	opts.logger = log.New(&logBuf, "comlink: ", 0)
-	if opts.reportVersion == "" {
-		opts.reportVersion = "0.165.0"
+	route.Logger = log.New(&logBuf, "comlink: ", 0)
+	if route.ReportVersion == "" {
+		route.ReportVersion = "0.165.0"
 	}
 	serverSide, clientSide := connPair(t)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- serve(serverSide, opts) }()
+	go func() { serveErr <- sshserver.Serve(serverSide, testSigner(t), &route) }()
 
 	conn, chans, reqs, err := ssh.NewClientConn(clientSide, "comlink", &ssh.ClientConfig{
 		User:            "comlink",
@@ -187,7 +190,7 @@ func exitStatus(t *testing.T, err error) int {
 
 func TestServerAcceptsForwardAndAnswersVersionProbe(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, _ := startServer(t, options{upstream: upstream.wsURL(), token: testToken, reportVersion: "0.170.0"})
+	client, _ := startServer(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken, ReportVersion: "0.170.0"})
 
 	ok, reply, err := client.SendRequest("tcpip-forward", true, ssh.Marshal(struct {
 		Addr string
@@ -229,7 +232,7 @@ func TestServerAcceptsForwardAndAnswersVersionProbe(t *testing.T) {
 }
 
 func TestServerAcknowledgesSetupCommands(t *testing.T) {
-	client, _ := startServer(t, options{upstream: "ws://127.0.0.1:1/unused"})
+	client, _ := startServer(t, codex.Route{Upstream: "ws://127.0.0.1:1/unused"})
 	for name, payload := range map[string]string{"probe": probePayload, "bootstrap": bootstrapPayload, "pkill": killPayload} {
 		t.Run(name, func(t *testing.T) {
 			sess, err := client.NewSession()
@@ -246,7 +249,7 @@ func TestServerAcknowledgesSetupCommands(t *testing.T) {
 }
 
 func TestServerRefusesUnknownCommandShellAndSubsystem(t *testing.T) {
-	client, logBuf := startServer(t, options{upstream: "ws://127.0.0.1:1/unused"})
+	client, logBuf := startServer(t, codex.Route{Upstream: "ws://127.0.0.1:1/unused"})
 
 	sess, err := client.NewSession()
 	if err != nil {
@@ -339,7 +342,7 @@ func proxySession(t *testing.T, client *ssh.Client) (*ssh.Session, net.Conn) {
 	// StdoutPipe returns the channel itself; hide its Close so closing the
 	// WebSocket only sends EOF (like the ssh client) instead of closing the
 	// channel before the exit status arrives.
-	return sess, &stdioConn{in: struct{ io.Reader }{stdout}, out: stdin}
+	return sess, &sshserver.StdioConn{In: struct{ io.Reader }{stdout}, Out: stdin}
 }
 
 // dialOverConn opens the WebSocket the Codex app opens over the channel.
@@ -355,13 +358,13 @@ func dialOverConn(t *testing.T, conn net.Conn) *websocket.Conn {
 	if err != nil {
 		t.Fatalf("dial over channel: %v", err)
 	}
-	c.SetReadLimit(readLimit)
+	c.SetReadLimit(codex.ReadLimit)
 	return c
 }
 
 func TestProxyRelaysMessagesToUpstreamWithToken(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, _ := startServer(t, options{upstream: upstream.wsURL(), token: testToken})
+	client, _ := startServer(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -399,7 +402,7 @@ func TestProxyRelaysMessagesToUpstreamWithToken(t *testing.T) {
 
 func TestProxyWithWrongTokenExitsOne(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, logBuf := startServer(t, options{upstream: upstream.wsURL(), token: "wrong-token"})
+	client, logBuf := startServer(t, codex.Route{Upstream: upstream.wsURL(), Token: "wrong-token"})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -431,7 +434,7 @@ func TestProxyUpstreamCloseEndsCommand(t *testing.T) {
 		_ = c.Close(websocket.StatusGoingAway, "bye")
 	}))
 	t.Cleanup(srv.Close)
-	client, _ := startServer(t, options{upstream: "ws" + strings.TrimPrefix(srv.URL, "http")})
+	client, _ := startServer(t, codex.Route{Upstream: "ws" + strings.TrimPrefix(srv.URL, "http")})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

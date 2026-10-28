@@ -1,30 +1,29 @@
-package main
+// Package sshserver speaks the server side of SSH over one connection. It
+// accepts session channels and hands each exec request to a Route; it knows
+// nothing about the client on the other end.
+package sshserver
 
 import (
 	"fmt"
-	"io"
-	"log"
 	"net"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// options configures one SSH connection served by comlink.
-type options struct {
-	upstream      string
-	token         string
-	reportVersion string
-	hostKey       ssh.Signer
-	logger        *log.Logger
+// Route answers exec requests for one kind of client. Exec serves command on
+// ch (stdout, stderr and stdin are the channel's) and returns the exit
+// status. Nothing is run by the server itself.
+type Route interface {
+	Exec(ch ssh.Channel, command string) (status int)
 }
 
-// serve speaks the server side of SSH on conn for one connection and returns
+// Serve speaks the server side of SSH on conn for one connection and returns
 // when the client disconnects. No client authentication is performed: the
 // transport is the user's own ProxyCommand process, not a network listener.
-func serve(conn net.Conn, opts options) error {
+func Serve(conn net.Conn, hostKey ssh.Signer, route Route) error {
 	config := &ssh.ServerConfig{NoClientAuth: true}
-	config.AddHostKey(opts.hostKey)
+	config.AddHostKey(hostKey)
 
 	sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
 	if err != nil {
@@ -44,7 +43,7 @@ func serve(conn net.Conn, opts options) error {
 		if err != nil {
 			continue
 		}
-		wg.Go(func() { handleSession(ch, chReqs, opts) })
+		wg.Go(func() { handleSession(ch, chReqs, route) })
 	}
 	wg.Wait()
 	return nil
@@ -83,7 +82,7 @@ func handleGlobalRequests(reqs <-chan *ssh.Request) {
 
 // handleSession answers the requests on one session channel. Only exec is
 // served; shell, pty, subsystem and agent forwarding are refused.
-func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, opts options) {
+func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, route Route) {
 	defer func() { _ = ch.Close() }()
 	done := make(chan struct{})
 	ran := false
@@ -101,7 +100,7 @@ func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, opts options) {
 			_ = req.Reply(true, nil)
 			go func() {
 				defer close(done)
-				status := runCommand(ch, payload.Command, opts)
+				status := route.Exec(ch, payload.Command)
 				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(status)}))
 				_ = ch.CloseWrite()
 				_ = ch.Close()
@@ -115,30 +114,5 @@ func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, opts options) {
 	}
 	if ran {
 		<-done
-	}
-}
-
-// runCommand answers one exec request on ch and returns the exit status.
-// Nothing is executed: the command is matched against the Codex app route.
-func runCommand(ch ssh.Channel, exec string, opts options) int {
-	cmd := parseCommand(exec)
-	if len(cmd.Marker) > 0 && cmd.Kind != kindUnknown {
-		if _, err := ch.Write(cmd.Marker); err != nil {
-			return 1
-		}
-	}
-	switch cmd.Kind {
-	case kindProxy:
-		return relay(ch, opts)
-	case kindBootstrap, kindKill, kindProbe:
-		return 0
-	case kindVersion:
-		_, _ = io.WriteString(ch, "codex-cli "+opts.reportVersion+"\n")
-		return 0
-	default:
-		// The client sees this as the command's stderr. It is not logged as well:
-		// a ProxyCommand's own stderr reaches the same terminal and would repeat it.
-		_, _ = io.WriteString(ch.Stderr(), "comlink: unsupported command: "+cmd.Payload+"\n")
-		return 127
 	}
 }

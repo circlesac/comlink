@@ -1,4 +1,4 @@
-package main
+package sshserver
 
 import (
 	"crypto/ed25519"
@@ -13,9 +13,9 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// hostKeyPath is $XDG_STATE_HOME/comlink/host_ed25519, falling back to
+// HostKeyPath is $XDG_STATE_HOME/comlink/host_ed25519, falling back to
 // ~/.local/state/comlink/host_ed25519.
-func hostKeyPath() string {
+func HostKeyPath() string {
 	dir := os.Getenv("XDG_STATE_HOME")
 	if dir == "" {
 		home, err := os.UserHomeDir()
@@ -27,10 +27,10 @@ func hostKeyPath() string {
 	return filepath.Join(dir, "comlink", "host_ed25519")
 }
 
-// loadOrCreateHostKey reads the ed25519 host key at path, generating and
+// LoadOrCreateHostKey reads the ed25519 host key at path, generating and
 // persisting one (directory 0700, file 0600) on first use so that ssh's
 // StrictHostKeyChecking=accept-new pins a stable key.
-func loadOrCreateHostKey(path string) (ssh.Signer, error) {
+func LoadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if b, err := os.ReadFile(path); err == nil {
 		signer, err := ssh.ParsePrivateKey(b)
 		if err != nil {
@@ -55,7 +55,7 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {
 		// Another comlink won the race; use its key.
-		return loadOrCreateHostKey(path)
+		return LoadOrCreateHostKey(path)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create host key %s: %w", path, err)

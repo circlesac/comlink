@@ -1,10 +1,12 @@
-package main
+package codex
 
 import (
 	"bytes"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/circlesac/comlink/internal/shell"
 )
 
 const (
@@ -31,11 +33,11 @@ func readFixture(t *testing.T) string {
 // wrapper the Codex app uses, taking the launcher from the fixture.
 func wrapLikeApp(t *testing.T, payload string) string {
 	t.Helper()
-	words := shellSplit(readFixture(t))
+	words := shell.Split(readFixture(t))
 	if len(words) != 5 || words[0] != "sh" || words[1] != "-c" || words[3] != "sh" {
 		t.Fatalf("fixture does not have the sh -c <launcher> sh <payload> shape: %d words", len(words))
 	}
-	return "sh -c " + shellQuote(words[2]) + " sh " + shellQuote(payload)
+	return "sh -c " + shell.Quote(words[2]) + " sh " + shell.Quote(payload)
 }
 
 func TestParseCommandFixtureIsProxyWithMarker(t *testing.T) {
@@ -125,59 +127,5 @@ func TestDecodePrintfB(t *testing.T) {
 		if got := string(decodePrintfB(tc.in)); got != tc.want {
 			t.Errorf("decodePrintfB(%q) = %q, want %q", tc.in, got, tc.want)
 		}
-	}
-}
-
-func TestShellSplit(t *testing.T) {
-	cases := []struct {
-		in   string
-		want []string
-	}{
-		{`a b  c`, []string{"a", "b", "c"}},
-		{`'single quoted' "double \"quoted\"" back\ slash`, []string{"single quoted", `double "quoted"`, "back slash"}},
-		{`sh -c 'x '\''y'\''' sh 'line1` + "\n" + `line2'`, []string{"sh", "-c", "x 'y'", "sh", "line1\nline2"}},
-		{`"a\$b\q"`, []string{`a$b\q`}},
-		{``, nil},
-	}
-	for _, tc := range cases {
-		got := shellSplit(tc.in)
-		if len(got) != len(tc.want) {
-			t.Errorf("shellSplit(%q) = %q, want %q", tc.in, got, tc.want)
-			continue
-		}
-		for i := range got {
-			if got[i] != tc.want[i] {
-				t.Errorf("shellSplit(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
-			}
-		}
-	}
-}
-
-func TestShellQuoteRoundTrip(t *testing.T) {
-	for _, s := range []string{"plain", "/usr/local/bin/comlink", "has space", "it's", "", "a\nb", `back\slash`, "$HOME"} {
-		got := shellSplit(shellQuote(s))
-		if s == "" {
-			if len(got) != 1 || got[0] != "" {
-				t.Errorf("shellQuote(%q) round-trips to %q", s, got)
-			}
-			continue
-		}
-		if len(got) != 1 || got[0] != s {
-			t.Errorf("shellQuote(%q) = %q round-trips to %q", s, shellQuote(s), got)
-		}
-	}
-}
-
-func TestSSHConfigBlock(t *testing.T) {
-	got := sshConfigBlock("example-agent", "/opt/com link/comlink", "wss://agent.example.com/codex?a=%20", "/home/u/token")
-	want := "Host example-agent\n" +
-		"  User comlink\n" +
-		"  ProxyCommand '/opt/com link/comlink' stdio --upstream 'wss://agent.example.com/codex?a=%%20' --token-file /home/u/token\n" +
-		"  StrictHostKeyChecking accept-new\n"
-	if got != want {
-		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
-	}
-	if strings.Contains(sshConfigBlock("a", "/x/comlink", "wss://h/", ""), "--token-file") {
-		t.Fatal("token-file flag printed without a token file")
 	}
 }

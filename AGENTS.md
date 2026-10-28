@@ -6,7 +6,7 @@ comlink is an SSH front door for coding-agent clients. A client that only knows 
 
 - comlink does not implement any agent protocol. It recognises the command that opens an agent session and moves bytes between the SSH channel and the WebSocket. The protocol lives in the endpoint (for example a Cloudflare Worker that implements the Codex app-server protocol).
 - Each supported client is a route: how its commands are recognised and which endpoint and framing its session uses. The Codex app is the first route. ACP clients that start their agent over SSH are expected later; Temple reaches endpoints over WebSocket directly and does not need comlink. Add a client by adding a route, not by special-casing the server.
-- Commands are matched against what the client actually sends. Keep the captured commands under `testdata/` as the fixtures the tests run against, and refresh them from a real client when it changes (see README).
+- Commands are matched against what the client actually sends. Keep the captured commands under `internal/route/codex/testdata/` as the fixtures the tests run against, and refresh them from a real client when it changes (see README).
 - An unrecognised command is logged to stderr and exits 127. It is never run.
 - The upstream token is a secret: never print it, log it, or put it in an error. Read it from a file or the environment.
 
@@ -27,6 +27,7 @@ Verified 2026-10-28 by recording an SSH host the app connected to:
 ## Conventions
 
 - Go, one module, one binary. Pull requests are squash-merged into `main`.
+- Layout: `main.go` declares the CLI and wires the packages; `internal/sshserver` is the SSH side and hands each exec request to a route; `internal/route/codex` is the Codex app route; `internal/shell` and `internal/sshconfig` are shared helpers. Unit tests sit next to their package; tests that drive the server with a route end to end, or real OpenSSH, live in `test/`.
 - `gofmt` and `golangci-lint` run in the test gate with `go test -race ./...` and `go vet ./...`.
 - CI runs on `runs-on: ${{ fromJSON(vars.LINUX_RUNNER) }}`.
 - No real personal or company identifiers in docs, tests or fixtures.

@@ -1,4 +1,4 @@
-package main
+package codex
 
 import (
 	"bufio"
@@ -14,38 +14,38 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// readLimit is the largest WebSocket message accepted from either side. The
+// ReadLimit is the largest WebSocket message accepted from either side. The
 // Codex app announces 16 MiB messages; the library default is 32 KiB.
-const readLimit = 64 << 20
+const ReadLimit = 64 << 20
 
 // relay serves the app-server proxy route on ch: the client speaks WebSocket
 // over the channel (an HTTP Upgrade to ws://codex-app-server/rpc followed by
 // JSON-RPC frames). That WebSocket is terminated here and every message is
 // relayed, type preserved, to the upstream WebSocket and back. It returns
 // the exit status for the command: 0 after a clean close, 1 otherwise.
-func relay(ch ssh.Channel, opts options) int {
+func (r *Route) relay(ch ssh.Channel) int {
 	conn := &channelConn{Channel: ch}
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
-		opts.logger.Printf("client did not send an HTTP upgrade: %v", err)
+		r.Logger.Printf("client did not send an HTTP upgrade: %v", err)
 		return 1
 	}
 	w := &upgradeResponse{conn: conn, br: br, header: http.Header{}}
 	client, err := websocket.Accept(w, req, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
-		opts.logger.Printf("client websocket handshake failed: %v", err)
+		r.Logger.Printf("client websocket handshake failed: %v", err)
 		return 1
 	}
-	client.SetReadLimit(readLimit)
-	upstream, err := dialUpstream(opts)
+	client.SetReadLimit(ReadLimit)
+	upstream, err := r.dialUpstream()
 	if err != nil {
 		// err may quote the URL and the response status but never the header.
-		opts.logger.Printf("upstream connect failed: %v", err)
+		r.Logger.Printf("upstream connect failed: %v", err)
 		_ = client.Close(websocket.StatusInternalError, "upstream unavailable")
 		return 1
 	}
-	upstream.SetReadLimit(readLimit)
+	upstream.SetReadLimit(ReadLimit)
 
 	type outcome struct {
 		err      error
@@ -88,19 +88,19 @@ func relay(ch ssh.Channel, opts options) int {
 		return 0
 	}
 	if first.upstream {
-		opts.logger.Printf("upstream failed: %v", first.err)
+		r.Logger.Printf("upstream failed: %v", first.err)
 	}
 	return 1
 }
 
-func dialUpstream(opts options) (*websocket.Conn, error) {
+func (r *Route) dialUpstream() (*websocket.Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var header http.Header
-	if opts.token != "" {
-		header = http.Header{"Authorization": {"Bearer " + opts.token}}
+	if r.Token != "" {
+		header = http.Header{"Authorization": {"Bearer " + r.Token}}
 	}
-	c, resp, err := websocket.Dial(ctx, opts.upstream, &websocket.DialOptions{HTTPHeader: header})
+	c, resp, err := websocket.Dial(ctx, r.Upstream, &websocket.DialOptions{HTTPHeader: header})
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
@@ -113,9 +113,14 @@ type channelConn struct {
 	ssh.Channel
 }
 
+type channelAddr struct{}
+
+func (channelAddr) Network() string { return "stdio" }
+func (channelAddr) String() string  { return "stdio" }
+
 func (c *channelConn) Close() error                     { return nil }
-func (c *channelConn) LocalAddr() net.Addr              { return stdioAddr{} }
-func (c *channelConn) RemoteAddr() net.Addr             { return stdioAddr{} }
+func (c *channelConn) LocalAddr() net.Addr              { return channelAddr{} }
+func (c *channelConn) RemoteAddr() net.Addr             { return channelAddr{} }
 func (c *channelConn) SetDeadline(time.Time) error      { return nil }
 func (c *channelConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *channelConn) SetWriteDeadline(time.Time) error { return nil }
