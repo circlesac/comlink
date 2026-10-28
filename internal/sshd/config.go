@@ -1,4 +1,4 @@
-package sshserver
+package sshd
 
 import (
 	"strings"
@@ -7,7 +7,9 @@ import (
 // ConfigBlock renders a ~/.ssh/config Host block whose ProxyCommand runs
 // comlink. ssh hands the ProxyCommand line to the user's shell after expanding
 // %-tokens, so every argument is shell-quoted and % is doubled. The token
-// file is referenced by path only; its contents never appear.
+// file is referenced by path only; its contents never appear. HostKeyAlias
+// keeps comlink's pinned key apart from a real host called alias in
+// known_hosts.
 func ConfigBlock(alias, exe, upstream, tokenFile string) string {
 	args := []string{exe, "stdio", "--upstream", upstream}
 	if tokenFile != "" {
@@ -21,6 +23,7 @@ func ConfigBlock(alias, exe, upstream, tokenFile string) string {
 	b.WriteString("Host " + alias + "\n")
 	b.WriteString("  User comlink\n")
 	b.WriteString("  ProxyCommand " + strings.Join(quoted, " ") + "\n")
+	b.WriteString("  HostKeyAlias comlink-" + alias + "\n")
 	b.WriteString("  StrictHostKeyChecking accept-new\n")
 	return b.String()
 }

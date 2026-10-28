@@ -49,6 +49,7 @@ func TestParseCommandClassifiesAppPayloads(t *testing.T) {
 		{"bootstrap", readFixture(t, "codex-app-bootstrap.txt"), kindBootstrap, "--listen 'unix://' </dev/null >/dev/null 2>&1 & }"},
 		{"pkill", readFixture(t, "codex-app-kill.txt"), kindKill, "-f 'codex.* app-server.* --listen'"},
 		{"unknown", "ls -la /", kindUnknown, "ls -la /"},
+		{"unknown-wrapped", readFixture(t, "codex-app-unknown.txt"), kindUnknown, "ls -la /"},
 		{"unknown-shell", "bash -lc 'echo hi'", kindUnknown, "bash -lc 'echo hi'"},
 	}
 	for _, tc := range cases {

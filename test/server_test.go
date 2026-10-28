@@ -20,7 +20,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/circlesac/comlink/internal/codex"
-	"github.com/circlesac/comlink/internal/sshserver"
+	"github.com/circlesac/comlink/internal/sshd"
 )
 
 const testToken = "test-token-do-not-print"
@@ -130,7 +130,7 @@ func startServer(t *testing.T, route codex.Route) (*ssh.Client, *lockedBuffer) {
 	}
 	serverSide, clientSide := connPair(t)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- sshserver.Serve(serverSide, testSigner(t), &route) }()
+	go func() { serveErr <- sshd.Serve(serverSide, testSigner(t), &route) }()
 
 	conn, chans, reqs, err := ssh.NewClientConn(clientSide, "comlink", &ssh.ClientConfig{
 		User:            "comlink",
@@ -269,6 +269,23 @@ func TestServerRefusesUnknownCommandShellAndSubsystem(t *testing.T) {
 	}
 	_ = sess.Close()
 
+	// The same refusal when the app's launcher wraps the unknown payload: the
+	// payload is unwrapped and named, the launcher is not echoed.
+	sess, err = client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	sess.Stderr = &stderr
+	out, err = sess.Output(readFixture(t, "codex-app-unknown.txt"))
+	if got := exitStatus(t, err); got != 127 {
+		t.Fatalf("wrapped: exit status = %d, want 127", got)
+	}
+	if len(out) != 0 || stderr.String() != "comlink: unsupported command: ls -la /\n" {
+		t.Fatalf("wrapped: stdout %q stderr %q", out, stderr.String())
+	}
+	_ = sess.Close()
+
 	sess, err = client.NewSession()
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +359,7 @@ func proxySession(t *testing.T, client *ssh.Client) (*ssh.Session, net.Conn) {
 	// StdoutPipe returns the channel itself; hide its Close so closing the
 	// WebSocket only sends EOF (like the ssh client) instead of closing the
 	// channel before the exit status arrives.
-	return sess, &sshserver.StdioConn{In: struct{ io.Reader }{stdout}, Out: eofOKCloser{stdin}}
+	return sess, &sshd.StdioConn{In: struct{ io.Reader }{stdout}, Out: eofOKCloser{stdin}}
 }
 
 // dialOverConn opens the WebSocket the Codex app opens over the channel.
@@ -420,6 +437,55 @@ func TestProxyWithWrongTokenExitsOne(t *testing.T) {
 	}
 	if strings.Contains(logBuf.String(), "wrong-token") {
 		t.Fatalf("server log %q contains the token", logBuf.String())
+	}
+}
+
+func TestProxyUpstreamURLQueryIsNotLogged(t *testing.T) {
+	client, logBuf := startServer(t, codex.Route{Upstream: "ws://127.0.0.1:1/rpc?token=secret-value"})
+	sess, conn := proxySession(t, client)
+	ws := dialOverConn(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, _, err := ws.Read(ctx)
+	if websocket.CloseStatus(err) != websocket.StatusInternalError {
+		t.Fatalf("read err = %v, want close status %d", err, websocket.StatusInternalError)
+	}
+	if got := exitStatus(t, sess.Wait()); got != 1 {
+		t.Fatalf("exit status = %d, want 1", got)
+	}
+	if log := logBuf.String(); !strings.Contains(log, "upstream connect failed: dial ws://127.0.0.1:1/rpc:") || strings.Contains(log, "secret-value") {
+		t.Fatalf("server log %q, want the redacted upstream and no query", log)
+	}
+}
+
+// TestProxyEndsWhenClientIgnoresUpstreamClose is the hang case: the upstream
+// closes first and the client never reads, so it never answers comlink's
+// close frame. The session must still end within the close-handshake
+// timeout instead of waiting for a frame that never comes.
+func TestProxyEndsWhenClientIgnoresUpstreamClose(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = c.Close(websocket.StatusGoingAway, "bye")
+	}))
+	t.Cleanup(srv.Close)
+	client, _ := startServer(t, codex.Route{Upstream: "ws" + strings.TrimPrefix(srv.URL, "http")})
+	sess, conn := proxySession(t, client)
+	ws := dialOverConn(t, conn)
+	defer func() { _ = ws.CloseNow() }() // never read, never closed while comlink waits
+
+	waited := make(chan error, 1)
+	go func() { waited <- sess.Wait() }()
+	select {
+	case err := <-waited:
+		if got := exitStatus(t, err); got != 0 {
+			t.Fatalf("exit status = %d, want 0 after a clean upstream close", got)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("session did not end within 15s of the upstream closing")
 	}
 }
 

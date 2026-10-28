@@ -24,22 +24,29 @@ listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
 
 ```
 main.go                CLI declaration and wiring
-internal/sshserver/    SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
+internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
 internal/codex/        Codex app route: command matching and the WebSocket relay
 test/                  end-to-end and real-OpenSSH tests
 ```
 
 ## Install
 
-```sh
-go install github.com/circlesac/comlink@latest
-```
-
-or build from a checkout:
+Build from a checkout:
 
 ```sh
 go build -o comlink .
 ```
+
+Alternatively, since the repository is private, tell Go not to use the
+module proxy for it and install directly:
+
+```sh
+GOPRIVATE=github.com/circlesac go install github.com/circlesac/comlink@latest
+```
+
+This needs `git` to be able to authenticate to GitHub (for example through
+`gh auth setup-git` or an SSH key with a `url.<ssh>.insteadOf` rewrite),
+because `go install` fetches the module with git.
 
 ## Setup
 
@@ -60,6 +67,7 @@ The block looks like this (the token file is referenced by path only):
 Host example-agent
   User comlink
   ProxyCommand /usr/local/bin/comlink stdio --upstream wss://agent.example.com/codex --token-file /home/alice/.config/comlink/token
+  HostKeyAlias comlink-example-agent
   StrictHostKeyChecking accept-new
 ```
 
@@ -76,7 +84,9 @@ ssh example-agent codex --version
 `comlink stdio` generates an ed25519 host key on first run and keeps it at
 `$XDG_STATE_HOME/comlink/host_ed25519` (default
 `~/.local/state/comlink/host_ed25519`) so `StrictHostKeyChecking accept-new`
-pins a stable key. `--report-version` sets the Codex version reported to
+pins a stable key. The block's `HostKeyAlias comlink-<alias>` stores that key
+in `known_hosts` under its own name, so it never collides with a real host
+called `<alias>`. `--report-version` sets the Codex version reported to
 `codex --version` (default `0.165.0`); the app refuses versions below its
 minimum.
 
@@ -86,8 +96,10 @@ minimum.
 sends to open the app-server proxy, captured from a real client.
 `codex-app-probe.txt`, `codex-app-version.txt`, `codex-app-bootstrap.txt` and
 `codex-app-kill.txt` next to it are the exec strings for the other payloads,
-each wrapped in the same launcher. The tests parse them and run the relay
-against the proxy one. When the app changes, record them again from a machine
+each wrapped in the same launcher. `codex-app-unknown.txt` is the same
+launcher around a payload the app never sends (`ls -la /`); the refusal tests
+use it. The tests parse them and run the relay against the proxy one. When
+the app changes, record them again from a machine
 the app can reach over SSH with a real sshd:
 
 1. Add a `ForceCommand` wrapper to the sshd `Match` block for the recording
@@ -97,8 +109,9 @@ the app can reach over SSH with a real sshd:
    starts the proxy session.
 3. Copy the proxy line into `internal/codex/testdata/codex-app-proxy.txt` and
    the other lines into the four other files, or, if only the launcher
-   changed, regenerate them by wrapping each payload in the new launcher. Then
-   update the contract in `AGENTS.md`.
+   changed, regenerate them by wrapping each payload in the new launcher
+   (`codex-app-unknown.txt` is always regenerated this way). Then update the
+   contract in `AGENTS.md`.
 
 ## Tests
 

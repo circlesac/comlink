@@ -27,7 +27,7 @@ Verified 2026-10-28 by recording an SSH host the app connected to:
 ## Conventions
 
 - Go, one module, one binary. Pull requests are squash-merged into `main`.
-- Layout: `main.go` declares the CLI and wires the packages; `internal/sshserver` is the SSH side, hands each exec request to a route and renders the ssh-config block; `internal/codex` is the Codex app route. Unit tests sit next to their package; tests that drive the server with a route end to end, or real OpenSSH, live in `test/`.
+- Layout: `main.go` declares the CLI and wires the packages; `internal/sshd` is the SSH side, hands each exec request to a route and renders the ssh-config block; `internal/codex` is the Codex app route. Unit tests sit next to their package; tests that drive the server with a route end to end, or real OpenSSH, live in `test/`.
 - `gofmt` and `golangci-lint` run in the test gate with `go test -race ./...` and `go vet ./...`.
 - CI runs on `runs-on: ${{ fromJSON(vars.LINUX_RUNNER) }}`.
 - No real personal or company identifiers in docs, tests or fixtures.

@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -24,7 +27,8 @@ const ReadLimit = 64 << 20
 // relayed, type preserved, to the upstream WebSocket and back. It returns
 // the exit status for the command: 0 after a clean close, 1 otherwise.
 func (r *Route) relay(ch ssh.Channel) int {
-	conn := &channelConn{Channel: ch}
+	conn := newChannelConn(ch)
+	defer func() { _ = conn.Close() }()
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
@@ -40,7 +44,7 @@ func (r *Route) relay(ch ssh.Channel) int {
 	client.SetReadLimit(ReadLimit)
 	upstream, err := r.dialUpstream()
 	if err != nil {
-		// err may quote the URL and the response status but never the header.
+		// err names the upstream without its query or userinfo and never the header.
 		r.Logger.Printf("upstream connect failed: %v", err)
 		_ = client.Close(websocket.StatusInternalError, "upstream unavailable")
 		return 1
@@ -104,13 +108,53 @@ func (r *Route) dialUpstream() (*websocket.Conn, error) {
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	return c, err
+	if err != nil {
+		return nil, redactDialError(err, r.Upstream)
+	}
+	return c, nil
 }
 
-// channelConn presents an SSH channel as a net.Conn. Close is a no-op: the
-// session handler closes the channel after the exit status has been sent.
+// redactDialError rewrites a websocket.Dial failure so that it names the
+// upstream without its query or userinfo. Go's URL and HTTP errors quote the
+// full URL, so an upstream such as wss://host/rpc?token=... would otherwise
+// put the token in the log.
+func redactDialError(err error, upstream string) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err // the cause, without the URL
+	}
+	return fmt.Errorf("dial %s: %w", redactURL(upstream), err)
+}
+
+// redactURL returns raw without its userinfo, query and fragment. A URL that
+// does not parse is not echoed at all: its secret part cannot be told apart.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid upstream URL>"
+	}
+	u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
+	return u.String()
+}
+
+// channelConn presents an SSH channel as a net.Conn. Reads go through a pipe
+// so that Close unblocks a pending Read without closing the channel: the
+// WebSocket library closes the conn when a close frame arrives or its close
+// handshake times out, and the session handler must still send the exit
+// status on the channel afterwards.
 type channelConn struct {
 	ssh.Channel
+	pr     *io.PipeReader
+	closed atomic.Bool
+}
+
+func newChannelConn(ch ssh.Channel) *channelConn {
+	pr, pw := io.Pipe()
+	go func() {
+		_, err := io.Copy(pw, ch)
+		_ = pw.CloseWithError(err)
+	}()
+	return &channelConn{Channel: ch, pr: pr}
 }
 
 type channelAddr struct{}
@@ -118,7 +162,22 @@ type channelAddr struct{}
 func (channelAddr) Network() string { return "stdio" }
 func (channelAddr) String() string  { return "stdio" }
 
-func (c *channelConn) Close() error                     { return nil }
+func (c *channelConn) Read(b []byte) (int, error) { return c.pr.Read(b) }
+
+func (c *channelConn) Write(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return c.Channel.Write(b)
+}
+
+// Close ends reads and writes on the conn; the channel itself stays open for
+// the exit status. The copying goroutine ends when the channel is closed.
+func (c *channelConn) Close() error {
+	c.closed.Store(true)
+	return c.pr.CloseWithError(net.ErrClosed)
+}
+
 func (c *channelConn) LocalAddr() net.Addr              { return channelAddr{} }
 func (c *channelConn) RemoteAddr() net.Addr             { return channelAddr{} }
 func (c *channelConn) SetDeadline(time.Time) error      { return nil }

@@ -14,7 +14,7 @@ import (
 	"github.com/alecthomas/kong"
 
 	"github.com/circlesac/comlink/internal/codex"
-	"github.com/circlesac/comlink/internal/sshserver"
+	"github.com/circlesac/comlink/internal/sshd"
 )
 
 type cli struct {
@@ -52,11 +52,11 @@ func (c *stdioCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	signer, err := sshserver.LoadOrCreateHostKey(sshserver.HostKeyPath())
+	signer, err := sshd.LoadOrCreateHostKey(sshd.HostKeyPath())
 	if err != nil {
 		return err
 	}
-	return sshserver.Serve(&sshserver.StdioConn{In: os.Stdin, Out: os.Stdout}, signer, &codex.Route{
+	return sshd.Serve(&sshd.StdioConn{In: os.Stdin, Out: os.Stdout}, signer, &codex.Route{
 		Upstream:      c.Upstream,
 		Token:         token,
 		ReportVersion: c.ReportVersion,
@@ -83,6 +83,6 @@ func (c *sshConfigCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("locate comlink executable: %w", err)
 	}
-	_, err = io.WriteString(os.Stdout, sshserver.ConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile))
+	_, err = io.WriteString(os.Stdout, sshd.ConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile))
 	return err
 }

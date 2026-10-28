@@ -14,7 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/circlesac/comlink/internal/sshserver"
+	"github.com/circlesac/comlink/internal/sshd"
 )
 
 // buildComlink compiles the binary once per test run for the OpenSSH tests.
@@ -133,7 +133,7 @@ func TestOpenSSHProxyRelay(t *testing.T) {
 		t.Fatalf("marker = %q, want %q", marker, fixtureMarker)
 	}
 
-	var conn net.Conn = &sshserver.StdioConn{In: stdout, Out: stdin}
+	var conn net.Conn = &sshd.StdioConn{In: stdout, Out: stdin}
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

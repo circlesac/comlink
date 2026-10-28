@@ -1,4 +1,4 @@
-package sshserver
+package sshd
 
 import (
 	"crypto/ed25519"
@@ -29,7 +29,10 @@ func HostKeyPath() string {
 
 // LoadOrCreateHostKey reads the ed25519 host key at path, generating and
 // persisting one (directory 0700, file 0600) on first use so that ssh's
-// StrictHostKeyChecking=accept-new pins a stable key.
+// StrictHostKeyChecking=accept-new pins a stable key. Concurrent first runs
+// (the Codex app starts several ssh processes at once) are safe: the key is
+// written to a temporary file and linked into place, so path only ever
+// holds a complete key and the loser of the race reads the winner's.
 func LoadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if b, err := os.ReadFile(path); err == nil {
 		signer, err := ssh.ParsePrivateKey(b)
@@ -52,20 +55,23 @@ func LoadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create host key directory: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, fs.ErrExist) {
-		// Another comlink won the race; use its key.
-		return LoadOrCreateHostKey(path)
-	}
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp") // mode 0600
 	if err != nil {
 		return nil, fmt.Errorf("create host key %s: %w", path, err)
 	}
+	defer func() { _ = os.Remove(f.Name()) }()
 	if err := pem.Encode(f, block); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("write host key %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("write host key %s: %w", path, err)
+	}
+	if err := os.Link(f.Name(), path); errors.Is(err, fs.ErrExist) {
+		// Another comlink won the race; use its key.
+		return LoadOrCreateHostKey(path)
+	} else if err != nil {
+		return nil, fmt.Errorf("create host key %s: %w", path, err)
 	}
 	return ssh.NewSignerFromKey(priv)
 }

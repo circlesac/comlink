@@ -1,4 +1,4 @@
-package sshserver
+package sshd
 
 import (
 	"strings"
@@ -10,6 +10,7 @@ func TestSSHConfigBlock(t *testing.T) {
 	want := "Host example-agent\n" +
 		"  User comlink\n" +
 		"  ProxyCommand '/opt/com link/comlink' stdio --upstream 'wss://agent.example.com/codex?a=%%20' --token-file /home/u/token\n" +
+		"  HostKeyAlias comlink-example-agent\n" +
 		"  StrictHostKeyChecking accept-new\n"
 	if got != want {
 		t.Fatalf("got:\n%s\nwant:\n%s", got, want)

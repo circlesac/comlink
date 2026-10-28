@@ -1,4 +1,4 @@
-package sshserver
+package sshd
 
 import (
 	"errors"
