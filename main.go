@@ -13,8 +13,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
-	"github.com/circlesac/comlink/internal/route/codex"
-	"github.com/circlesac/comlink/internal/sshconfig"
+	"github.com/circlesac/comlink/internal/codex"
 	"github.com/circlesac/comlink/internal/sshserver"
 )
 
@@ -84,6 +83,6 @@ func (c *sshConfigCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("locate comlink executable: %w", err)
 	}
-	_, err = io.WriteString(os.Stdout, sshconfig.Block(c.Alias, exe, c.Upstream, c.TokenFile))
+	_, err = io.WriteString(os.Stdout, sshserver.ConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile))
 	return err
 }

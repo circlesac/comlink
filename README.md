@@ -24,10 +24,8 @@ listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
 
 ```
 main.go                CLI declaration and wiring
-internal/sshserver/    SSH server: host key, global and session requests; hands exec to a route
-internal/route/codex/  Codex app route: command matching and the WebSocket relay
-internal/shell/        POSIX word splitting and quoting
-internal/sshconfig/    the ssh-config block
+internal/sshserver/    SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
+internal/codex/        Codex app route: command matching and the WebSocket relay
 test/                  end-to-end and real-OpenSSH tests
 ```
 
@@ -82,21 +80,25 @@ pins a stable key. `--report-version` sets the Codex version reported to
 `codex --version` (default `0.165.0`); the app refuses versions below its
 minimum.
 
-## Refreshing the Codex fixture
+## Refreshing the Codex fixtures
 
-`internal/route/codex/testdata/codex-app-proxy.txt` is the exec string the
-Codex app sends to open the app-server proxy, captured from a real client. The
-tests parse it and run the relay against it. When the app changes, record it
-again from a machine the app can reach over SSH with a real sshd:
+`internal/codex/testdata/codex-app-proxy.txt` is the exec string the Codex app
+sends to open the app-server proxy, captured from a real client.
+`codex-app-probe.txt`, `codex-app-version.txt`, `codex-app-bootstrap.txt` and
+`codex-app-kill.txt` next to it are the exec strings for the other payloads,
+each wrapped in the same launcher. The tests parse them and run the relay
+against the proxy one. When the app changes, record them again from a machine
+the app can reach over SSH with a real sshd:
 
 1. Add a `ForceCommand` wrapper to the sshd `Match` block for the recording
    user that appends `$SSH_ORIGINAL_COMMAND` to a file, one command per line,
    for example `ForceCommand sh -c 'printf "%s\n" "$SSH_ORIGINAL_COMMAND" >> ~/commands.log; exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"'`.
 2. Connect the app to that host and let it run through its probes until it
    starts the proxy session.
-3. Copy the proxy line into `internal/route/codex/testdata/codex-app-proxy.txt`
-   and the other payloads into `internal/route/codex/command_test.go` and
-   `test/fixture_test.go`, then update the contract in `AGENTS.md`.
+3. Copy the proxy line into `internal/codex/testdata/codex-app-proxy.txt` and
+   the other lines into the four other files, or, if only the launcher
+   changed, regenerate them by wrapping each payload in the new launcher. Then
+   update the contract in `AGENTS.md`.
 
 ## Tests
 
@@ -108,7 +110,7 @@ go test -race ./...
 ```
 
 Unit tests sit next to their package: shell quoting, command parsing against
-the fixture, and SSH request handling with a fake route. The integration
+the fixtures, and SSH request handling with a fake route. The integration
 tests in `test/` cover an SSH client driving the server end to end
 (port-forward request, version probe, refusals, and the proxy route relayed
 to an upstream that checks the bearer token) and, when an `ssh` binary is on

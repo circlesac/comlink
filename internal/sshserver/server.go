@@ -1,6 +1,7 @@
 // Package sshserver speaks the server side of SSH over one connection. It
 // accepts session channels and hands each exec request to a Route; it knows
-// nothing about the client on the other end.
+// nothing about the client on the other end. It also renders the
+// ~/.ssh/config block that routes an alias through comlink.
 package sshserver
 
 import (

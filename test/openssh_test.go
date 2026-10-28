@@ -14,7 +14,6 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/circlesac/comlink/internal/shell"
 	"github.com/circlesac/comlink/internal/sshserver"
 )
 
@@ -37,7 +36,7 @@ func opensshCommand(t *testing.T, bin, upstream, tokenFile, command string) *exe
 	t.Helper()
 	cmd := exec.Command("ssh",
 		"-F", "/dev/null",
-		"-o", "ProxyCommand="+shell.Quote(bin)+" stdio --upstream "+shell.Quote(upstream)+" --token-file "+shell.Quote(tokenFile),
+		"-o", "ProxyCommand="+quote(bin)+" stdio --upstream "+quote(upstream)+" --token-file "+quote(tokenFile),
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
@@ -49,6 +48,9 @@ func opensshCommand(t *testing.T, bin, upstream, tokenFile, command string) *exe
 	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+t.TempDir())
 	return cmd
 }
+
+// quote single-quotes s for the shell ssh runs the ProxyCommand with.
+func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 func TestOpenSSHVersionProbe(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
@@ -62,7 +64,7 @@ func TestOpenSSHVersionProbe(t *testing.T) {
 	}
 	stateHome := t.TempDir()
 
-	cmd := opensshCommand(t, bin, upstream.wsURL(), tokenFile, wrapLikeApp(t, versionPayload))
+	cmd := opensshCommand(t, bin, upstream.wsURL(), tokenFile, readFixture(t, "codex-app-version.txt"))
 	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+stateHome)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -84,7 +86,7 @@ func TestOpenSSHVersionProbe(t *testing.T) {
 		t.Fatalf("host key mode = %o, want 600", perm)
 	}
 
-	cmd = opensshCommand(t, bin, upstream.wsURL(), tokenFile, wrapLikeApp(t, "ls /"))
+	cmd = opensshCommand(t, bin, upstream.wsURL(), tokenFile, "ls /")
 	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+stateHome)
 	stderr.Reset()
 	cmd.Stderr = &stderr
@@ -109,7 +111,7 @@ func TestOpenSSHProxyRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := opensshCommand(t, bin, upstream.wsURL(), tokenFile, readFixture(t))
+	cmd := opensshCommand(t, bin, upstream.wsURL(), tokenFile, readFixture(t, "codex-app-proxy.txt"))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)

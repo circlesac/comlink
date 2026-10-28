@@ -19,7 +19,7 @@ import (
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/circlesac/comlink/internal/route/codex"
+	"github.com/circlesac/comlink/internal/codex"
 	"github.com/circlesac/comlink/internal/sshserver"
 )
 
@@ -222,7 +222,7 @@ func TestServerAcceptsForwardAndAnswersVersionProbe(t *testing.T) {
 	defer func() { _ = sess.Close() }()
 	var stderr bytes.Buffer
 	sess.Stderr = &stderr
-	out, err := sess.Output(wrapLikeApp(t, versionPayload))
+	out, err := sess.Output(readFixture(t, "codex-app-version.txt"))
 	if got := exitStatus(t, err); got != 0 {
 		t.Fatalf("exit status = %d, stderr %q", got, stderr.String())
 	}
@@ -233,14 +233,14 @@ func TestServerAcceptsForwardAndAnswersVersionProbe(t *testing.T) {
 
 func TestServerAcknowledgesSetupCommands(t *testing.T) {
 	client, _ := startServer(t, codex.Route{Upstream: "ws://127.0.0.1:1/unused"})
-	for name, payload := range map[string]string{"probe": probePayload, "bootstrap": bootstrapPayload, "pkill": killPayload} {
+	for name, fixture := range map[string]string{"probe": "codex-app-probe.txt", "bootstrap": "codex-app-bootstrap.txt", "pkill": "codex-app-kill.txt"} {
 		t.Run(name, func(t *testing.T) {
 			sess, err := client.NewSession()
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = sess.Close() }()
-			out, err := sess.CombinedOutput(wrapLikeApp(t, payload))
+			out, err := sess.CombinedOutput(readFixture(t, fixture))
 			if got := exitStatus(t, err); got != 0 || len(out) != 0 {
 				t.Fatalf("exit status = %d, output %q", got, out)
 			}
@@ -257,7 +257,7 @@ func TestServerRefusesUnknownCommandShellAndSubsystem(t *testing.T) {
 	}
 	var stderr bytes.Buffer
 	sess.Stderr = &stderr
-	out, err := sess.Output(wrapLikeApp(t, "rm -rf /tmp/x"))
+	out, err := sess.Output("rm -rf /tmp/x")
 	if got := exitStatus(t, err); got != 127 {
 		t.Fatalf("exit status = %d, want 127", got)
 	}
@@ -329,7 +329,7 @@ func proxySession(t *testing.T, client *ssh.Client) (*ssh.Session, net.Conn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Start(readFixture(t)); err != nil {
+	if err := sess.Start(readFixture(t, "codex-app-proxy.txt")); err != nil {
 		t.Fatal(err)
 	}
 	marker := make([]byte, len(fixtureMarker))
@@ -342,7 +342,7 @@ func proxySession(t *testing.T, client *ssh.Client) (*ssh.Session, net.Conn) {
 	// StdoutPipe returns the channel itself; hide its Close so closing the
 	// WebSocket only sends EOF (like the ssh client) instead of closing the
 	// channel before the exit status arrives.
-	return sess, &sshserver.StdioConn{In: struct{ io.Reader }{stdout}, Out: stdin}
+	return sess, &sshserver.StdioConn{In: struct{ io.Reader }{stdout}, Out: eofOKCloser{stdin}}
 }
 
 // dialOverConn opens the WebSocket the Codex app opens over the channel.
@@ -448,4 +448,17 @@ func TestProxyUpstreamCloseEndsCommand(t *testing.T) {
 	if got := exitStatus(t, sess.Wait()); got != 0 {
 		t.Fatalf("exit status = %d, want 0 after a clean upstream close", got)
 	}
+}
+
+// eofOKCloser is the session's stdin with one difference: Close treats io.EOF
+// as success. Once comlink has answered the client's close frame it ends the
+// channel, so the client's own CloseWrite can race it and report EOF on a
+// clean shutdown.
+type eofOKCloser struct{ io.WriteCloser }
+
+func (c eofOKCloser) Close() error {
+	if err := c.WriteCloser.Close(); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
