@@ -25,6 +25,7 @@ import (
 
 	"github.com/circlesac/comlink/internal/codex"
 	"github.com/circlesac/comlink/internal/sshd"
+	"github.com/circlesac/comlink/internal/upstream"
 )
 
 const testToken = "test-token-do-not-print"
@@ -196,7 +197,7 @@ func newEchoUpstream(t *testing.T) *echoUpstream {
 		if err != nil {
 			return
 		}
-		c.SetReadLimit(codex.ReadLimit)
+		c.SetReadLimit(upstream.ReadLimit)
 		for {
 			typ, data, err := c.Read(r.Context())
 			if err != nil {
@@ -252,6 +253,6 @@ func dialOverConn(t *testing.T, conn net.Conn) *websocket.Conn {
 	if err != nil {
 		t.Fatalf("dial over channel: %v", err)
 	}
-	c.SetReadLimit(codex.ReadLimit)
+	c.SetReadLimit(upstream.ReadLimit)
 	return c
 }

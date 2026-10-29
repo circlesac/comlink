@@ -8,18 +8,15 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
-)
 
-// ReadLimit is the largest WebSocket message accepted from either side. The
-// Codex app announces 16 MiB messages; the library default is 32 KiB.
-const ReadLimit = 64 << 20
+	"github.com/circlesac/comlink/internal/upstream"
+)
 
 // relay serves the app-server proxy route on ch: the client speaks WebSocket
 // over the channel (an HTTP Upgrade to ws://codex-app-server/rpc followed by
@@ -43,15 +40,14 @@ func (r *Route) relay(ch ssh.Channel) int {
 		r.Logger.Printf("client websocket handshake failed: %v", err)
 		return 1
 	}
-	client.SetReadLimit(ReadLimit)
-	upstream, err := r.dialUpstream()
+	client.SetReadLimit(upstream.ReadLimit)
+	up, err := upstream.Dial(r.Upstream, r.Token)
 	if err != nil {
 		// err names the upstream without its query or userinfo and never the header.
 		r.Logger.Printf("upstream connect failed: %v", err)
 		_ = client.Close(websocket.StatusInternalError, "upstream unavailable")
 		return 1
 	}
-	upstream.SetReadLimit(ReadLimit)
 
 	type outcome struct {
 		err      error
@@ -71,8 +67,8 @@ func (r *Route) relay(ch ssh.Channel) int {
 			}
 		}
 	}
-	go pump(client, upstream, false)
-	go pump(upstream, client, true)
+	go pump(client, up, false)
+	go pump(up, client, true)
 
 	first := <-outcomes
 	status := websocket.CloseStatus(first.err)
@@ -88,9 +84,9 @@ func (r *Route) relay(ch ssh.Channel) int {
 	}
 	if first.upstream {
 		_ = client.Close(code, reason)
-		_ = upstream.CloseNow()
+		_ = up.CloseNow()
 	} else {
-		_ = upstream.Close(code, reason)
+		_ = up.Close(code, reason)
 		_ = client.CloseNow()
 	}
 	<-outcomes
@@ -102,46 +98,6 @@ func (r *Route) relay(ch ssh.Channel) int {
 		r.Logger.Printf("upstream failed: %v", first.err)
 	}
 	return 1
-}
-
-func (r *Route) dialUpstream() (*websocket.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	var header http.Header
-	if r.Token != "" {
-		header = http.Header{"Authorization": {"Bearer " + r.Token}}
-	}
-	c, resp, err := websocket.Dial(ctx, r.Upstream, &websocket.DialOptions{HTTPHeader: header})
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	if err != nil {
-		return nil, redactDialError(err, r.Upstream)
-	}
-	return c, nil
-}
-
-// redactDialError rewrites a websocket.Dial failure so that it names the
-// upstream without its query or userinfo. Go's URL and HTTP errors quote the
-// full URL, so an upstream such as wss://host/rpc?token=... would otherwise
-// put the token in the log.
-func redactDialError(err error, upstream string) error {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		err = urlErr.Err // the cause, without the URL
-	}
-	return fmt.Errorf("dial %s: %w", redactURL(upstream), err)
-}
-
-// redactURL returns raw without its userinfo, query and fragment. A URL that
-// does not parse is not echoed at all: its secret part cannot be told apart.
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<invalid upstream URL>"
-	}
-	u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
-	return u.String()
 }
 
 // channelConn presents an SSH channel as a net.Conn. Reads go through a pipe

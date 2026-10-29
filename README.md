@@ -7,14 +7,19 @@ Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
 `ProxyCommand` starts `comlink`, which speaks the server side of SSH on its
 own stdin/stdout, answers the few shell commands the client sends and relays
 the agent session to a WebSocket endpoint. There is no sshd, no shell and no
-listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
+listening port. ACP clients, which launch their agent as a local subprocess,
+run `comlink acp` instead; it bridges stdio to the remote agent's WebSocket
+(see [ACP clients](#acp-clients)). The contracts comlink implements are in
+[AGENTS.md](AGENTS.md).
 
 ## Boundaries
 
 - comlink does not implement any agent protocol. It recognises the command
   that opens an agent session and moves WebSocket messages between the SSH
-  channel and the upstream endpoint. The protocol lives in the endpoint.
-- Each supported client is a route. The Codex app is the first route.
+  channel (or, for ACP, stdio) and the upstream endpoint. The protocol lives
+  in the endpoint.
+- Each supported client is a route. The Codex app is the first route; ACP
+  clients are the second, through `comlink acp`.
 - Commands are matched against what the client actually sends; nothing is
   ever executed. An unrecognised command is logged to stderr and exits 127.
 - The upstream token is a secret: it is read from a file or the environment
@@ -25,7 +30,9 @@ listening port. The contract comlink implements is in [AGENTS.md](AGENTS.md).
 ```
 main.go                CLI declaration and wiring
 internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
-internal/codex/        Codex app route: command matching, the WebSocket relay and the upstream token
+internal/codex/        Codex app route: command matching and the WebSocket relay
+internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
+internal/upstream/     upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors
 test/                  all tests, black-box through the exported API; testdata/ holds the captured Codex commands
 ```
 
@@ -98,6 +105,31 @@ with a real host called `<alias>`. `--report-version` sets the Codex version
 reported to `codex --version` (default `0.165.0`); the app refuses versions
 below its minimum.
 
+## ACP clients
+
+An ACP client such as Zed starts its agent as a local subprocess and speaks
+newline-delimited JSON-RPC on the subprocess's stdin/stdout. When the agent
+serves ACP over a WebSocket instead (`/acp`, one message per text frame,
+`Authorization: Bearer <token>`), configure comlink as the agent command:
+
+```sh
+comlink acp --upstream wss://agent.example.com/acp \
+  --token-file ~/.config/comlink/token
+```
+
+The client's agent command is `comlink` with those arguments; comlink
+needs no other setup (no host key, no ssh config).
+
+The token rules are the same as for `comlink stdio`: `--token-file`, else
+`$COMLINK_TOKEN`, else no `Authorization` header, with a warning for a token
+file others can read. comlink does not parse the messages: each stdin line
+goes to the upstream as one text frame and each text frame comes back as one
+stdout line. stdout carries nothing else; diagnostics go to stderr. When the
+client closes stdin, comlink closes the upstream with status 1000 and exits
+0; when the upstream closes, comlink exits 0 for a normal close and 1
+otherwise. An upstream that cannot be reached or refuses the token is one
+stderr line naming the URL without its query or userinfo, and exit 1.
+
 ## Refreshing the Codex fixtures
 
 `test/testdata/codex-app-proxy.txt` is the exec string the Codex app
@@ -158,6 +190,15 @@ and the route's log.
 - `hostkey_test.go`: host key creation under concurrent first runs, the
   state path (an error without `XDG_STATE_HOME` or a home directory), and
   the error cases.
+- `acp_test.go`: the ACP bridge against a WebSocket upstream that checks
+  the bearer token. Line-to-frame and frame-to-line mapping (`\r`, empty
+  lines, a line that is not JSON, a last line without a newline), many
+  messages in order with one of several MiB, stdin EOF closing with 1000 and
+  exit 0, upstream closes (1000 and 1001 exit 0, an error status or a drop
+  exit 1), a wrong token, an unreachable or unparsable upstream (one
+  redacted log line, exit 1), a binary frame (1003), an oversized line
+  (1009), a failed stdout write (1001); and the built binary run as an
+  agent subprocess with the token from a file or `$COMLINK_TOKEN`.
 - `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe,
   a refusal and the proxy relay through real OpenSSH with the built binary
   as its `ProxyCommand`; and the built binary run directly: the token file
@@ -166,9 +207,9 @@ and the route's log.
 
 Coverage is measured across the module from `test/` with `-coverpkg=./...`;
 CI fails when the total statement coverage is below 80%. `main.go` is only
-exercised through the tests in `openssh_test.go`, which run the built binary,
-so it does not count towards the profile. CI runs the same commands and then
-builds the binary and runs `--help` and `--version`.
+exercised through the tests in `openssh_test.go` and `acp_test.go` that run
+the built binary, so it does not count towards the profile. CI runs the same
+commands and then builds the binary and runs `--help` and `--version`.
 
 ## Tooling
 

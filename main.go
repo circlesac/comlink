@@ -1,7 +1,8 @@
 // Command comlink is an SSH front door for coding-agent clients. It runs as an
 // ssh ProxyCommand, speaks the server side of SSH on its own stdin/stdout,
 // answers the few shell commands the client sends and relays the agent
-// session to a WebSocket endpoint.
+// session to a WebSocket endpoint. For ACP clients that launch their agent as
+// a local subprocess, it bridges stdio to the remote agent's WebSocket.
 package main
 
 import (
@@ -13,6 +14,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/circlesac/comlink/internal/acp"
 	"github.com/circlesac/comlink/internal/codex"
 	"github.com/circlesac/comlink/internal/sshd"
 )
@@ -21,12 +23,18 @@ type cli struct {
 	Version   kong.VersionFlag `help:"Print the comlink version and exit."`
 	Stdio     stdioCmd         `cmd:"" help:"Serve one SSH connection on stdin/stdout (the ssh ProxyCommand mode)."`
 	SSHConfig sshConfigCmd     `cmd:"" name:"ssh-config" help:"Print a ~/.ssh/config block that routes an alias through comlink."`
+	ACP       acpCmd           `cmd:"" name:"acp" help:"Bridge an ACP client's stdin/stdout (newline-delimited JSON-RPC) to a WebSocket agent endpoint."`
 }
 
 type stdioCmd struct {
 	Upstream      string `required:"" placeholder:"URL" help:"WebSocket endpoint that receives the agent session (ws:// or wss://)."`
 	TokenFile     string `type:"path" placeholder:"PATH" help:"File whose trimmed contents are the upstream bearer token. Falls back to $COMLINK_TOKEN."`
 	ReportVersion string `default:"0.165.0" placeholder:"VERSION" help:"Codex version reported to 'codex --version'."`
+}
+
+type acpCmd struct {
+	Upstream  string `required:"" placeholder:"URL" help:"WebSocket endpoint that serves ACP (ws:// or wss://)."`
+	TokenFile string `type:"path" placeholder:"PATH" help:"File whose trimmed contents are the upstream bearer token. Falls back to $COMLINK_TOKEN."`
 }
 
 type sshConfigCmd struct {
@@ -66,6 +74,19 @@ func (c *stdioCmd) Run() error {
 		ReportVersion: c.ReportVersion,
 		Logger:        logger,
 	})
+}
+
+func (c *acpCmd) Run() error {
+	logger := log.New(os.Stderr, "comlink: ", 0)
+	token, err := loadToken(c.TokenFile, logger)
+	if err != nil {
+		return err
+	}
+	bridge := &acp.Bridge{Upstream: c.Upstream, Token: token, Logger: logger}
+	if status := bridge.Run(os.Stdin, os.Stdout); status != 0 {
+		os.Exit(status)
+	}
+	return nil
 }
 
 // loadToken returns the trimmed contents of path, or $COMLINK_TOKEN when path
