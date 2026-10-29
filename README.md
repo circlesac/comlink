@@ -1,6 +1,7 @@
 # comlink
 
-SSH front door that relays coding-agent clients to WebSocket agent endpoints.
+Front door that relays coding-agent clients to WebSocket agent endpoints:
+over SSH for the Codex desktop app, over stdio for ACP clients.
 
 A client that only knows how to reach a remote machine over SSH (today the
 Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
@@ -46,7 +47,7 @@ their usage; `comlink --version` prints the version.
 
 ```
 main.go                CLI declaration and wiring
-internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the `codex ssh-config` block
+internal/sshd/         SSH server, client-agnostic: host key, global and session requests; hands exec to a route; renders an ssh config block around a given ProxyCommand
 internal/codex/        Codex app route: command matching and the WebSocket relay
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
 internal/upstream/     upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors
@@ -141,7 +142,10 @@ The token rules are the same as for `comlink codex proxy`: `--token-file`, else
 `$COMLINK_TOKEN`, else no `Authorization` header, with a warning for a token
 file others can read. comlink does not parse the messages: each stdin line
 goes to the upstream as one text frame and each text frame comes back as one
-stdout line. stdout carries nothing else; diagnostics go to stderr. When the
+stdout line. A binary frame, or a text frame that contains a newline (`\n`
+or `\r`, which the client would read as several lines), is not written; comlink
+closes the upstream with status 1003, logs one line and exits 1. stdout
+carries nothing else; diagnostics go to stderr. When the
 client closes stdin, comlink closes the upstream with status 1000 and exits
 0; when the upstream closes, comlink exits 0 for a normal close and 1
 otherwise. An upstream that cannot be reached or refuses the token is one
@@ -201,9 +205,9 @@ and the route's log.
 - `sshd_test.go`: the server with a stand-in route. The exec handoff,
   one exec per session, malformed requests, the port-forward replies, the
   refused shell, pty, subsystem and channel types, and `StdioConn`.
-- `config_test.go`: the `codex ssh-config` block, its shell quoting, that `sh`
-  splits the `ProxyCommand` line back into the original arguments, and the
-  accepted and refused aliases.
+- `config_test.go`: the ssh config block for a given `ProxyCommand`
+  argument list, its shell quoting, that `sh` splits the `ProxyCommand` line
+  back into the original arguments, and the accepted and refused aliases.
 - `hostkey_test.go`: host key creation under concurrent first runs, the
   state path (an error without `XDG_STATE_HOME` or a home directory), and
   the error cases.
@@ -213,14 +217,16 @@ and the route's log.
   messages in order with one of several MiB, stdin EOF closing with 1000 and
   exit 0, upstream closes (1000 and 1001 exit 0, an error status or a drop
   exit 1), a wrong token, an unreachable or unparsable upstream (one
-  redacted log line, exit 1), a binary frame (1003), an oversized line
+  redacted log line, exit 1), a binary frame or a text frame holding `\n` or
+  `\r` (1003, nothing of it on stdout), an oversized line
   (1009), a failed stdout write (1001); and the built binary run as an
   agent subprocess with the token from a file or `$COMLINK_TOKEN`.
 - `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe,
   a refusal and the proxy relay through real OpenSSH with the built binary
   as its `ProxyCommand`; and the built binary run directly: the token file
-  permission warning, a missing token file, the missing home directory and a
-  refused alias.
+  permission warning, a missing token file, the missing home directory, the
+  `codex ssh-config` block running this binary as `codex proxy` (with and
+  without `--token-file`) and a refused alias.
 
 Coverage is measured across the module from `test/` with `-coverpkg=./...`;
 CI fails when the total statement coverage is below 80%. `main.go` is only

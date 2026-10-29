@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +59,8 @@ func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + 
 // stdin is empty, so it gets as far as the SSH handshake and stops there;
 // what it prints on stderr before that is the startup behaviour: a warning
 // for a token file others can read, and a clear failure when there is no
-// place for the host key. codex ssh-config refuses a bad alias before printing.
+// place for the host key. codex ssh-config prints a ProxyCommand that runs
+// this binary as 'codex proxy', and refuses a bad alias before printing.
 func TestBinaryStartupChecks(t *testing.T) {
 	bin := buildComlink(t)
 	proxy := func(t *testing.T, dir string, env []string, tokenFile string) (stderr string, err error) {
@@ -126,16 +128,42 @@ func TestBinaryStartupChecks(t *testing.T) {
 			t.Fatalf("working directory holds %v (%v), want nothing created there", entries, err)
 		}
 	})
-	t.Run("codex ssh-config alias", func(t *testing.T) {
-		sshConfig := func(alias string) (stdout, stderr string, err error) {
-			cmd := exec.Command(bin, "codex", "ssh-config", "--alias", alias, "--upstream", "wss://agent.example.com/codex")
+	t.Run("codex ssh-config", func(t *testing.T) {
+		sshConfig := func(alias string, args ...string) (stdout, stderr string, err error) {
+			cmd := exec.Command(bin, append([]string{"codex", "ssh-config", "--alias", alias, "--upstream", "wss://agent.example.com/codex"}, args...)...)
 			var outBuf, errBuf bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
 			err = cmd.Run()
 			return outBuf.String(), errBuf.String(), err
 		}
-		if stdout, stderr, err := sshConfig("example-agent"); err != nil || !strings.HasPrefix(stdout, "Host example-agent\n") {
-			t.Fatalf("valid alias: %v, stdout %q, stderr %q", err, stdout, stderr)
+		// The ProxyCommand runs this binary as 'codex proxy' with the same
+		// upstream, and passes --token-file only when one was given.
+		tokenFile := filepath.Join(t.TempDir(), "50% dir", "token")
+		for _, tc := range []struct {
+			args []string
+			want []string
+		}{
+			{nil, []string{"codex", "proxy", "--upstream", "wss://agent.example.com/codex"}},
+			{[]string{"--token-file", tokenFile}, []string{"codex", "proxy", "--upstream", "wss://agent.example.com/codex", "--token-file", tokenFile}},
+		} {
+			stdout, stderr, err := sshConfig("example-agent", tc.args...)
+			if err != nil || !strings.HasPrefix(stdout, "Host example-agent\n  User comlink\n  ProxyCommand ") ||
+				!strings.HasSuffix(stdout, "\n  HostKeyAlias comlink-example-agent\n  StrictHostKeyChecking accept-new\n") {
+				t.Fatalf("%q: %v, stdout %q, stderr %q", tc.args, err, stdout, stderr)
+			}
+			line := strings.ReplaceAll(proxyCommand(t, stdout), "%%", "%") // ssh's token expansion
+			out, err := exec.Command("sh", "-c", `printf '%s\0' `+line).Output()
+			if err != nil {
+				t.Fatalf("sh -c %q: %v", line, err)
+			}
+			got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+			exe, err := filepath.EvalSymlinks(got[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want, _ := filepath.EvalSymlinks(bin); exe != want || !slices.Equal(got[1:], tc.want) {
+				t.Fatalf("%q: ProxyCommand runs %q, want %s %q", tc.args, got, want, tc.want)
+			}
 		}
 		stdout, stderr, err := sshConfig("agent\nHost *")
 		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() == 0 {

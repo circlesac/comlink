@@ -353,6 +353,44 @@ func TestACPBinaryFrameEndsRun(t *testing.T) {
 	}
 }
 
+// TestACPNewlineFrameEndsRun: a text message holding \n or \r would reach
+// the client as several lines, so none of it is written to stdout; the
+// messages before it are, the upstream is told 1003 and Run exits 1 with one
+// log line.
+func TestACPNewlineFrameEndsRun(t *testing.T) {
+	for _, data := range []string{"{\"a\":1}\n{\"b\":2}", "{\"a\":1}\r{\"b\":2}", "{\"a\":1}\r\n", "\n"} {
+		t.Run(fmt.Sprintf("%q", data), func(t *testing.T) {
+			closes := make(chan websocket.StatusCode, 1)
+			srv := newACPUpstream(t, func(ctx context.Context, c *websocket.Conn) {
+				for _, msg := range []string{`{"ok":true}`, data} {
+					if err := c.Write(ctx, websocket.MessageText, []byte(msg)); err != nil {
+						return
+					}
+				}
+				_, _, err := c.Read(ctx)
+				closes <- websocket.CloseStatus(err)
+			})
+			s := startACP(t, wsURLOf(srv)+"/acp", testToken)
+
+			if line := s.readLine(t); line != "{\"ok\":true}\n" {
+				t.Fatalf("first stdout line = %q", line)
+			}
+			if got := s.wait(t); got != 1 {
+				t.Fatalf("exit status = %d, want 1", got)
+			}
+			if rest := s.rest(t); rest != "" {
+				t.Fatalf("stdout carries %q", rest)
+			}
+			if status := <-closes; status != websocket.StatusUnsupportedData {
+				t.Fatalf("upstream close status = %d, want %d", status, websocket.StatusUnsupportedData)
+			}
+			if log := s.log.String(); log != "comlink: upstream sent a message that contains a newline\n" {
+				t.Fatalf("log %q, want one line naming the newline", log)
+			}
+		})
+	}
+}
+
 // TestACPOversizedLineEndsRun: a stdin line longer than the read limit is
 // not split or truncated; the upstream is told 1009 and Run exits 1.
 func TestACPOversizedLineEndsRun(t *testing.T) {

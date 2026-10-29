@@ -6,23 +6,19 @@ import (
 )
 
 // ConfigBlock renders a ~/.ssh/config Host block whose ProxyCommand runs
-// 'comlink codex proxy'. ssh hands the ProxyCommand line to the user's shell after expanding
-// %-tokens, so every argument is shell-quoted and % is doubled. The token
-// file is referenced by path only; its contents never appear. HostKeyAlias
-// keeps comlink's pinned key apart from a real host called alias in
-// known_hosts. The alias may hold only letters, digits, '-', '_' and '.':
-// anything else (spaces, newlines, the ssh patterns '*', '?' and '!') would
-// change what the Host line means, so it is refused.
-func ConfigBlock(alias, exe, upstream, tokenFile string) (string, error) {
+// command, the executable followed by its arguments. ssh hands the
+// ProxyCommand line to the user's shell after expanding %-tokens, so every
+// argument is shell-quoted and % is doubled. HostKeyAlias keeps comlink's
+// pinned key apart from a real host called alias in known_hosts. The alias
+// may hold only letters, digits, '-', '_' and '.': anything else (spaces,
+// newlines, the ssh patterns '*', '?' and '!') would change what the Host
+// line means, so it is refused.
+func ConfigBlock(alias string, command []string) (string, error) {
 	if !validAlias(alias) {
 		return "", fmt.Errorf("invalid alias %q: use only letters, digits, '-', '_' and '.'", alias)
 	}
-	args := []string{exe, "codex", "proxy", "--upstream", upstream}
-	if tokenFile != "" {
-		args = append(args, "--token-file", tokenFile)
-	}
-	quoted := make([]string, len(args))
-	for i, a := range args {
+	quoted := make([]string, len(command))
+	for i, a := range command {
 		quoted[i] = strings.ReplaceAll(shellQuote(a), "%", "%%")
 	}
 	var b strings.Builder

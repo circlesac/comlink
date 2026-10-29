@@ -7,6 +7,7 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,10 @@ type Bridge struct {
 // messages are text, and stdout carries nothing but protocol lines.
 var errBinary = errors.New("upstream sent a binary message")
 
+// errNewline ends the session when a text message from the upstream holds a
+// newline (\n or \r): the client would read it as several lines.
+var errNewline = errors.New("upstream sent a message that contains a newline")
+
 // stdoutError is a failed write to stdout: the client has gone away.
 type stdoutError struct{ err error }
 
@@ -45,8 +50,9 @@ func (e upstreamWriteError) Unwrap() error { return e.err }
 // Run relays until one side ends and returns the exit status. Each stdin line
 // (without its newline; a trailing \r is dropped and empty lines are skipped)
 // is sent as one text frame, and each text frame from the upstream is written
-// to stdout followed by \n. At stdin EOF the upstream is closed with 1000 and
-// Run returns 0 once the close handshake completes. When the upstream closes
+// to stdout followed by \n; a binary frame or a text frame holding \n or \r
+// is not written and ends the session with 1003. At stdin EOF the upstream
+// is closed with 1000 and Run returns 0 once the close handshake completes. When the upstream closes
 // first, Run returns without reading stdin further: 0 for a normal or
 // going-away close, 1 otherwise. A failed connect returns 1.
 func (b *Bridge) Run(stdin io.Reader, stdout io.Writer) int {
@@ -105,7 +111,7 @@ func (b *Bridge) Run(stdin io.Reader, stdout io.Writer) int {
 }
 
 // upstreamEnded handles the reader's end: the upstream closed or failed, it
-// sent a binary message, or stdout could not be written.
+// sent a binary message or one with a newline, or stdout could not be written.
 func (b *Bridge) upstreamEnded(conn *websocket.Conn, err error) int {
 	var outErr stdoutError
 	switch {
@@ -116,6 +122,10 @@ func (b *Bridge) upstreamEnded(conn *websocket.Conn, err error) int {
 	case errors.Is(err, errBinary):
 		b.Logger.Printf("%v", err)
 		_ = conn.Close(websocket.StatusUnsupportedData, "binary message")
+		return 1
+	case errors.Is(err, errNewline):
+		b.Logger.Printf("%v", err)
+		_ = conn.Close(websocket.StatusUnsupportedData, "message contains a newline")
 		return 1
 	}
 	_ = conn.CloseNow()
@@ -151,7 +161,7 @@ func forwardLines(stdin io.Reader, conn *websocket.Conn) error {
 }
 
 // forwardFrames writes each text frame from conn to stdout as one line until
-// the read or the write fails.
+// the read or the write fails, or a frame is binary or holds a newline.
 func forwardFrames(conn *websocket.Conn, stdout io.Writer) error {
 	for {
 		typ, data, err := conn.Read(context.Background())
@@ -160,6 +170,9 @@ func forwardFrames(conn *websocket.Conn, stdout io.Writer) error {
 		}
 		if typ != websocket.MessageText {
 			return errBinary
+		}
+		if bytes.ContainsAny(data, "\r\n") {
+			return errNewline
 		}
 		if _, err := stdout.Write(append(data, '\n')); err != nil {
 			return stdoutError{err}

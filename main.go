@@ -1,4 +1,4 @@
-// Command comlink is an SSH front door for coding-agent clients. It runs as an
+// Command comlink is a front door for coding-agent clients. It runs as an
 // ssh ProxyCommand, speaks the server side of SSH on its own stdin/stdout,
 // answers the few shell commands the client sends and relays the agent
 // session to a WebSocket endpoint. For ACP clients that launch their agent as
@@ -51,7 +51,7 @@ func main() {
 	var c cli
 	ctx := kong.Parse(&c,
 		kong.Name("comlink"),
-		kong.Description("SSH front door that relays coding-agent clients to WebSocket agent endpoints."),
+		kong.Description("Front door that relays coding-agent clients to WebSocket agent endpoints: SSH for the Codex desktop app, stdio for ACP clients."),
 		kong.UsageOnError(),
 		kong.Vars{"version": "comlink " + Version},
 	)
@@ -116,7 +116,12 @@ func (c *codexSSHConfigCmd) Run() error {
 	if err != nil {
 		return fmt.Errorf("locate comlink executable: %w", err)
 	}
-	block, err := sshd.ConfigBlock(c.Alias, exe, c.Upstream, c.TokenFile)
+	// The token file is referenced by path only; its contents never appear.
+	command := []string{exe, "codex", "proxy", "--upstream", c.Upstream}
+	if c.TokenFile != "" {
+		command = append(command, "--token-file", c.TokenFile)
+	}
+	block, err := sshd.ConfigBlock(c.Alias, command)
 	if err != nil {
 		return err
 	}
