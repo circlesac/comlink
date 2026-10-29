@@ -6,7 +6,7 @@ import (
 )
 
 // ConfigBlock renders a ~/.ssh/config Host block whose ProxyCommand runs
-// comlink. ssh hands the ProxyCommand line to the user's shell after expanding
+// 'comlink codex proxy'. ssh hands the ProxyCommand line to the user's shell after expanding
 // %-tokens, so every argument is shell-quoted and % is doubled. The token
 // file is referenced by path only; its contents never appear. HostKeyAlias
 // keeps comlink's pinned key apart from a real host called alias in
@@ -17,7 +17,7 @@ func ConfigBlock(alias, exe, upstream, tokenFile string) (string, error) {
 	if !validAlias(alias) {
 		return "", fmt.Errorf("invalid alias %q: use only letters, digits, '-', '_' and '.'", alias)
 	}
-	args := []string{exe, "stdio", "--upstream", upstream}
+	args := []string{exe, "codex", "proxy", "--upstream", upstream}
 	if tokenFile != "" {
 		args = append(args, "--token-file", tokenFile)
 	}

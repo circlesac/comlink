@@ -4,7 +4,7 @@ SSH front door that relays coding-agent clients to WebSocket agent endpoints.
 
 A client that only knows how to reach a remote machine over SSH (today the
 Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
-`ProxyCommand` starts `comlink`, which speaks the server side of SSH on its
+`ProxyCommand` starts `comlink codex proxy`, which speaks the server side of SSH on its
 own stdin/stdout, answers the few shell commands the client sends and relays
 the agent session to a WebSocket endpoint. There is no sshd, no shell and no
 listening port. ACP clients, which launch their agent as a local subprocess,
@@ -25,11 +25,28 @@ run `comlink acp` instead; it bridges stdio to the remote agent's WebSocket
 - The upstream token is a secret: it is read from a file or the environment
   and never printed, logged or placed in an error.
 
+## Commands
+
+Commands are grouped by client:
+
+```
+comlink codex proxy --upstream URL [--token-file PATH] [--report-version V]
+comlink codex ssh-config --alias NAME --upstream URL [--token-file PATH]
+comlink acp --upstream URL [--token-file PATH]
+```
+
+`comlink codex proxy` serves one SSH connection on stdin/stdout and is what
+the ssh `ProxyCommand` runs; `comlink codex ssh-config` prints the
+`~/.ssh/config` block that sets it up (see [Setup](#setup)). `comlink acp` is
+the agent command of an ACP client (see [ACP clients](#acp-clients)).
+`comlink --help`, `comlink codex --help` and `--help` on each command print
+their usage; `comlink --version` prints the version.
+
 ## Layout
 
 ```
 main.go                CLI declaration and wiring
-internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the ssh-config block
+internal/sshd/         SSH server: host key, global and session requests; hands exec to a route; the `codex ssh-config` block
 internal/codex/        Codex app route: command matching and the WebSocket relay
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
 internal/upstream/     upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors
@@ -63,7 +80,7 @@ ssh config block and append it to `~/.ssh/config`:
 ```sh
 mkdir -p ~/.config/comlink
 (umask 077; printf '%s' "$TOKEN" > ~/.config/comlink/token)
-comlink ssh-config --alias example-agent \
+comlink codex ssh-config --alias example-agent \
   --upstream wss://agent.example.com/codex \
   --token-file ~/.config/comlink/token >> ~/.ssh/config
 ```
@@ -73,19 +90,19 @@ The block looks like this (the token file is referenced by path only):
 ```
 Host example-agent
   User comlink
-  ProxyCommand /usr/local/bin/comlink stdio --upstream wss://agent.example.com/codex --token-file /home/alice/.config/comlink/token
+  ProxyCommand /usr/local/bin/comlink codex proxy --upstream wss://agent.example.com/codex --token-file /home/alice/.config/comlink/token
   HostKeyAlias comlink-example-agent
   StrictHostKeyChecking accept-new
 ```
 
-The alias may contain only letters, digits, `-`, `_` and `.`; `ssh-config`
+The alias may contain only letters, digits, `-`, `_` and `.`; `codex ssh-config`
 refuses anything else (spaces, newlines, the ssh patterns `*`, `?` and `!`)
 with a non-zero exit and prints nothing.
 
 Then add `example-agent` as an SSH connection in the Codex app. Without
-`--token-file`, `comlink stdio` reads the token from `$COMLINK_TOKEN`; with
+`--token-file`, `comlink codex proxy` reads the token from `$COMLINK_TOKEN`; with
 neither, the upstream is dialled without an `Authorization` header. A token
-file that group or others can read is still used, but `comlink stdio` prints
+file that group or others can read is still used, but `comlink codex proxy` prints
 a one-line warning naming the file (never the token) to stderr.
 
 Check the alias by hand:
@@ -94,11 +111,11 @@ Check the alias by hand:
 ssh example-agent codex --version
 ```
 
-`comlink stdio` generates an ed25519 host key on first run and keeps it at
+`comlink codex proxy` generates an ed25519 host key on first run and keeps it at
 `$XDG_STATE_HOME/comlink/host_ed25519` (default
 `~/.local/state/comlink/host_ed25519`) so `StrictHostKeyChecking accept-new`
 pins a stable key. When `XDG_STATE_HOME` is unset and the home directory
-cannot be determined, `comlink stdio` exits non-zero instead of keeping the
+cannot be determined, `comlink codex proxy` exits non-zero instead of keeping the
 key in the current directory. The block's `HostKeyAlias comlink-<alias>`
 stores that key in `known_hosts` under its own name, so it never collides
 with a real host called `<alias>`. `--report-version` sets the Codex version
@@ -120,7 +137,7 @@ comlink acp --upstream wss://agent.example.com/acp \
 The client's agent command is `comlink` with those arguments; comlink
 needs no other setup (no host key, no ssh config).
 
-The token rules are the same as for `comlink stdio`: `--token-file`, else
+The token rules are the same as for `comlink codex proxy`: `--token-file`, else
 `$COMLINK_TOKEN`, else no `Authorization` header, with a warning for a token
 file others can read. comlink does not parse the messages: each stdin line
 goes to the upstream as one text frame and each text frame comes back as one
@@ -184,7 +201,7 @@ and the route's log.
 - `sshd_test.go`: the server with a stand-in route. The exec handoff,
   one exec per session, malformed requests, the port-forward replies, the
   refused shell, pty, subsystem and channel types, and `StdioConn`.
-- `config_test.go`: the `ssh-config` block, its shell quoting, that `sh`
+- `config_test.go`: the `codex ssh-config` block, its shell quoting, that `sh`
   splits the `ProxyCommand` line back into the original arguments, and the
   accepted and refused aliases.
 - `hostkey_test.go`: host key creation under concurrent first runs, the

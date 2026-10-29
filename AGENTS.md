@@ -1,6 +1,6 @@
 # Repository guidance
 
-comlink is an SSH front door for coding-agent clients. A client that only knows how to reach a remote machine over SSH — today the Codex desktop app's SSH connections — runs `ssh <alias>`; the alias's `ProxyCommand` starts `comlink`, which speaks the server side of SSH on its own stdin/stdout, answers the few shell commands the client sends, and relays the agent protocol to a WebSocket endpoint. There is no sshd, no shell and no listening port. For ACP clients, which launch their agent as a local subprocess, `comlink acp` is that subprocess and bridges its stdin/stdout to the remote agent's WebSocket.
+comlink is an SSH front door for coding-agent clients. A client that only knows how to reach a remote machine over SSH — today the Codex desktop app's SSH connections — runs `ssh <alias>`; the alias's `ProxyCommand` starts `comlink codex proxy`, which speaks the server side of SSH on its own stdin/stdout, answers the few shell commands the client sends, and relays the agent protocol to a WebSocket endpoint. There is no sshd, no shell and no listening port. For ACP clients, which launch their agent as a local subprocess, `comlink acp` is that subprocess and bridges its stdin/stdout to the remote agent's WebSocket.
 
 ## Boundaries
 
@@ -31,10 +31,14 @@ Verified 2026-10-28 by recording an SSH host the app connected to:
 - stdin EOF closes the upstream with 1000 and exits 0 once the close handshake completes. An upstream close exits 0 for 1000/1001 and 1 otherwise, without waiting for stdin. A failed connect is one stderr line naming the upstream without query or userinfo, and exit 1. A failed stdout write closes the upstream with 1001 and exits 1.
 - stdout carries nothing but protocol lines; diagnostics go to stderr.
 
+## Command surface
+
+- Commands are grouped by client: `comlink codex proxy --upstream URL [--token-file PATH] [--report-version V]` (the ssh `ProxyCommand` mode), `comlink codex ssh-config --alias NAME --upstream URL [--token-file PATH]` (prints the `~/.ssh/config` block whose `ProxyCommand` runs `<exe> codex proxy --upstream ...`), and `comlink acp --upstream URL [--token-file PATH]`. A new client gets its own command group.
+
 ## Conventions
 
 - Go, one module, one binary. Pull requests are squash-merged into `main`.
-- Layout: `main.go` declares the CLI and wires the packages; `internal/sshd` is the SSH side, hands each exec request to a route and renders the ssh-config block; `internal/codex` is the Codex app route; `internal/acp` is the ACP stdio bridge; `internal/upstream` dials the upstream WebSocket for both and redacts its URL in errors. `internal/` holds no tests. All tests live in `test/` (one package, one file per subject) and reach the code only through its exported entry points, mostly by driving `sshd.Serve` with the Codex route over a real SSH connection and `acp.Bridge.Run` over pipes; nothing is exported or hooked for the tests' sake.
+- Layout: `main.go` declares the CLI and wires the packages; `internal/sshd` is the SSH side, hands each exec request to a route and renders the `codex ssh-config` block; `internal/codex` is the Codex app route; `internal/acp` is the ACP stdio bridge; `internal/upstream` dials the upstream WebSocket for both and redacts its URL in errors. `internal/` holds no tests. All tests live in `test/` (one package, one file per subject) and reach the code only through its exported entry points, mostly by driving `sshd.Serve` with the Codex route over a real SSH connection and `acp.Bridge.Run` over pipes; nothing is exported or hooked for the tests' sake.
 - `gofmt` and `golangci-lint` run in the test gate with `go vet ./...` and `go test -race -coverpkg=./... -coverprofile=coverage.out ./...`; CI fails when total statement coverage is below 80%.
 - CI runs on `runs-on: ${{ fromJSON(vars.LINUX_RUNNER) }}`.
 - No real personal or company identifiers in docs, tests or fixtures.

@@ -26,7 +26,7 @@ func TestConfigBlock(t *testing.T) {
 	got := configBlock(t, "example-agent", "/opt/com link/comlink", "wss://agent.example.com/codex?a=%20", "/home/u/token")
 	want := "Host example-agent\n" +
 		"  User comlink\n" +
-		"  ProxyCommand '/opt/com link/comlink' stdio --upstream 'wss://agent.example.com/codex?a=%%20' --token-file /home/u/token\n" +
+		"  ProxyCommand '/opt/com link/comlink' codex proxy --upstream 'wss://agent.example.com/codex?a=%%20' --token-file /home/u/token\n" +
 		"  HostKeyAlias comlink-example-agent\n" +
 		"  StrictHostKeyChecking accept-new\n"
 	if got != want {
@@ -93,7 +93,7 @@ func TestConfigBlockQuotesArguments(t *testing.T) {
 	}
 	for _, tc := range cases {
 		block := configBlock(t, "a", "/x/comlink", tc.in, "")
-		if want := "\n  ProxyCommand /x/comlink stdio --upstream " + tc.want + "\n"; !strings.Contains(block, want) {
+		if want := "\n  ProxyCommand /x/comlink codex proxy --upstream " + tc.want + "\n"; !strings.Contains(block, want) {
 			t.Errorf("upstream %q: block\n%s\nwant %q", tc.in, block, want)
 		}
 	}
@@ -123,7 +123,7 @@ func TestConfigBlockProxyCommandSplitsBack(t *testing.T) {
 		t.Fatalf("sh -c %q: %v", line, err)
 	}
 	got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
-	want := []string{exe, "stdio", "--upstream", upstream, "--token-file", tokenFile}
+	want := []string{exe, "codex", "proxy", "--upstream", upstream, "--token-file", tokenFile}
 	if !slices.Equal(got, want) {
 		t.Fatalf("shell split %q into %q, want %q", line, got, want)
 	}

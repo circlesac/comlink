@@ -20,13 +20,17 @@ import (
 )
 
 type cli struct {
-	Version   kong.VersionFlag `help:"Print the comlink version and exit."`
-	Stdio     stdioCmd         `cmd:"" help:"Serve one SSH connection on stdin/stdout (the ssh ProxyCommand mode)."`
-	SSHConfig sshConfigCmd     `cmd:"" name:"ssh-config" help:"Print a ~/.ssh/config block that routes an alias through comlink."`
-	ACP       acpCmd           `cmd:"" name:"acp" help:"Bridge an ACP client's stdin/stdout (newline-delimited JSON-RPC) to a WebSocket agent endpoint."`
+	Version kong.VersionFlag `help:"Print the comlink version and exit."`
+	Codex   codexCmd         `cmd:"" name:"codex" help:"Codex desktop app SSH connections."`
+	ACP     acpCmd           `cmd:"" name:"acp" help:"Bridge an ACP client's stdin/stdout (newline-delimited JSON-RPC) to a WebSocket agent endpoint."`
 }
 
-type stdioCmd struct {
+type codexCmd struct {
+	Proxy     codexProxyCmd     `cmd:"" name:"proxy" help:"Serve one SSH connection on stdin/stdout (the ssh ProxyCommand mode)."`
+	SSHConfig codexSSHConfigCmd `cmd:"" name:"ssh-config" help:"Print a ~/.ssh/config block that routes an alias through comlink."`
+}
+
+type codexProxyCmd struct {
 	Upstream      string `required:"" placeholder:"URL" help:"WebSocket endpoint that receives the agent session (ws:// or wss://)."`
 	TokenFile     string `type:"path" placeholder:"PATH" help:"File whose trimmed contents are the upstream bearer token. Falls back to $COMLINK_TOKEN."`
 	ReportVersion string `default:"0.165.0" placeholder:"VERSION" help:"Codex version reported to 'codex --version'."`
@@ -37,10 +41,10 @@ type acpCmd struct {
 	TokenFile string `type:"path" placeholder:"PATH" help:"File whose trimmed contents are the upstream bearer token. Falls back to $COMLINK_TOKEN."`
 }
 
-type sshConfigCmd struct {
+type codexSSHConfigCmd struct {
 	Alias     string `required:"" placeholder:"NAME" help:"Host alias to print."`
-	Upstream  string `required:"" placeholder:"URL" help:"WebSocket endpoint passed to 'comlink stdio --upstream'."`
-	TokenFile string `type:"path" placeholder:"PATH" help:"Token file passed to 'comlink stdio --token-file'."`
+	Upstream  string `required:"" placeholder:"URL" help:"WebSocket endpoint passed to 'comlink codex proxy --upstream'."`
+	TokenFile string `type:"path" placeholder:"PATH" help:"Token file passed to 'comlink codex proxy --token-file'."`
 }
 
 func main() {
@@ -54,7 +58,7 @@ func main() {
 	ctx.FatalIfErrorf(ctx.Run())
 }
 
-func (c *stdioCmd) Run() error {
+func (c *codexProxyCmd) Run() error {
 	logger := log.New(os.Stderr, "comlink: ", 0)
 	token, err := loadToken(c.TokenFile, logger)
 	if err != nil {
@@ -107,7 +111,7 @@ func loadToken(path string, logger *log.Logger) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-func (c *sshConfigCmd) Run() error {
+func (c *codexSSHConfigCmd) Run() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate comlink executable: %w", err)
