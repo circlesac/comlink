@@ -14,7 +14,7 @@ var errLocked = errors.New("locked")
 
 // acquire opens path and takes an exclusive flock on it without blocking.
 // The lock lives as long as the returned file is open and is released by
-// the kernel when the process ends, so it tells `up` processes apart from
+// the kernel when the process ends, so it tells session processes apart from
 // stale records without trusting a pid. A Close that unlinks the lock file
 // may race with this; the open file is checked to still be the one at path
 // and the attempt is repeated otherwise. pid is unused here.

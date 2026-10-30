@@ -1,18 +1,23 @@
-// Package session is the registry of named sessions. `comlink up --name
-// NAME` registers NAME for as long as it runs; `comlink codex proxy --name
-// NAME` and `comlink acp --name NAME` look NAME up to find the server, and
-// `comlink list` shows what is up. Everything lives under the state
-// directory ($XDG_STATE_HOME/comlink, default ~/.local/state/comlink):
+// Package session is the registry of the Codex app's named sessions.
+// `comlink codex --name NAME` registers NAME for as long as it runs;
+// `comlink codex --stdio --name NAME`, which ssh runs for the alias, looks NAME
+// up to find the server, and `comlink codex list` shows what is up.
+// Everything lives under the state directory ($XDG_STATE_HOME/comlink,
+// default ~/.local/state/comlink):
 //
-//	run/NAME.json   the record: name, server, the two endpoints and the pid
+//	run/NAME.json   the record: name, server, the /codex endpoint and the pid
 //	run/NAME.token  the bearer token, mode 0600 (never in the record)
-//	run/NAME.lock   held with flock by the `up` process for its lifetime
+//	run/NAME.lock   held with flock by the session process for its lifetime
 //	ssh/NAME.conf   the ~/.ssh/config Host block for the Codex app
 //
+// The record, the token file and the ssh config file are each written to a
+// temporary file in the same directory and renamed into place, so ssh, the
+// Codex app and `codex --stdio --name` never read a half-written file.
+//
 // A session is up while its lock is held: the lock is released by the
-// kernel when the `up` process ends, however it ends, so a record whose lock
-// is free is stale even if its pid has been reused by another process. The
-// pid in the record is for display only.
+// kernel when the session process ends, however it ends, so a record whose
+// lock is free is stale even if its pid has been reused by another process.
+// The pid in the record is for display only.
 package session
 
 import (
@@ -20,19 +25,19 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/circlesac/comlink/internal/upstream"
 )
 
-// Record is what `up` registers for a name.
+// Record is what `comlink codex` registers for a name.
 type Record struct {
 	Name   string `json:"name"`
 	Server string `json:"server"` // base URL; the token is never here
 	Codex  string `json:"codex"`  // <server>/codex, the Codex app-server endpoint
-	ACP    string `json:"acp"`    // <server>/acp, the ACP endpoint
 	PID    int    `json:"pid"`
 }
 
@@ -40,7 +45,7 @@ type Record struct {
 type NotUpError struct{ Name string }
 
 func (e *NotUpError) Error() string {
-	return fmt.Sprintf("session %q is not up: run 'comlink up --name %s --server URL' first", e.Name, e.Name)
+	return fmt.Sprintf("session %q is not up: run 'comlink codex --name %s --server URL' first", e.Name, e.Name)
 }
 
 // Store is the registry under one state directory.
@@ -87,22 +92,7 @@ func ValidName(name string) bool {
 	return true
 }
 
-// Endpoints returns the Codex app-server and ACP endpoints a comlink server
-// serves under its base URL: <server>/codex and <server>/acp, joined
-// whether or not the base has a path prefix or a trailing slash. The scheme
-// must be ws or wss.
-func Endpoints(server string) (codex, acp string, err error) {
-	u, err := url.Parse(server)
-	if err != nil {
-		return "", "", fmt.Errorf("server URL: %w", err)
-	}
-	if (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
-		return "", "", fmt.Errorf("server URL %q: want ws://host[/prefix] or wss://host[/prefix]", server)
-	}
-	return u.JoinPath("codex").String(), u.JoinPath("acp").String(), nil
-}
-
-// Session is a registered name, held by the `up` process until Close.
+// Session is a registered name, held by the session process until Close.
 type Session struct {
 	Record
 	Replaced *Record // the stale record Start removed, if any
@@ -112,13 +102,13 @@ type Session struct {
 
 // Start registers name with server and token, writes sshConfig as the
 // name's ssh config file, and returns the session, which stays up until
-// Close. It fails when name is already up. A stale record (its `up` process
-// is gone) is removed and replaced, and returned as Replaced.
+// Close. It fails when name is already up. A stale record (its session
+// process is gone) is removed and replaced, and returned as Replaced.
 func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 	if !ValidName(name) {
 		return nil, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.'", name)
 	}
-	codex, acp, err := Endpoints(server)
+	codex, err := upstream.Endpoint(server, "codex")
 	if err != nil {
 		return nil, err
 	}
@@ -136,11 +126,11 @@ func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 		return nil, err
 	}
 	sess := &Session{
-		Record: Record{Name: name, Server: server, Codex: codex, ACP: acp, PID: os.Getpid()},
+		Record: Record{Name: name, Server: server, Codex: codex, PID: os.Getpid()},
 		store:  s,
 		lock:   lock,
 	}
-	// The lock is ours, so whatever a previous `up` left behind is stale.
+	// The lock is ours, so whatever a previous session left behind is stale.
 	if oldErr == nil {
 		sess.Replaced = &old
 	}
@@ -152,29 +142,50 @@ func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 	return sess, nil
 }
 
-// write creates the record, the token file and the ssh config file.
+// write creates the token file, the ssh config file and the record, each
+// renamed into place whole.
 func (sess *Session) write(token, sshConfig string) error {
 	s, name := sess.store, sess.Name
-	if err := os.WriteFile(s.tokenPath(name), []byte(token), 0o600); err != nil {
+	if err := writeFile(s.tokenPath(name), []byte(token), 0o600); err != nil {
 		return fmt.Errorf("write token file: %w", err)
 	}
-	if err := os.WriteFile(s.confPath(name), []byte(sshConfig), 0o600); err != nil {
+	if err := writeFile(s.confPath(name), []byte(sshConfig), 0o600); err != nil {
 		return fmt.Errorf("write ssh config: %w", err)
 	}
 	b, err := json.MarshalIndent(sess.Record, "", "  ")
 	if err != nil {
 		return err
 	}
-	// The record is renamed into place so a reader never sees a partial one.
-	tmp := s.recordPath(name) + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write record: %w", err)
-	}
-	if err := os.Rename(tmp, s.recordPath(name)); err != nil {
-		_ = os.Remove(tmp)
+	if err := writeFile(s.recordPath(name), append(b, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write record: %w", err)
 	}
 	return nil
+}
+
+// writeFile replaces path with data and mode atomically: it writes a
+// temporary file in the same directory, sets its mode and renames it over
+// path, so a reader sees the old file or the new one and never part of
+// either. The temporary name ends in ".tmp" plus a random suffix, which
+// neither the record (*.json) nor the ssh config (*.conf) globs match. The
+// temporary file is removed when anything fails.
+func writeFile(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // Close removes the files Start created and releases the lock. The lock
@@ -208,7 +219,7 @@ func (s *Store) read(name string) (Record, error) {
 }
 
 // Load returns the record and the token of name when it is up, and a
-// *NotUpError when it has no record or its `up` process is gone. It does
+// *NotUpError when it has no record or its session process is gone. It does
 // not remove a stale record; List and Start do.
 func (s *Store) Load(name string) (Record, string, error) {
 	if !ValidName(name) {
@@ -232,7 +243,7 @@ func (s *Store) Load(name string) (Record, string, error) {
 }
 
 // List returns the records that are up, sorted by name, and removes and
-// returns those whose `up` process is gone.
+// returns those whose session process is gone.
 func (s *Store) List() (live, stale []Record, err error) {
 	entries, err := os.ReadDir(s.runDir())
 	if errors.Is(err, fs.ErrNotExist) {

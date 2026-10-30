@@ -67,90 +67,115 @@ func (s *Store) includes(config string) bool {
 }
 
 // Include puts the Include line at the top of the ssh config at path, as
-// include does, and prints what it did on out.
+// include does, and prints what it did on out. When path is a symbolic link
+// the file it names is the one changed, and the message shows both.
 func (s *Store) Include(path string, out io.Writer) error {
 	result, err := s.include(path)
 	if err != nil {
 		return err
 	}
+	shown := path
+	if result.Target != path {
+		shown = path + " -> " + result.Target
+	}
 	switch {
 	case result.Created:
-		_, _ = fmt.Fprintf(out, "created %s with %q\n", path, s.IncludeLine())
+		_, _ = fmt.Fprintf(out, "created %s with %q\n", shown, s.IncludeLine())
 	case result.Added:
-		_, _ = fmt.Fprintf(out, "added %q to the top of %s\n", s.IncludeLine(), path)
+		_, _ = fmt.Fprintf(out, "added %q to the top of %s\n", s.IncludeLine(), shown)
 		if result.Backup != "" {
 			_, _ = fmt.Fprintf(out, "previous content backed up to %s\n", result.Backup)
 		}
 	default:
-		_, _ = fmt.Fprintf(out, "%s already includes %s; nothing changed\n", path, s.IncludePattern())
+		_, _ = fmt.Fprintf(out, "%s already includes %s; nothing changed\n", shown, s.IncludePattern())
 	}
 	return nil
 }
 
 // includeResult says what include did to the file.
 type includeResult struct {
+	Target  string // the file read and written: path, or what its symlinks name
 	Added   bool   // the line was added; false when it was already there
 	Created bool   // the file did not exist and was created
 	Backup  string // path of the backup written before the first change, or ""
 }
 
 // include puts the Include line at the top of the ssh config at path so it
-// applies before any Host or Match block. A missing file is created with
-// mode 0600 (and its directory with 0700). Before the first change to an
-// existing file its content is copied to path + ".comlink-bak"; a backup
-// that already exists is kept. Everything else in the file is preserved
-// byte for byte. Running include again changes nothing.
+// applies before any Host or Match block. When path is a symbolic link (or a
+// chain of them) the file it finally names is changed and the links are left
+// as they are; a link to a file that does not exist yet creates that file.
+// A missing file is created with mode 0600 (and its directory with 0700).
+// Before the first change to an existing file its content is copied to the
+// file's own path + ".comlink-bak" (next to the target, not the link); a
+// backup that already exists is kept. Everything else in the file is
+// preserved byte for byte and its mode is kept. The new content is renamed
+// into place whole. Running include again changes nothing.
 func (s *Store) include(path string) (includeResult, error) {
+	target, err := resolveLinks(path)
+	if err != nil {
+		return includeResult{}, err
+	}
 	line := s.IncludeLine() + "\n"
-	old, err := os.ReadFile(path)
+	old, err := os.ReadFile(target)
 	if errors.Is(err, fs.ErrNotExist) {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return includeResult{}, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return includeResult{}, fmt.Errorf("create %s: %w", filepath.Dir(target), err)
 		}
-		if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
-			return includeResult{}, fmt.Errorf("write %s: %w", path, err)
+		if err := writeFile(target, []byte(line), 0o600); err != nil {
+			return includeResult{}, fmt.Errorf("write %s: %w", target, err)
 		}
-		return includeResult{Added: true, Created: true}, nil
+		return includeResult{Target: target, Added: true, Created: true}, nil
 	}
 	if err != nil {
 		return includeResult{}, err
 	}
 	if s.includes(string(old)) {
-		return includeResult{}, nil
+		return includeResult{Target: target}, nil
 	}
-	info, err := os.Stat(path)
+	info, err := os.Stat(target)
 	if err != nil {
 		return includeResult{}, err
 	}
 	mode := info.Mode().Perm()
-	result := includeResult{Added: true}
-	backup := path + ".comlink-bak"
+	result := includeResult{Target: target, Added: true}
+	backup := target + ".comlink-bak"
 	if _, err := os.Stat(backup); errors.Is(err, fs.ErrNotExist) {
 		if err := os.WriteFile(backup, old, mode); err != nil {
 			return includeResult{}, fmt.Errorf("write backup %s: %w", backup, err)
 		}
 		result.Backup = backup
 	}
-	// Written next to path and renamed into place so the file is never
-	// half-written; the mode is set before the rename.
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".comlink.*")
-	if err != nil {
-		return includeResult{}, fmt.Errorf("write %s: %w", path, err)
-	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if _, err := tmp.Write(append([]byte(line), old...)); err != nil {
-		_ = tmp.Close()
-		return includeResult{}, fmt.Errorf("write %s: %w", path, err)
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return includeResult{}, fmt.Errorf("write %s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return includeResult{}, fmt.Errorf("write %s: %w", path, err)
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return includeResult{}, fmt.Errorf("write %s: %w", path, err)
+	if err := writeFile(target, append([]byte(line), old...), mode); err != nil {
+		return includeResult{}, fmt.Errorf("write %s: %w", target, err)
 	}
 	return result, nil
+}
+
+// resolveLinks follows path through symbolic links to the path they finally
+// name, which need not exist. Only links at the last component are followed:
+// the path is returned as written when it is not a link. A relative link is
+// taken relative to the real directory that holds it.
+func resolveLinks(path string) (string, error) {
+	for range 40 { // the kernel's own limit on a chain of links
+		info, err := os.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) || err == nil && info.Mode()&fs.ModeSymlink == 0 {
+			return path, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		dest, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(dest) {
+			dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+			if err != nil {
+				return "", err
+			}
+			dest = filepath.Join(dir, dest)
+		}
+		path = dest
+	}
+	return "", fmt.Errorf("resolve %s: too many levels of symbolic links", path)
 }

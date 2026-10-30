@@ -5,15 +5,17 @@ over SSH for the Codex desktop app, over stdio for ACP clients.
 
 A client that only knows how to reach a remote machine over SSH (today the
 Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
-`ProxyCommand` starts `comlink codex proxy`, which speaks the server side of SSH on its
-own stdin/stdout, answers the few shell commands the client sends and relays
+`ProxyCommand` starts `comlink codex --stdio`, which speaks the server side of
+SSH on its own stdin/stdout, answers the few shell commands the client sends and relays
 the agent session to a WebSocket endpoint. There is no sshd, no shell and no
-listening port. ACP clients, which launch their agent as a local subprocess,
-run `comlink acp` instead; it bridges stdio to the remote agent's WebSocket
-(see [ACP clients](#acp-clients)). `comlink up --name NAME --server URL`
-makes one agent available to both kinds of client under a stable name for
-as long as it runs (see [Sessions](#sessions)). The contracts comlink
-implements are in [AGENTS.md](AGENTS.md).
+listening port. The Codex app finds hosts through `~/.ssh/config`, so
+`comlink codex --name NAME --server URL` registers NAME as such a host for
+as long as it runs (see [Codex app](#codex-app)). ACP clients launch their
+agent as a local subprocess when they need it, so they need no
+registration: their agent command is `comlink acp --server URL`, which
+bridges stdio to the remote agent's WebSocket and ends with the client (see
+[ACP clients](#acp-clients)). The contracts comlink implements are in
+[AGENTS.md](AGENTS.md).
 
 ## Boundaries
 
@@ -31,23 +33,30 @@ implements are in [AGENTS.md](AGENTS.md).
 ## Commands
 
 ```
-comlink up --name NAME --server URL [--token-file PATH]
-comlink list
-comlink ssh-include
-comlink codex proxy (--name NAME | --upstream URL [--token-file PATH]) [--report-version V]
-comlink acp (--name NAME | --upstream URL [--token-file PATH])
+comlink codex --name NAME --server URL [--token-file PATH]
+comlink codex --stdio (--name NAME | --server URL [--token-file PATH]) [--report-version V]
+comlink codex list
+comlink codex ssh-include
+comlink acp --server URL [--token-file PATH]
 ```
 
-`comlink up` registers a named session and holds it in the foreground;
-`comlink list` prints the names that are up; `comlink ssh-include` adds the
-one line to `~/.ssh/config` that lets the Codex app find every session (see
-[Sessions](#sessions)). The client commands are grouped by client:
-`comlink codex proxy` serves one SSH connection on stdin/stdout and is what
-the ssh `ProxyCommand` runs; `comlink acp` is the agent command of an ACP
-client (see [ACP clients](#acp-clients)). Each takes either `--name`, the
-session to reach, or `--upstream`, an endpoint URL with its own token.
-`comlink --help`, `comlink codex --help` and `--help` on each command print
-their usage; `comlink --version` prints the version.
+Commands are grouped by client. `comlink codex --name NAME --server URL`
+registers a Codex session and holds it in the foreground. `comlink codex
+--stdio` serves one SSH connection on stdin/stdout; ssh runs it as the
+session's `ProxyCommand` and you normally never run it yourself (see
+[How the Codex app connects](#how-the-codex-app-connects)). Both are
+`comlink codex` itself, with no subcommand; which flags go together is
+checked when it runs: without `--stdio`, `--name` and `--server` are both
+required and `--report-version` is refused; with it, exactly one of
+`--name` and `--server`, and `--token-file` only with `--server`.
+`comlink codex list` prints the names that are up; `comlink codex
+ssh-include` adds the one line to `~/.ssh/config` that lets the Codex app
+find every session; neither takes the flags of `comlink codex`.
+`comlink acp` is the agent command of an ACP client (see
+[ACP clients](#acp-clients)). `--server` is always a comlink server's base
+URL: the Codex commands use `<server>/codex` and `comlink acp` uses
+`<server>/acp`. `comlink --help`, `comlink codex --help` and `--help` on
+each command print their usage; `comlink --version` prints the version.
 
 ## Layout
 
@@ -56,8 +65,8 @@ main.go                CLI declaration and wiring
 internal/sshd/         SSH server, client-agnostic: host key, global and session requests; hands exec to a route; renders an ssh config block around a given ProxyCommand
 internal/codex/        Codex app route: command matching and the WebSocket relay
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
-internal/session/      named sessions: the record, token and ssh config files under the state directory, liveness by file lock, the ~/.ssh/config Include, and the up / list / resolve commands behind main.go
-internal/upstream/     upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors; token loading from a file or $COMLINK_TOKEN
+internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, the ~/.ssh/config Include, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
+internal/upstream/     the <server>/codex and <server>/acp endpoints of a base URL; upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors; token loading from a file or $COMLINK_TOKEN
 test/                  all tests, black-box through the exported API and the built binary; testdata/ holds the captured Codex commands
 ```
 
@@ -80,18 +89,37 @@ This needs `git` to be able to authenticate to GitHub (for example through
 `gh auth setup-git` or an SSH key with a `url.<ssh>.insteadOf` rewrite),
 because `go install` fetches the module with git.
 
-## Sessions
+## Codex app
 
 A comlink server serves both protocols under one base URL: the Codex
 app-server protocol at `<server>/codex` and ACP at `<server>/acp`. A server
 that implements only one of them just rejects the other when a client uses
-it. `comlink up` makes that server available under a name, to the Codex app
-and to ACP clients, for as long as it runs:
+it. The Codex app only connects to hosts it finds in `~/.ssh/config`, so it
+needs a named, registered session. Set that up once:
+
+```sh
+comlink codex ssh-include
+```
+
+It puts `Include /home/alice/.local/state/comlink/ssh/*.conf` (the absolute
+path of the session directory) at the top of `~/.ssh/config`, creating the
+file with mode 0600 if there is none, so it applies before any `Host`
+block. The previous content is kept byte for byte below it and copied to
+`~/.ssh/config.comlink-bak` the first time the file changes, and the file's
+mode is kept. When `~/.ssh/config` is a symbolic link (for example into a
+dotfiles checkout), the link is left as it is and the file it finally
+points to gets the line; the backup then sits next to that file, as
+`<target>.comlink-bak`, and the output names both paths. A link to a file
+that does not exist yet creates that file. Running it again changes
+nothing. The file is rewritten by renaming a complete copy into place, so
+ssh never reads half of it.
+
+Then start a session and leave it running:
 
 ```sh
 mkdir -p ~/.config/comlink
 (umask 077; printf '%s' "$TOKEN" > ~/.config/comlink/token)
-comlink up --name example-agent --server wss://agent.example.com \
+comlink codex --name example-agent --server wss://agent.example.com \
   --token-file ~/.config/comlink/token
 ```
 
@@ -99,10 +127,20 @@ It prints what is available and stays in the foreground:
 
 ```
 example-agent is up (pid 4242)
-  server:       wss://agent.example.com
-  Codex app:    SSH connection "example-agent" (ssh example-agent)
-  ACP clients:  agent command /usr/local/bin/comlink acp --name example-agent
+  server:     wss://agent.example.com
+  Codex app:  SSH connection "example-agent" (ssh example-agent)
 Press Ctrl-C to stop.
+```
+
+Add `example-agent` as an SSH connection in the app. While the session
+runs, the session directory holds the alias's `Host` block:
+
+```
+Host example-agent
+  User comlink
+  ProxyCommand /usr/local/bin/comlink codex --stdio --name example-agent
+  HostKeyAlias comlink-example-agent
+  StrictHostKeyChecking accept-new
 ```
 
 Ctrl-C (SIGINT) or SIGTERM ends it with exit 0 and removes everything it
@@ -111,90 +149,87 @@ name is a run of letters, digits, `-`, `_` and `.`; it is the ssh alias and
 part of the file names, so anything else is refused. The token comes from
 `--token-file`, else `$COMLINK_TOKEN`, else the server is dialled without
 an `Authorization` header; a token file that group or others can read is
-used with a one-line warning naming the file.
+used with a one-line warning naming the file. The session prints a reminder
+on stderr when `~/.ssh/config` lacks the Include line; it never edits that
+file itself. Check an alias by hand with `ssh example-agent codex
+--version`.
 
-Client-side configuration is written once and never edited again:
+### How the Codex app connects
 
-- **Codex app.** Run `comlink ssh-include` once. It puts
-  `Include /home/alice/.local/state/comlink/ssh/*.conf` (the absolute path
-  of the session directory) at the top of `~/.ssh/config` (creating the file
-  with mode 0600 if there is none), so it applies before any `Host` block; the previous content is kept byte for byte below it and
-  copied to `~/.ssh/config.comlink-bak` the first time the file changes.
-  Running it again changes nothing. Then add `example-agent` as an SSH
-  connection in the app. While `up` runs, that directory holds the alias's
-  `Host` block:
+The app never talks to comlink directly. It runs `ssh example-agent`, and
+ssh, finding the alias's `Host` block through the Include, starts the block's
+`ProxyCommand`, `comlink codex --stdio --name example-agent`, and speaks SSH
+over that process's stdin and stdout instead of a TCP connection. That
+process is the whole SSH server for one connection: it answers the few
+commands the app sends (the `codex` probe, `codex --version`, the app-server
+bootstrap and `pkill`) without running anything, and when the app opens its
+app-server session it relays that session's WebSocket messages to the
+session's `<server>/codex` with the session's token. It exits when ssh
+closes the connection, so each connection the app opens starts its own.
 
-  ```
-  Host example-agent
-    User comlink
-    ProxyCommand /usr/local/bin/comlink codex proxy --name example-agent
-    HostKeyAlias comlink-example-agent
-    StrictHostKeyChecking accept-new
-  ```
+`--stdio --name NAME` reads the session's server and token. When NAME is
+not up it exits non-zero at once with one stderr line, `session "NAME" is
+not up: run 'comlink codex --name NAME --server URL' first`, which ssh
+shows. `--stdio --server URL [--token-file PATH]` takes the place of
+`--name` for a server that is not registered as a session (with a
+hand-written `ProxyCommand`); it dials `<server>/codex`.
 
-  `up` prints a reminder on stderr when `~/.ssh/config` lacks the Include
-  line; it never edits that file itself. Check an alias by hand with
-  `ssh example-agent codex --version`.
-- **ACP clients.** Configure the agent command as
-  `comlink acp --name example-agent`.
-
-`comlink codex proxy --name NAME` and `comlink acp --name NAME` read the
-session's server and token and use `<server>/codex` and `<server>/acp`.
-When NAME is not up they exit non-zero at once with one stderr line,
-`session "NAME" is not up: run 'comlink up --name NAME --server URL' first`,
-which the ssh client or the ACP client shows. Both commands also take
-`--upstream URL [--token-file PATH]` instead of `--name`, for an endpoint
-that is not registered as a session.
-
-`comlink list` prints each name that is up with its pid and server URL
-(never the token), one per line, and removes records whose `up` process is
-gone.
+`comlink codex list` prints each name that is up with its pid and server URL
+(never the token), one per line, and removes records whose session process
+is gone.
 
 Everything lives under `$XDG_STATE_HOME/comlink` (default
-`~/.local/state/comlink`); `up` exits non-zero when `XDG_STATE_HOME` is
+`~/.local/state/comlink`); a session exits non-zero when `XDG_STATE_HOME` is
 unset and the home directory cannot be determined:
 
 ```
-run/NAME.json    the record: name, server, the /codex and /acp endpoints, pid (mode 0600)
+run/NAME.json    the record: name, server, the /codex endpoint, pid (mode 0600)
 run/NAME.token   the token, and nothing else (mode 0600; never in the record or the ssh config)
-run/NAME.lock    held with flock by the up process for its lifetime
+run/NAME.lock    held with flock by the session process for its lifetime
 ssh/NAME.conf    the Host block above (mode 0600)
-host_ed25519     the host key comlink codex proxy pins (see below)
+host_ed25519     the host key comlink codex --stdio pins (see below)
 ```
 
-A session is up while its lock is held. The kernel releases the lock when
-the `up` process ends, however it ends, so a record left behind by a killed
-`up` is stale even if its pid has since been reused; `up` on that name
-removes it and continues, and `list` removes it. The pid in the record is
-for display. On a build without flock (not unix) liveness falls back to
-whether the recorded pid exists.
+The record, the token file and the ssh config file are each written to a
+temporary file in the same directory (whose name matches neither `*.json`
+nor `*.conf`) and renamed into place, so ssh, the Codex app and `codex
+--stdio --name` never read a half-written file.
 
-`comlink codex proxy` generates an ed25519 host key on first run and keeps it at
+A session is up while its lock is held. The kernel releases the lock when
+the session process ends, however it ends, so a record left behind by a
+killed session is stale even if its pid has since been reused; a new
+session on that name removes it and continues, and `list` removes it. The
+pid in the record is for display. On a build without flock (not unix)
+liveness falls back to whether the recorded pid exists.
+
+`comlink codex --stdio` generates an ed25519 host key on first run and keeps it at
 `$XDG_STATE_HOME/comlink/host_ed25519` so `StrictHostKeyChecking accept-new`
 pins a stable key. The block's `HostKeyAlias comlink-<alias>`
 stores that key in `known_hosts` under its own name, so it never collides
-with a real host called `<alias>`. `--report-version` sets the Codex version
-reported to `codex --version` (default `0.165.0`); the app refuses versions
-below its minimum.
+with a real host called `<alias>`. `--report-version` (with `--stdio`) sets
+the Codex version reported to `codex --version` (default `0.165.0`); the app
+refuses versions below its minimum.
 
 ## ACP clients
 
-An ACP client such as Zed starts its agent as a local subprocess and speaks
-newline-delimited JSON-RPC on the subprocess's stdin/stdout. When the agent
-serves ACP over a WebSocket instead (`/acp`, one message per text frame,
-`Authorization: Bearer <token>`), configure comlink as the agent command,
-by session name or by endpoint:
+An ACP client such as Zed starts its agent as a local subprocess when it
+needs it and speaks newline-delimited JSON-RPC on the subprocess's
+stdin/stdout. When the agent is a comlink server, which serves ACP over a
+WebSocket at `<server>/acp` (one message per text frame,
+`Authorization: Bearer <token>`), configure comlink as the agent command:
 
 ```sh
-comlink acp --name example-agent
-comlink acp --upstream wss://agent.example.com/acp \
+comlink acp --server wss://agent.example.com \
   --token-file ~/.config/comlink/token
 ```
 
-The client's agent command is `comlink` with those arguments; comlink
-needs no other setup (no host key, no ssh config).
+The client's agent command is `comlink` with those arguments. The process
+lives as long as the client keeps it, so there is nothing to register and
+nothing else to set up (no session, no host key, no ssh config). `--server`
+is joined like the Codex session's: `wss://h/x` and `wss://h/x/` both dial
+`wss://h/x/acp`.
 
-With `--upstream` the token rules are the same as for `comlink codex proxy`: `--token-file`, else
+The token rules are the same as for a Codex session: `--token-file`, else
 `$COMLINK_TOKEN`, else no `Authorization` header, with a warning for a token
 file others can read. comlink does not parse the messages: each stdin line
 goes to the upstream as one text frame and each text frame comes back as one
@@ -278,40 +313,53 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   redacted log line, exit 1), a binary frame or a text frame holding `\n` or
   `\r` (1003, nothing of it on stdout), an oversized line
   (1009), a failed stdout write (1001); and the built binary run as an
-  agent subprocess with the token from a file or `$COMLINK_TOKEN`.
-- `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe,
-  a refusal and the proxy relay through real OpenSSH with the built binary
-  as its `ProxyCommand`; and the built binary run directly: the token file
-  permission warning, a missing token file and the missing home directory.
-- `session_test.go`: the session registry in process. The `/codex` and
-  `/acp` endpoints for bases with and without a path prefix or trailing
+  agent subprocess with the token from a file or `$COMLINK_TOKEN`, dialling
+  `<server>/acp` for bases with and without a path prefix or trailing slash
+  and writing nothing under the home or state directory.
+- `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe
+  (also with `--report-version`), a refusal and the proxy relay through
+  real OpenSSH with the built binary as its `ProxyCommand` (`codex --stdio
+  --server`); and the built binary run directly: the token file permission
+  warning, a missing token file and the missing home directory.
+- `session_test.go`: the Codex session registry in process. The `/codex`
+  and `/acp` endpoints for bases with and without a path prefix or trailing
   slash, the name rule, the state directory from `XDG_STATE_HOME` or the
-  home directory, `Start`/`Load`/`List`/`Close` with the file modes and the
-  token kept out of the record, a refused second start, stale records
-  (lock not held) removed by `List` and replaced by `Start` while `Load`
-  reports them as not up, `Up` driven to its ready line and ended through
-  its context, `Resolve`, `PrintList`, and the `~/.ssh/config` Include:
-  created private, prepended with the rest byte-identical and the mode
-  kept, backed up once, idempotent, the spellings ssh accepts, and the
-  failure cases.
+  home directory, `Start`/`Load`/`List`/`Close` with the file modes, no
+  temporary file left beside them and the token kept out of the record, a
+  refused second start, a failed write undone, stale records (lock not
+  held) removed by `List` and replaced by `Start` while `Load` reports them
+  as not up, `Up` driven to its ready line and ended through its context,
+  `Resolve`, `PrintList`, the flag combinations of `comlink codex`
+  (`Flags.Check`, `Flags.CheckUnset`) and the endpoint `--stdio` relays to
+  (`Flags.Endpoint`, with `--server` without a state directory and with
+  `--name` for a session that is or is not up), and the `~/.ssh/config`
+  Include: created private,
+  prepended with the rest byte-identical and the mode kept, backed up once,
+  idempotent, the spellings ssh accepts, the failure cases, and a config
+  that is a symlink (absolute, a relative chain, dangling, a loop): the
+  links stay as they were and the target gets the line and the backup.
 - `token_test.go`: the token from a file or `$COMLINK_TOKEN`, trimmed, the
   permission warning naming the path and a missing file.
 - `up_test.go`: the built binary with a temporary `HOME` and
-  `XDG_STATE_HOME`. `up` writes the record, token and ssh config with
-  private modes and no token outside the token file, prints what is
-  available and the ssh-include hint, and removes exactly its files on
-  SIGTERM or SIGINT with exit 0; a second `up` on a name that is up is
-  refused naming the pid; a killed `up` leaves a stale record that the next
-  `up` replaces and `list` removes; `list` output; `ssh-include` creating,
-  prepending, backing up once and changing nothing on a second run; `codex
-  proxy --name` through real OpenSSH with a config that Includes the session
-  directory, answering the version probe and relaying the app-server session
-  to `<server>/codex` with the session's token, then failing with the
-  not-up line once `up` has stopped; `acp --name` relaying to `<server>/acp`
-  and failing fast afterwards; three names up at once, with and without a
-  path prefix or trailing slash, each reaching its own server; and the
-  refused arguments (bad name or server, both or neither of `--name` and
-  `--upstream`, `--token-file` with `--name`).
+  `XDG_STATE_HOME`. `codex --name NAME --server URL` writes the record, token and ssh config with private modes, nothing else
+  and no token outside the token file, prints the alias and the
+  ssh-include hint, and removes exactly its files on SIGTERM or SIGINT with
+  exit 0; a second session on a name that is up is refused naming the pid;
+  a killed session leaves a stale record that the next one replaces and
+  `codex list` removes; `codex list` output; `codex ssh-include` creating,
+  prepending, backing up once, changing nothing on a second run, and
+  writing through a symlinked `~/.ssh/config`; `codex --stdio --name`
+  through real OpenSSH with a config that Includes the session directory, answering
+  the version probe and relaying the app-server session to `<server>/codex`
+  with the session's token, then failing with the not-up line once the
+  session has stopped; three names up at once, with and without a path
+  prefix or trailing slash, each reaching its own server through OpenSSH;
+  and the refused arguments (bad name or server, a session without
+  `--name` or `--server`, `--report-version` without `--stdio`, both or
+  neither of `--name` and `--server` with `--stdio`, `--token-file` with
+  `--stdio --name`, the flags of `codex` given to `list` or `ssh-include`,
+  and the removed `proxy` and `up` subcommands of `codex`, top-level `up`,
+  `list` and `ssh-include`, `--upstream` and `acp --name`).
 
 Coverage is measured across the module from `test/` with `-coverpkg=./...`;
 CI fails when the total statement coverage is below 80%. `main.go` is only

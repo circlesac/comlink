@@ -1,5 +1,6 @@
 // Package upstream dials the WebSocket endpoint that receives an agent
-// session. It is shared by every route: the bearer token goes only into the
+// session. It is shared by every route: it maps a comlink server's base URL
+// to a protocol's endpoint, the bearer token goes only into the
 // Authorization header, and errors name the endpoint without its secrets.
 package upstream
 
@@ -21,6 +22,21 @@ import (
 // relay. The Codex app announces 16 MiB messages; the library default is
 // 32 KiB.
 const ReadLimit = 64 << 20
+
+// Endpoint returns the endpoint a comlink server serves protocol at under
+// its base URL, <server>/<protocol> ("codex" or "acp"), joined whether or not
+// the base has a path prefix or a trailing slash. The scheme must be ws or
+// wss.
+func Endpoint(server, protocol string) (string, error) {
+	u, err := url.Parse(server)
+	if err != nil {
+		return "", fmt.Errorf("server URL: %w", err)
+	}
+	if (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
+		return "", fmt.Errorf("server URL %q: want ws://host[/prefix] or wss://host[/prefix]", server)
+	}
+	return u.JoinPath(protocol).String(), nil
+}
 
 // Dial opens the WebSocket to rawURL with token as its bearer token (no
 // Authorization header when token is empty) and raises the read limit to

@@ -23,10 +23,10 @@ func configBlock(t *testing.T, alias string, command ...string) string {
 }
 
 func TestConfigBlock(t *testing.T) {
-	got := configBlock(t, "example-agent", "/opt/com link/comlink", "codex", "proxy", "--upstream", "wss://agent.example.com/codex?a=%20", "--token-file", "/home/u/token")
+	got := configBlock(t, "example-agent", "/opt/com link/comlink", "codex", "--stdio", "--server", "wss://agent.example.com/base?a=%20", "--token-file", "/home/u/token")
 	want := "Host example-agent\n" +
 		"  User comlink\n" +
-		"  ProxyCommand '/opt/com link/comlink' codex proxy --upstream 'wss://agent.example.com/codex?a=%%20' --token-file /home/u/token\n" +
+		"  ProxyCommand '/opt/com link/comlink' codex --stdio --server 'wss://agent.example.com/base?a=%%20' --token-file /home/u/token\n" +
 		"  HostKeyAlias comlink-example-agent\n" +
 		"  StrictHostKeyChecking accept-new\n"
 	if got != want {
@@ -110,9 +110,9 @@ func TestConfigBlockProxyCommandSplitsBack(t *testing.T) {
 	if err := os.WriteFile(exe, []byte("#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	upstream := `wss://agent.example.com/codex?a=%20&b=$HOME&c='quoted'`
+	server := `wss://agent.example.com/base?a=%20&b=$HOME&c='quoted'`
 	tokenFile := `/home/u/50% dir/back\slash/token`
-	want := []string{exe, "codex", "proxy", "--upstream", upstream, "--token-file", tokenFile}
+	want := []string{exe, "codex", "--stdio", "--server", server, "--token-file", tokenFile}
 	line := proxyCommand(t, configBlock(t, "example-agent", want...))
 	line = strings.ReplaceAll(line, "%%", "%") // ssh's token expansion
 

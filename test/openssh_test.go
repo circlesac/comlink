@@ -21,7 +21,7 @@ import (
 )
 
 // buildComlink compiles the binary once per test run for the tests that run
-// it: through OpenSSH, as an ACP agent command and as `comlink up`.
+// it: through OpenSSH, as an ACP agent command and as a Codex session.
 func buildComlink(t *testing.T) string {
 	t.Helper()
 	buildOnce.Do(func() {
@@ -61,14 +61,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// opensshCommand runs the real ssh client through comlink as its
-// ProxyCommand, the way the Codex app does, with a temporary XDG_STATE_HOME
-// so the host key is generated fresh.
-func opensshCommand(t *testing.T, bin, upstream, tokenFile, command string) *exec.Cmd {
+// opensshCommand runs the real ssh client through `comlink codex --stdio
+// --server` (plus flags) as its ProxyCommand, the way the Codex app does,
+// with a temporary XDG_STATE_HOME so the host key is generated fresh.
+func opensshCommand(t *testing.T, bin, server, tokenFile, command string, flags ...string) *exec.Cmd {
 	t.Helper()
+	proxy := quote(bin) + " codex --stdio --server " + quote(server) + " --token-file " + quote(tokenFile)
+	for _, f := range flags {
+		proxy += " " + quote(f)
+	}
 	cmd := exec.Command("ssh",
 		"-F", "/dev/null",
-		"-o", "ProxyCommand="+quote(bin)+" codex proxy --upstream "+quote(upstream)+" --token-file "+quote(tokenFile),
+		"-o", "ProxyCommand="+proxy,
 		"-o", "BatchMode=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
@@ -84,16 +88,16 @@ func opensshCommand(t *testing.T, bin, upstream, tokenFile, command string) *exe
 // quote single-quotes s for the shell ssh runs the ProxyCommand with.
 func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// TestBinaryStartupChecks runs the built binary directly. In proxy mode
+// TestBinaryStartupChecks runs the built binary directly. With --stdio
 // stdin is empty, so it gets as far as the SSH handshake and stops there;
 // what it prints on stderr before that is the startup behaviour: a warning
 // for a token file others can read, and a clear failure when there is no
 // place for the host key.
 func TestBinaryStartupChecks(t *testing.T) {
 	bin := buildComlink(t)
-	proxy := func(t *testing.T, dir string, env []string, tokenFile string) (stderr string, err error) {
+	stdio := func(t *testing.T, dir string, env []string, tokenFile string) (stderr string, err error) {
 		t.Helper()
-		cmd := exec.Command(bin, "codex", "proxy", "--upstream", "ws://127.0.0.1:1/rpc", "--token-file", tokenFile)
+		cmd := exec.Command(bin, "codex", "--stdio", "--server", "ws://127.0.0.1:1", "--token-file", tokenFile)
 		cmd.Env = append(os.Environ(), env...)
 		cmd.Dir = dir
 		var errBuf bytes.Buffer
@@ -111,7 +115,7 @@ func TestBinaryStartupChecks(t *testing.T) {
 	for _, mode := range []os.FileMode{0o644, 0o640, 0o604} {
 		t.Run(fmt.Sprintf("token file %04o", mode), func(t *testing.T) {
 			path := writeTokenFile(t, mode)
-			stderr, _ := proxy(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
+			stderr, _ := stdio(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
 			if strings.Count(stderr, warning(path)) != 1 {
 				t.Fatalf("stderr %q, want one line %q", stderr, warning(path))
 			}
@@ -122,7 +126,7 @@ func TestBinaryStartupChecks(t *testing.T) {
 	}
 	t.Run("token file 0600", func(t *testing.T) {
 		path := writeTokenFile(t, 0o600)
-		stderr, _ := proxy(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
+		stderr, _ := stdio(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
 		if strings.Contains(stderr, "warning") {
 			t.Fatalf("stderr %q warns about a private token file", stderr)
 		}
@@ -132,9 +136,9 @@ func TestBinaryStartupChecks(t *testing.T) {
 	})
 	t.Run("missing token file", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "absent")
-		stderr, err := proxy(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
+		stderr, err := stdio(t, t.TempDir(), []string{"XDG_STATE_HOME=" + t.TempDir()}, path)
 		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() == 0 {
-			t.Fatalf("comlink codex proxy: %v, want a non-zero exit", err)
+			t.Fatalf("comlink codex --stdio: %v, want a non-zero exit", err)
 		}
 		if !strings.Contains(stderr, "comlink: error: read token file: ") {
 			t.Fatalf("stderr %q, want the token file error", stderr)
@@ -145,9 +149,9 @@ func TestBinaryStartupChecks(t *testing.T) {
 			t.Skip("os.UserHomeDir reads $HOME only on darwin and linux")
 		}
 		dir := t.TempDir()
-		stderr, err := proxy(t, dir, []string{"HOME=", "XDG_STATE_HOME="}, writeTokenFile(t, 0o600))
+		stderr, err := stdio(t, dir, []string{"HOME=", "XDG_STATE_HOME="}, writeTokenFile(t, 0o600))
 		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() == 0 {
-			t.Fatalf("comlink codex proxy: %v, want a non-zero exit", err)
+			t.Fatalf("comlink codex --stdio: %v, want a non-zero exit", err)
 		}
 		if want := "comlink: error: locate host key: XDG_STATE_HOME is unset and the home directory is unknown: "; !strings.Contains(stderr, want) {
 			t.Fatalf("stderr %q, want %q", stderr, want)
@@ -191,6 +195,15 @@ func TestOpenSSHVersionProbe(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Fatalf("host key mode = %o, want 600", perm)
+	}
+
+	// --report-version changes the answer.
+	cmd = opensshCommand(t, bin, upstream.wsURL(), tokenFile, readFixture(t, "codex-app-version.txt"), "--report-version", "0.200.1")
+	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+stateHome)
+	stderr.Reset()
+	cmd.Stderr = &stderr
+	if out, err := cmd.Output(); err != nil || string(out) != "codex-cli 0.200.1\n" {
+		t.Fatalf("ssh with --report-version: %v, stdout %q\nstderr: %s", err, out, stderr.String())
 	}
 
 	cmd = opensshCommand(t, bin, upstream.wsURL(), tokenFile, "ls /")

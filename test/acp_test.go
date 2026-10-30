@@ -458,7 +458,8 @@ type failingWriter struct{}
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
 
 // TestBinaryACP runs the built binary as an ACP client would: as the agent
-// subprocess, with the token from --token-file or $COMLINK_TOKEN.
+// subprocess given the server's base URL, with the token from --token-file
+// or $COMLINK_TOKEN.
 func TestBinaryACP(t *testing.T) {
 	bin := buildComlink(t)
 	echo := newEchoUpstream(t)
@@ -504,18 +505,18 @@ func TestBinaryACP(t *testing.T) {
 	}
 
 	t.Run("token file", func(t *testing.T) {
-		cmd := exec.Command(bin, "acp", "--upstream", echo.wsURL()+"/acp", "--token-file", writeTokenFile(t, 0o600))
+		cmd := exec.Command(bin, "acp", "--server", echo.wsURL(), "--token-file", writeTokenFile(t, 0o600))
 		cmd.Env = append(os.Environ(), "COMLINK_TOKEN=")
 		roundTrip(t, cmd)
 	})
 	t.Run("COMLINK_TOKEN", func(t *testing.T) {
-		cmd := exec.Command(bin, "acp", "--upstream", echo.wsURL()+"/acp")
+		cmd := exec.Command(bin, "acp", "--server", echo.wsURL())
 		cmd.Env = append(os.Environ(), "COMLINK_TOKEN="+testToken)
 		roundTrip(t, cmd)
 	})
 	t.Run("token file readable by others", func(t *testing.T) {
 		path := writeTokenFile(t, 0o644)
-		cmd := exec.Command(bin, "acp", "--upstream", "ws://127.0.0.1:1/acp?token=secret-value", "--token-file", path)
+		cmd := exec.Command(bin, "acp", "--server", "ws://127.0.0.1:1?token=secret-value", "--token-file", path)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		err := cmd.Run()
@@ -535,7 +536,7 @@ func TestBinaryACP(t *testing.T) {
 		}
 	})
 	t.Run("missing token file", func(t *testing.T) {
-		cmd := exec.Command(bin, "acp", "--upstream", echo.wsURL()+"/acp", "--token-file", filepath.Join(t.TempDir(), "absent"))
+		cmd := exec.Command(bin, "acp", "--server", echo.wsURL(), "--token-file", filepath.Join(t.TempDir(), "absent"))
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		err := cmd.Run()
@@ -546,4 +547,78 @@ func TestBinaryACP(t *testing.T) {
 			t.Fatalf("stdout %q, stderr %q, want only the token file error", stdout.String(), stderr.String())
 		}
 	})
+}
+
+// acpRoundTrip runs the binary as an ACP agent command and checks that one
+// message is echoed back and the session ends cleanly.
+func acpRoundTrip(t *testing.T, bin string, env []string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Env = env
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stdout := bufio.NewReader(stdoutPipe)
+	msg := `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}`
+	if _, err := io.WriteString(stdin, msg+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := stdout.ReadString('\n'); err != nil || line != msg+"\n" {
+		t.Fatalf("stdout line %q (%v), want the echo; stderr %q", line, err, stderr.String())
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rest, err := io.ReadAll(stdout); err != nil || len(rest) != 0 {
+		t.Fatalf("stdout carries %q (%v) after the protocol line", rest, err)
+	}
+	if err := cmd.Wait(); err != nil || stderr.Len() != 0 {
+		t.Fatalf("comlink %v: %v, want exit 0 and no stderr; stderr %q", args, err, stderr.String())
+	}
+}
+
+// TestBinaryACPServer: `acp --server URL` dials <server>/acp whether the
+// base has a path prefix or a trailing slash, with the bearer token, and
+// needs no session: nothing is written under the state or home directory.
+func TestBinaryACPServer(t *testing.T) {
+	bin := buildComlink(t)
+	env, home, state := sessionEnv(t)
+	server := newServerUpstream(t)
+	base := wsURLOf(server.Server)
+	tokenFile := writeTokenFile(t, 0o600)
+	for _, tc := range []struct {
+		server string
+		args   []string
+		path   string
+	}{
+		{base, nil, "/acp"},
+		{base + "/", nil, "/acp"},
+		{base + "/tenant/x", nil, "/tenant/x/acp"},
+		{base + "/tenant/x/", []string{"--token-file", tokenFile}, "/tenant/x/acp"},
+	} {
+		runEnv := env
+		if tc.args == nil {
+			runEnv = append(append([]string(nil), env...), "COMLINK_TOKEN="+testToken)
+		}
+		acpRoundTrip(t, bin, runEnv, append([]string{"acp", "--server", tc.server}, tc.args...)...)
+		paths, auths := server.seen()
+		if got, auth := paths[len(paths)-1], auths[len(auths)-1]; got != tc.path || auth != "Bearer "+testToken {
+			t.Errorf("--server %s: server saw %s with Authorization %q, want %s", tc.server, got, auth, tc.path)
+		}
+	}
+	for _, dir := range []string{home, state} {
+		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+			t.Errorf("%s holds %v (%v) after acp sessions", dir, entries, err)
+		}
+	}
 }
