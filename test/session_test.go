@@ -1,0 +1,658 @@
+package test
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/circlesac/comlink/internal/session"
+)
+
+// TestSessionEndpoints: a comlink server serves the Codex app-server
+// protocol at <server>/codex and ACP at <server>/acp, whatever the base's
+// path prefix or trailing slash.
+func TestSessionEndpoints(t *testing.T) {
+	for _, tc := range []struct{ server, codex, acp string }{
+		{"wss://agent.example.com", "wss://agent.example.com/codex", "wss://agent.example.com/acp"},
+		{"wss://agent.example.com/", "wss://agent.example.com/codex", "wss://agent.example.com/acp"},
+		{"ws://127.0.0.1:8787/prefix", "ws://127.0.0.1:8787/prefix/codex", "ws://127.0.0.1:8787/prefix/acp"},
+		{"ws://127.0.0.1:8787/prefix/", "ws://127.0.0.1:8787/prefix/codex", "ws://127.0.0.1:8787/prefix/acp"},
+		{"wss://agent.example.com/a/b//", "wss://agent.example.com/a/b/codex", "wss://agent.example.com/a/b/acp"},
+		{"wss://agent.example.com/base?x=1", "wss://agent.example.com/base/codex?x=1", "wss://agent.example.com/base/acp?x=1"},
+	} {
+		codex, acp, err := session.Endpoints(tc.server)
+		if err != nil || codex != tc.codex || acp != tc.acp {
+			t.Errorf("Endpoints(%q) = %q, %q, %v; want %q, %q", tc.server, codex, acp, err, tc.codex, tc.acp)
+		}
+	}
+	for _, server := range []string{"", "https://agent.example.com", "agent.example.com/codex", "ws://", "ws://[::1", "wss:///path"} {
+		if codex, acp, err := session.Endpoints(server); err == nil {
+			t.Errorf("Endpoints(%q) = %q, %q, want an error", server, codex, acp)
+		}
+	}
+}
+
+func TestSessionValidName(t *testing.T) {
+	for _, name := range []string{"example-agent", "a", "Agent_2", "agent.example.com", "0-9_.-"} {
+		if !session.ValidName(name) {
+			t.Errorf("ValidName(%q) = false", name)
+		}
+	}
+	for _, name := range []string{"", "two words", "agent\nHost *", "*", "agent?", "!agent", "agent/x", "../agent", "ägent"} {
+		if session.ValidName(name) {
+			t.Errorf("ValidName(%q) = true", name)
+		}
+	}
+}
+
+// readRecord parses a record file.
+func readRecord(t *testing.T, path string) session.Record {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), testToken) {
+		t.Fatalf("record %s contains the token: %s", path, b)
+	}
+	var r session.Record
+	if err := json.Unmarshal(b, &r); err != nil {
+		t.Fatalf("record %s: %v\n%s", path, err, b)
+	}
+	return r
+}
+
+// mode returns the permission bits of path.
+func mode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
+}
+
+// absent fails when any of paths exists.
+func absent(t *testing.T, paths ...string) {
+	t.Helper()
+	for _, p := range paths {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s exists (%v), want it gone", p, err)
+		}
+	}
+}
+
+// sessionFiles are the paths a session's files have under a state directory.
+func sessionFiles(dir, name string) (record, token, lock, conf string) {
+	run := filepath.Join(dir, "comlink", "run")
+	return filepath.Join(run, name+".json"), filepath.Join(run, name+".token"), filepath.Join(run, name+".lock"),
+		filepath.Join(dir, "comlink", "ssh", name+".conf")
+}
+
+// deadPID is the pid of a process that has already exited.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
+}
+
+// writeStaleSession writes the files a crashed `up` leaves behind for name:
+// a record with a dead pid, a token file, an ssh config file and a lock file
+// nobody holds.
+func writeStaleSession(t *testing.T, dir, name string) {
+	t.Helper()
+	record, token, lock, conf := sessionFiles(dir, name)
+	for _, d := range []string{filepath.Dir(record), filepath.Dir(conf)} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, _ := json.Marshal(session.Record{Name: name, Server: "ws://stale.example.com", Codex: "ws://stale.example.com/codex", ACP: "ws://stale.example.com/acp", PID: deadPID(t)})
+	for path, content := range map[string]string{record: string(b), token: "stale-token", lock: "", conf: "Host stale\n"} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestSessionStore drives the registry in process: Start creates the
+// record, the token file and the ssh config file with private modes and no
+// token outside the token file; Load finds the session while it is up and
+// a second Start on the name is refused; Close removes everything and Load
+// then reports the name as not up.
+func TestSessionStore(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	record, token, lock, conf := sessionFiles(dir, "agent-a")
+
+	sess, err := store.Start("agent-a", "wss://agent.example.com/base/", testToken, "Host agent-a\n  ProxyCommand x\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.Replaced != nil {
+		t.Fatalf("Replaced = %+v on a fresh name", sess.Replaced)
+	}
+	want := session.Record{Name: "agent-a", Server: "wss://agent.example.com/base/", Codex: "wss://agent.example.com/base/codex", ACP: "wss://agent.example.com/base/acp", PID: os.Getpid()}
+	if sess.Record != want {
+		t.Fatalf("session record %+v, want %+v", sess.Record, want)
+	}
+	if got := readRecord(t, record); got != want {
+		t.Fatalf("record on disk %+v, want %+v", got, want)
+	}
+	for _, path := range []string{record, token, lock, conf} {
+		if m := mode(t, path); m != 0o600 {
+			t.Errorf("%s mode %o, want 600", path, m)
+		}
+	}
+	for _, d := range []string{filepath.Dir(record), filepath.Dir(conf)} {
+		if m := mode(t, d); m != 0o700 {
+			t.Errorf("%s mode %o, want 700", d, m)
+		}
+	}
+	if b, _ := os.ReadFile(token); string(b) != testToken {
+		t.Fatalf("token file %q", b)
+	}
+	if b, _ := os.ReadFile(conf); string(b) != "Host agent-a\n  ProxyCommand x\n" {
+		t.Fatalf("ssh config %q", b)
+	}
+
+	got, gotToken, err := store.Load("agent-a")
+	if err != nil || got != want || gotToken != testToken {
+		t.Fatalf("Load = %+v, token ok %v, %v", got, gotToken == testToken, err)
+	}
+	if _, err := store.Start("agent-a", "wss://other.example.com", "", ""); err == nil || err.Error() != `session "agent-a" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
+		t.Fatalf("second Start: %v", err)
+	}
+	if got := readRecord(t, record); got != want {
+		t.Fatalf("record changed by the refused Start: %+v", got)
+	}
+	live, stale, err := store.List()
+	if err != nil || len(stale) != 0 || len(live) != 1 || live[0] != want {
+		t.Fatalf("List = %+v, %+v, %v", live, stale, err)
+	}
+
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+	absent(t, record, token, lock, conf)
+	var notUp *session.NotUpError
+	if _, _, err := store.Load("agent-a"); !errors.As(err, &notUp) || notUp.Name != "agent-a" {
+		t.Fatalf("Load after Close: %v", err)
+	}
+	if want := `session "agent-a" is not up: run 'comlink up --name agent-a --server URL' first`; notUp.Error() != want {
+		t.Fatalf("error %q, want %q", notUp, want)
+	}
+	if live, stale, err := store.List(); err != nil || len(live)+len(stale) != 0 {
+		t.Fatalf("List after Close = %+v, %+v, %v", live, stale, err)
+	}
+	if _, _, err := store.Load("never"); !errors.As(err, &notUp) {
+		t.Fatalf("Load of an unknown name: %v", err)
+	}
+
+	// A second session with the same name can start once the first is closed.
+	again, err := store.Start("agent-a", "ws://127.0.0.1:1", "", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, gotToken, err := store.Load("agent-a"); err != nil || gotToken != "" {
+		t.Fatalf("Load without a token = %q, %v", gotToken, err)
+	}
+	if err := again.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSessionStoreRefusesBadInput: an invalid name or server URL is refused
+// before anything is written.
+func TestSessionStoreRefusesBadInput(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	for _, tc := range []struct{ name, server, want string }{
+		{"two words", "wss://agent.example.com", `invalid name "two words": use only letters, digits, '-', '_' and '.'`},
+		{"../up", "wss://agent.example.com", `invalid name "../up": use only letters, digits, '-', '_' and '.'`},
+		{"agent", "https://agent.example.com", `server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
+		{"agent", "ws://[::1", `server URL: parse "ws://[::1": missing ']' in host`},
+	} {
+		sess, err := store.Start(tc.name, tc.server, testToken, "x")
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("Start(%q, %q) = %v, %v; want %q", tc.name, tc.server, sess, err, tc.want)
+		}
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("state directory holds %v (%v) after refused starts", entries, err)
+	}
+	if _, _, err := store.Load("two words"); err == nil || !strings.HasPrefix(err.Error(), "invalid name") {
+		t.Fatalf("Load of an invalid name: %v", err)
+	}
+}
+
+// TestSessionStaleRecords: a record whose `up` process is gone (its lock is
+// not held) is stale. List removes it and reports it; Start replaces it and
+// reports it as Replaced; Load reports the name as not up and leaves it.
+func TestSessionStaleRecords(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	writeStaleSession(t, dir, "gone")
+	writeStaleSession(t, dir, "replaced")
+	record, token, lock, conf := sessionFiles(dir, "gone")
+	run := filepath.Dir(record)
+	// Not sessions: a record being renamed into place, a broken one and a
+	// stray file. They are left alone.
+	for name, content := range map[string]string{"half.json.tmp": "{", "broken.json": "not json", "notes.txt": "x"} {
+		if err := os.WriteFile(filepath.Join(run, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var notUp *session.NotUpError
+	if _, _, err := store.Load("gone"); !errors.As(err, &notUp) {
+		t.Fatalf("Load of a stale name: %v", err)
+	}
+	if _, err := os.Stat(record); err != nil {
+		t.Fatalf("Load removed the stale record: %v", err)
+	}
+
+	live, stale, err := store.List()
+	if err != nil || len(live) != 0 || len(stale) != 2 || stale[0].Name != "gone" || stale[1].Name != "replaced" {
+		t.Fatalf("List = %+v, %+v, %v", live, stale, err)
+	}
+	absent(t, record, token, conf)
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("List removed the lock file, which only its holder removes: %v", err)
+	}
+	for _, name := range []string{"half.json.tmp", "broken.json", "notes.txt"} {
+		if _, err := os.Stat(filepath.Join(run, name)); err != nil {
+			t.Errorf("List removed %s: %v", name, err)
+		}
+	}
+
+	writeStaleSession(t, dir, "replaced")
+	stalePID := readRecord(t, filepath.Join(run, "replaced.json")).PID
+	sess, err := store.Start("replaced", "wss://new.example.com", testToken, "Host replaced\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+	if sess.Replaced == nil || sess.Replaced.PID != stalePID || sess.Replaced.Server != "ws://stale.example.com" {
+		t.Fatalf("Replaced = %+v, want the stale record with pid %d", sess.Replaced, stalePID)
+	}
+	rec, tok, _, cnf := sessionFiles(dir, "replaced")
+	if got := readRecord(t, rec); got.PID != os.Getpid() || got.Server != "wss://new.example.com" {
+		t.Fatalf("record after replacement %+v", got)
+	}
+	if b, _ := os.ReadFile(tok); string(b) != testToken {
+		t.Fatalf("token file after replacement %q", b)
+	}
+	if b, _ := os.ReadFile(cnf); string(b) != "Host replaced\n" {
+		t.Fatalf("ssh config after replacement %q", b)
+	}
+
+	// Without a run directory there is nothing to list.
+	empty := &session.Store{Dir: filepath.Join(t.TempDir(), "comlink")}
+	if live, stale, err := empty.List(); err != nil || live != nil || stale != nil {
+		t.Fatalf("List on an empty store = %+v, %+v, %v", live, stale, err)
+	}
+}
+
+// TestSessionOpen: the store is $XDG_STATE_HOME/comlink, else
+// ~/.local/state/comlink, and an error without either.
+func TestSessionOpen(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/tmp/state-x")
+	store, err := session.Open()
+	if err != nil || store.Dir != "/tmp/state-x/comlink" || store.SSHDir() != "/tmp/state-x/comlink/ssh" {
+		t.Fatalf("Open = %+v, %v", store, err)
+	}
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "/tmp/home-x")
+	store, err = session.Open()
+	if err != nil || store.Dir != "/tmp/home-x/.local/state/comlink" {
+		t.Fatalf("Open = %+v, %v", store, err)
+	}
+	if path, err := session.SSHConfigPath(); err != nil || path != "/tmp/home-x/.ssh/config" {
+		t.Fatalf("SSHConfigPath = %q, %v", path, err)
+	}
+	t.Setenv("HOME", "")
+	if store, err := session.Open(); err == nil || !strings.HasPrefix(err.Error(), "locate state directory: XDG_STATE_HOME is unset and the home directory is unknown: ") {
+		t.Fatalf("Open without a home = %+v, %v", store, err)
+	}
+	if path, err := session.SSHConfigPath(); err == nil || !strings.HasPrefix(err.Error(), "locate ~/.ssh/config: ") {
+		t.Fatalf("SSHConfigPath without a home = %q, %v", path, err)
+	}
+}
+
+// TestSessionInclude: the Include line goes to the top of ~/.ssh/config,
+// the file is created private when missing, the previous content is backed
+// up once and otherwise preserved byte for byte, and a second run changes
+// nothing.
+func TestSessionInclude(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
+	if got := store.IncludeLine(); got != line {
+		t.Fatalf("IncludeLine = %q, want %q", got, line)
+	}
+	spaced := &session.Store{Dir: filepath.Join(dir, "with space", "comlink")}
+	if got, want := spaced.IncludeLine(), `Include "`+filepath.Join(dir, "with space", "comlink", "ssh", "*.conf")+`"`; got != want {
+		t.Fatalf("IncludeLine with whitespace = %q, want %q", got, want)
+	}
+
+	config := filepath.Join(dir, "home", ".ssh", "config")
+	backup := config + ".comlink-bak"
+	include := func(t *testing.T) string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := store.Include(config, &out); err != nil {
+			t.Fatalf("Include: %v", err)
+		}
+		return out.String()
+	}
+	unchanged := config + " already includes " + store.IncludePattern() + "; nothing changed\n"
+	if included, err := store.Included(config); err != nil || included {
+		t.Fatalf("Included(missing) = %v, %v", included, err)
+	}
+	if got, want := include(t), "created "+config+" with \""+line+"\"\n"; got != want {
+		t.Fatalf("Include(missing) printed %q, want %q", got, want)
+	}
+	if b, _ := os.ReadFile(config); string(b) != line+"\n" {
+		t.Fatalf("created config %q", b)
+	}
+	if m := mode(t, config); m != 0o600 {
+		t.Fatalf("created config mode %o, want 600", m)
+	}
+	if m := mode(t, filepath.Dir(config)); m != 0o700 {
+		t.Fatalf("created .ssh mode %o, want 700", m)
+	}
+	absent(t, backup)
+	if included, err := store.Included(config); err != nil || !included {
+		t.Fatalf("Included(created) = %v, %v", included, err)
+	}
+	if got := include(t); got != unchanged {
+		t.Fatalf("Include again printed %q, want %q", got, unchanged)
+	}
+
+	// An existing file: the line is prepended, the rest is byte-identical,
+	// the mode is kept and the backup holds the previous content.
+	original := "# keep\r\n\nHost *\n\tServerAliveInterval 30 \n\n  Host old\n    HostName old.example.com"
+	if err := os.WriteFile(config, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(config, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := include(t), "added \""+line+"\" to the top of "+config+"\nprevious content backed up to "+backup+"\n"; got != want {
+		t.Fatalf("Include(existing) printed %q, want %q", got, want)
+	}
+	if b, _ := os.ReadFile(config); string(b) != line+"\n"+original {
+		t.Fatalf("config after include %q", b)
+	}
+	if m := mode(t, config); m != 0o644 {
+		t.Fatalf("config mode %o, want the original 644", m)
+	}
+	if b, _ := os.ReadFile(backup); string(b) != original {
+		t.Fatalf("backup %q, want the previous content", b)
+	}
+	if got := include(t); got != unchanged {
+		t.Fatalf("Include again printed %q, want %q", got, unchanged)
+	}
+	// The user removed the line: it is added back, and the first backup is kept.
+	if err := os.WriteFile(config, []byte("Host x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := include(t), "added \""+line+"\" to the top of "+config+"\n"; got != want {
+		t.Fatalf("Include after removal printed %q, want %q", got, want)
+	}
+	if b, _ := os.ReadFile(config); string(b) != line+"\nHost x\n" {
+		t.Fatalf("config after re-include %q", b)
+	}
+	if b, _ := os.ReadFile(backup); string(b) != original {
+		t.Fatalf("backup overwritten: %q", b)
+	}
+
+	// Spellings ssh accepts for the same line count as included.
+	pattern := filepath.Join(dir, "comlink", "ssh", "*.conf")
+	for _, content := range []string{
+		"include " + pattern + "\n",
+		"  Include\t" + pattern + "  \n",
+		"Include=" + pattern + "\n",
+		"Include = " + pattern + "\n",
+		`Include "` + pattern + `"` + "\n",
+		"Host a\nInclude " + pattern + "\n",
+	} {
+		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if included, err := store.Included(config); err != nil || !included {
+			t.Errorf("Included(%q) = %v, %v", content, included, err)
+		}
+	}
+	for _, content := range []string{
+		"# Include " + pattern + "\n",
+		"Include " + pattern + "x\n",
+		"Include " + filepath.Join(dir, "other", "*.conf") + "\n",
+		"IncludeX " + pattern + "\n",
+		"Include\n",
+	} {
+		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if included, err := store.Included(config); err != nil || included {
+			t.Errorf("Included(%q) = %v, %v", content, included, err)
+		}
+	}
+
+	// A config that cannot be read is an error, not "not included".
+	unreadable := filepath.Join(dir, "unreadable")
+	if err := os.Mkdir(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Included(unreadable); err == nil {
+		t.Fatal("Included(directory) = nil error")
+	}
+	if err := store.Include(unreadable, io.Discard); err == nil {
+		t.Fatal("Include(directory) = nil error")
+	}
+	// A backup that cannot be written stops the change.
+	if os.Getuid() != 0 {
+		blockedDir := filepath.Join(dir, "blocked")
+		blocked := filepath.Join(blockedDir, "config")
+		if err := os.Mkdir(blockedDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(blocked, []byte("Host y\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(blockedDir, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o700) })
+		if err := store.Include(blocked, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "write backup ") {
+			t.Fatalf("Include in a read-only directory: %v", err)
+		}
+		if b, _ := os.ReadFile(blocked); string(b) != "Host y\n" {
+			t.Fatalf("config changed although the backup failed: %q", b)
+		}
+	}
+}
+
+// TestSessionUp drives Up in process: it prints what is available and the
+// ssh-include hint, holds the name until the context is done, then removes
+// its files. With the include in place there is no hint, and a stale
+// record is reported as replaced.
+func TestSessionUp(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	sshConfig := filepath.Join(dir, "home", ".ssh", "config")
+	record, token, lock, conf := sessionFiles(dir, "agent-a")
+
+	start := func(t *testing.T, name string) (ready string, stderr *bytes.Buffer, stop func() error) {
+		t.Helper()
+		outR, outW := io.Pipe()
+		var errBuf lockedBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			err := store.Up(ctx, name, "wss://agent.example.com/base", testToken, "/opt/comlink", sshConfig, outW, &errBuf)
+			_ = outW.Close()
+			done <- err
+		}()
+		sc := bufio.NewScanner(outR)
+		for sc.Scan() {
+			ready += sc.Text() + "\n"
+			if sc.Text() == "Press Ctrl-C to stop." {
+				break
+			}
+		}
+		if ready == "" || !strings.HasSuffix(ready, "Press Ctrl-C to stop.\n") {
+			cancel()
+			t.Fatalf("Up ended before it was ready: %v\nstdout %q", <-done, ready)
+		}
+		var errOut bytes.Buffer
+		errOut.WriteString(errBuf.String())
+		return ready, &errOut, func() error {
+			cancel()
+			rest, _ := io.ReadAll(outR)
+			if len(rest) != 0 {
+				t.Errorf("Up printed %q after the ready line", rest)
+			}
+			return <-done
+		}
+	}
+
+	ready, stderr, stop := start(t, "agent-a")
+	want := "agent-a is up (pid " + strconv.Itoa(os.Getpid()) + ")\n" +
+		"  server:       wss://agent.example.com/base\n" +
+		"  Codex app:    SSH connection \"agent-a\" (ssh agent-a)\n" +
+		"  ACP clients:  agent command /opt/comlink acp --name agent-a\n" +
+		"Press Ctrl-C to stop.\n"
+	if ready != want {
+		t.Fatalf("stdout:\n%s\nwant:\n%s", ready, want)
+	}
+	if hint := "comlink: " + sshConfig + " does not include " + store.IncludePattern() + "; run 'comlink ssh-include' once so the Codex app can use the alias\n"; stderr.String() != hint {
+		t.Fatalf("stderr %q, want %q", stderr.String(), hint)
+	}
+	block, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantBlock := configBlock(t, "agent-a", "/opt/comlink", "codex", "proxy", "--name", "agent-a"); string(block) != wantBlock {
+		t.Fatalf("ssh config:\n%s\nwant:\n%s", block, wantBlock)
+	}
+	if got := readRecord(t, record); got.Codex != "wss://agent.example.com/base/codex" || got.PID != os.Getpid() {
+		t.Fatalf("record %+v", got)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("Up returned %v after the context ended", err)
+	}
+	absent(t, record, token, lock, conf)
+
+	if err := store.Include(sshConfig, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	writeStaleSession(t, dir, "agent-a")
+	stalePID := readRecord(t, record).PID
+	_, stderr, stop = start(t, "agent-a")
+	if want := "comlink: removed stale session \"agent-a\" (pid " + strconv.Itoa(stalePID) + " is gone)\n"; stderr.String() != want {
+		t.Fatalf("stderr %q, want %q", stderr.String(), want)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Refusals: a bad alias before anything is written, and a name that is up.
+	if err := store.Up(context.Background(), "agent\nHost *", "wss://agent.example.com", "", "/opt/comlink", sshConfig, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "invalid alias ") {
+		t.Fatalf("Up with a bad alias: %v", err)
+	}
+	held, err := store.Start("agent-b", "wss://agent.example.com", "", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+	if err := store.Up(context.Background(), "agent-b", "wss://agent.example.com", "", "/opt/comlink", sshConfig, io.Discard, io.Discard); err == nil || err.Error() != `session "agent-b" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
+		t.Fatalf("Up on a name that is up: %v", err)
+	}
+}
+
+// TestSessionResolveAndPrintList: Resolve returns the endpoint for codex or
+// acp with the token, and PrintList prints the live sessions, the removed
+// stale ones and the empty case.
+func TestSessionResolveAndPrintList(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	var stdout, stderr bytes.Buffer
+	if err := store.PrintList(&stdout, &stderr); err != nil || stdout.Len() != 0 || stderr.String() != "comlink: no sessions are up\n" {
+		t.Fatalf("PrintList with nothing up: %v, stdout %q, stderr %q", err, stdout.String(), stderr.String())
+	}
+
+	b, err := store.Start("agent-b", "wss://b.example.com/x/", testToken, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	a, err := store.Start("agent-a", "wss://a.example.com", testToken, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Close() }()
+	writeStaleSession(t, dir, "agent-c")
+	stalePID := readRecord(t, filepath.Join(dir, "comlink", "run", "agent-c.json")).PID
+
+	for _, tc := range []struct{ name, protocol, want string }{
+		{"agent-a", "codex", "wss://a.example.com/codex"},
+		{"agent-a", "acp", "wss://a.example.com/acp"},
+		{"agent-b", "codex", "wss://b.example.com/x/codex"},
+		{"agent-b", "acp", "wss://b.example.com/x/acp"},
+	} {
+		if url, token, err := store.Resolve(tc.name, tc.protocol); err != nil || url != tc.want || token != testToken {
+			t.Errorf("Resolve(%q, %q) = %q, token ok %v, %v; want %q", tc.name, tc.protocol, url, token == testToken, err, tc.want)
+		}
+	}
+	var notUp *session.NotUpError
+	if _, _, err := store.Resolve("agent-c", "acp"); !errors.As(err, &notUp) {
+		t.Fatalf("Resolve of a stale name: %v", err)
+	}
+	if _, _, err := store.Resolve("agent-a", "ftp"); err == nil || err.Error() != "unknown protocol ftp" {
+		t.Fatalf("Resolve with an unknown protocol: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := store.PrintList(&stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	pid := strconv.Itoa(os.Getpid())
+	if want := "agent-a\tup\tpid " + pid + "\twss://a.example.com\nagent-b\tup\tpid " + pid + "\twss://b.example.com/x/\n"; stdout.String() != want {
+		t.Fatalf("PrintList stdout %q, want %q", stdout.String(), want)
+	}
+	if want := "comlink: removed stale session \"agent-c\" (pid " + strconv.Itoa(stalePID) + " is gone)\n"; stderr.String() != want {
+		t.Fatalf("PrintList stderr %q, want %q", stderr.String(), want)
+	}
+	if strings.Contains(stdout.String(), testToken) {
+		t.Fatal("PrintList printed the token")
+	}
+	// A run directory that cannot be read is an error.
+	if os.Getuid() != 0 {
+		run := filepath.Join(dir, "comlink", "run")
+		if err := os.Chmod(run, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(run, 0o700) })
+		if err := store.PrintList(io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "read "+run+": ") {
+			t.Fatalf("PrintList on an unreadable run directory: %v", err)
+		}
+		if err := os.Chmod(run, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

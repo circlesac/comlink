@@ -7,8 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -62,4 +65,22 @@ func redactURL(raw string) string {
 	}
 	u.User, u.RawQuery, u.ForceQuery, u.Fragment, u.RawFragment = nil, "", false, "", ""
 	return u.String()
+}
+
+// LoadToken returns the trimmed contents of path, or $COMLINK_TOKEN when
+// path is empty. An empty result means no token: the upstream is dialled
+// without an Authorization header. A token file that group or others can
+// read is still used, with a warning naming the path (never the token).
+func LoadToken(path string, logger *log.Logger) (string, error) {
+	if path == "" {
+		return strings.TrimSpace(os.Getenv("COMLINK_TOKEN")), nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read token file: %w", err)
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		logger.Printf("warning: token file %s is readable by group or others; restrict it with chmod 600", path)
+	}
+	return strings.TrimSpace(string(b)), nil
 }

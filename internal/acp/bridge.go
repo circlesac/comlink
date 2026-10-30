@@ -143,19 +143,52 @@ func clean(status websocket.StatusCode) bool {
 // forwardLines sends each stdin line to conn as a text frame and returns nil
 // at EOF.
 func forwardLines(stdin io.Reader, conn *websocket.Conn) error {
-	sc := bufio.NewScanner(stdin)
-	sc.Buffer(nil, upstream.ReadLimit+1) // a ReadLimit-byte message plus its newline
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+	// Bytes are examined as they arrive and only once: a bufio.Scanner rescans
+	// its whole buffer after every read (quadratic in the line length), and
+	// ReadSlice waits for a full buffer or a newline before the length can be
+	// checked.
+	br := bufio.NewReaderSize(stdin, 64<<10)
+	var line []byte
+	for {
+		if _, err := br.Peek(1); err != nil {
+			if !errors.Is(err, io.EOF) {
+				return fmt.Errorf("read stdin: %w", err)
+			}
+			// EOF: a last line without a newline is still a message.
+			return sendLine(conn, line)
+		}
+		data, _ := br.Peek(br.Buffered())
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			line = append(line, data[:i]...)
+			_, _ = br.Discard(i + 1)
+			if err := sendLine(conn, line); err != nil {
+				return err
+			}
+			line = line[:0]
 			continue
 		}
-		if err := conn.Write(context.Background(), websocket.MessageText, line); err != nil {
-			return upstreamWriteError{err}
+		line = append(line, data...)
+		_, _ = br.Discard(len(data))
+		// No newline yet: ReadLimit message bytes plus a possible "\r" fit,
+		// anything more cannot be a message within the limit.
+		if len(line) > upstream.ReadLimit+1 {
+			return fmt.Errorf("read stdin: %w", bufio.ErrTooLong)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+}
+
+// sendLine sends line (a trailing \r dropped) as one text frame; an empty
+// line is skipped.
+func sendLine(conn *websocket.Conn, line []byte) error {
+	msg := bytes.TrimSuffix(line, []byte("\r"))
+	if len(msg) > upstream.ReadLimit {
+		return fmt.Errorf("read stdin: %w", bufio.ErrTooLong)
+	}
+	if len(msg) == 0 {
+		return nil
+	}
+	if err := conn.Write(context.Background(), websocket.MessageText, msg); err != nil {
+		return upstreamWriteError{err}
 	}
 	return nil
 }
