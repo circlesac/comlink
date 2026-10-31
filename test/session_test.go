@@ -224,6 +224,43 @@ func TestSessionStore(t *testing.T) {
 	}
 }
 
+// TestSessionStoreUpWithoutRecord: a name whose lock is held is up even when
+// its record is missing or unreadable (a deleted record, or the moment
+// inside Close between removing the record and releasing the lock). A
+// second Start is refused without a pid, since there is none to name, and
+// leaves the live session's files alone.
+func TestSessionStoreUpWithoutRecord(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	record, token, lock, conf := sessionFiles(dir, "agent-a")
+
+	sess, err := store.Start("agent-a", "wss://agent.example.com", testToken, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	for _, tc := range []struct {
+		what   string
+		record func() error
+	}{
+		{"missing", func() error { return os.Remove(record) }},
+		{"unreadable", func() error { return os.WriteFile(record, []byte("{not json"), 0o600) }},
+	} {
+		if err := tc.record(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Start("agent-a", "wss://other.example.com", "", "y"); err == nil || err.Error() != `session "agent-a" is already up` {
+			t.Fatalf("Start with the record %s: %v", tc.what, err)
+		}
+		for _, path := range []string{token, lock, conf} {
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("record %s: the refused Start removed %s: %v", tc.what, path, err)
+			}
+		}
+	}
+}
+
 // TestSessionStoreRefusesBadInput: an invalid name or server URL is refused
 // before anything is written.
 func TestSessionStoreRefusesBadInput(t *testing.T) {

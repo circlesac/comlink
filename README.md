@@ -300,7 +300,8 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   refused shell, pty, subsystem and channel types, and `StdioConn`.
 - `config_test.go`: the ssh config block for a given `ProxyCommand`
   argument list, its shell quoting, that `sh` splits the `ProxyCommand` line
-  back into the original arguments, and the accepted and refused aliases.
+  back into the original arguments, the accepted and refused aliases, and
+  the refusal of an argument holding a newline or carriage return.
 - `hostkey_test.go`: host key creation under concurrent first runs, the
   state path (an error without `XDG_STATE_HOME` or a home directory), and
   the error cases.
@@ -326,7 +327,8 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   slash, the name rule, the state directory from `XDG_STATE_HOME` or the
   home directory, `Start`/`Load`/`List`/`Close` with the file modes, no
   temporary file left beside them and the token kept out of the record, a
-  refused second start, a failed write undone, stale records (lock not
+  refused second start (without a pid when the live session's record is
+  missing or unreadable), a failed write undone, stale records (lock not
   held) removed by `List` and replaced by `Start` while `Load` reports them
   as not up, `Up` driven to its ready line and ended through its context,
   `Resolve`, `PrintList`, the flag combinations of `comlink codex`

@@ -12,13 +12,18 @@ import (
 // pinned key apart from a real host called alias in known_hosts. The alias
 // may hold only letters, digits, '-', '_' and '.': anything else (spaces,
 // newlines, the ssh patterns '*', '?' and '!') would change what the Host
-// line means, so it is refused.
+// line means, so it is refused. ssh_config is line based, so an argument
+// holding a newline or carriage return, which quoting cannot keep on one
+// line, is refused too.
 func ConfigBlock(alias string, command []string) (string, error) {
 	if !validAlias(alias) {
 		return "", fmt.Errorf("invalid alias %q: use only letters, digits, '-', '_' and '.'", alias)
 	}
 	quoted := make([]string, len(command))
 	for i, a := range command {
+		if strings.ContainsAny(a, "\n\r") {
+			return "", fmt.Errorf("invalid ProxyCommand argument %q: it must not contain a newline or carriage return", a)
+		}
 		quoted[i] = strings.ReplaceAll(shellQuote(a), "%", "%%")
 	}
 	var b strings.Builder

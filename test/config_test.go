@@ -56,6 +56,25 @@ func TestConfigBlockAlias(t *testing.T) {
 	}
 }
 
+// TestConfigBlockRefusesLineBreaks: ssh_config is line based, so an argument
+// holding a newline or carriage return would split the ProxyCommand across
+// lines (the rest becoming a directive of its own). Such an argument is
+// refused before a block is produced.
+func TestConfigBlockRefusesLineBreaks(t *testing.T) {
+	for _, arg := range []string{"a\nb", "/x/token\n  ProxyCommand evil", "a\rb", "trailing\n", "\r"} {
+		for _, command := range [][]string{{arg, "codex"}, {"/x/comlink", "--token-file", arg}} {
+			block, err := sshd.ConfigBlock("example-agent", command)
+			if err == nil || block != "" {
+				t.Errorf("command %q accepted: %q, %v", command, block, err)
+				continue
+			}
+			if want := fmt.Sprintf("invalid ProxyCommand argument %q: it must not contain a newline or carriage return", arg); err.Error() != want {
+				t.Errorf("command %q: error %q, want %q", command, err, want)
+			}
+		}
+	}
+}
+
 // proxyCommand returns the ProxyCommand line of a config block.
 func proxyCommand(t *testing.T, block string) string {
 	t.Helper()
@@ -83,7 +102,6 @@ func TestConfigBlockQuotesArguments(t *testing.T) {
 		{"it's", `'it'\''s'`},
 		{"/home/u/50%", "/home/u/50%%"},
 		{"", "''"},
-		{"a\nb", "'a\nb'"},
 		{`back\slash`, `'back\slash'`},
 		{"$HOME", "'$HOME'"},
 		{"a;b", "'a;b'"},

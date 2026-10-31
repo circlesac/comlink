@@ -121,6 +121,12 @@ func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 	lock, err := acquire(s.lockPath(name), old.PID)
 	if err != nil {
 		if errors.Is(err, errLocked) {
+			// The record can be missing or unreadable while the lock is
+			// held (deleted, or the moment inside Close between removing
+			// it and releasing the lock); then there is no pid to name.
+			if oldErr != nil || old.PID <= 0 {
+				return nil, fmt.Errorf("session %q is already up", name)
+			}
 			return nil, fmt.Errorf("session %q is already up (pid %d)", name, old.PID)
 		}
 		return nil, err
