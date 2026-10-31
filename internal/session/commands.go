@@ -56,7 +56,7 @@ func (f Flags) Check() error {
 }
 
 // CheckUnset rejects any of the flags given to the subcommand sub of
-// `comlink codex` (list or ssh-include), which kong lets inherit them.
+// `comlink codex` (list), which kong lets inherit them.
 func (f Flags) CheckUnset(sub string) error {
 	if f != (Flags{}) {
 		return fmt.Errorf("'comlink codex %s' takes no flags; --stdio, --name, --server, --token-file and --report-version go with 'comlink codex' itself", sub)
@@ -83,15 +83,24 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 	return store.Resolve(f.Name)
 }
 
-// Up is `comlink codex --name NAME --server URL`. It registers name with
-// server and token, writes the ssh config block whose ProxyCommand runs
-// `<exe> codex --stdio --name NAME`, prints the alias on stdout (and, on
-// stderr, a hint when sshConfig does not include the session config files),
-// and holds the session until ctx is done. It then removes the session's
-// files and returns nil.
+// Up is `comlink codex --name NAME --server URL`. Once name and server are
+// valid it makes sure the ssh config at sshConfig includes the session
+// config files (adding the line as include does and saying so on stderr;
+// the line stays after the session), then registers name with server and
+// token, writes the ssh config block whose ProxyCommand runs
+// `<exe> codex --stdio --name NAME`, prints the alias on stdout, and holds
+// the session until ctx is done. It then removes the session's files and
+// returns nil. When the Include line cannot be added no session file is
+// written.
 func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig string, stdout, stderr io.Writer) error {
 	block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
 	if err != nil {
+		return err
+	}
+	if _, err := upstream.Endpoint(server, "codex"); err != nil {
+		return err
+	}
+	if err := s.addInclude(sshConfig, stderr); err != nil {
 		return err
 	}
 	sess, err := s.Start(name, server, token, block)
@@ -100,9 +109,6 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 	}
 	if sess.Replaced != nil {
 		_, _ = fmt.Fprintf(stderr, "comlink: removed stale session %q (pid %d is gone)\n", sess.Replaced.Name, sess.Replaced.PID)
-	}
-	if included, err := s.Included(sshConfig); err != nil || !included {
-		_, _ = fmt.Fprintf(stderr, "comlink: %s does not include %s; run 'comlink codex ssh-include' once so the Codex app can use the alias\n", sshConfig, s.IncludePattern())
 	}
 	_, _ = fmt.Fprintf(stdout, "%s is up (pid %d)\n", sess.Name, sess.PID)
 	_, _ = fmt.Fprintf(stdout, "  server:     %s\n", sess.Server)

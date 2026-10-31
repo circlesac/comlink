@@ -30,7 +30,7 @@ import (
 
 type cli struct {
 	Version kong.VersionFlag `help:"Print the comlink version and exit."`
-	Codex   codexCmd         `cmd:"" name:"codex" help:"Codex desktop app: 'comlink codex --name NAME --server URL' makes <server>/codex the SSH host NAME until stopped; list and ssh-include manage those sessions."`
+	Codex   codexCmd         `cmd:"" name:"codex" help:"Codex desktop app: 'comlink codex --name NAME --server URL' makes <server>/codex the SSH host NAME until stopped, adding the Include line for it to ~/.ssh/config if missing; list prints those sessions."`
 	ACP     acpCmd           `cmd:"" name:"acp" help:"Bridge an ACP client's stdin/stdout (newline-delimited JSON-RPC) to <server>/acp; the client runs this as its agent command."`
 }
 
@@ -39,8 +39,8 @@ type cli struct {
 // lists them. Which flags go together is checked by session.Flags.Check:
 // kong cannot say that --name and --server are both required without
 // --stdio and exactly one of them with it, and tagging them required would
-// make usage claim otherwise. kong also accepts these flags after list and
-// ssh-include, which therefore refuse them.
+// make usage claim otherwise. kong also accepts these flags after list,
+// which therefore refuses them.
 type codexCmd struct {
 	Stdio         bool   `group:"codex" help:"Serve one SSH connection on stdin/stdout, reaching the session --name or the server --server. ssh runs this via a Host block's ProxyCommand; you normally never run it yourself."`
 	Name          string `group:"codex" placeholder:"NAME" help:"Session name: the SSH alias the Codex app connects to. With --stdio, the running session to reach."`
@@ -48,8 +48,7 @@ type codexCmd struct {
 	TokenFile     string `group:"codex" type:"path" placeholder:"PATH" help:"File whose trimmed contents are the server's bearer token. Falls back to $COMLINK_TOKEN. Not with --stdio --name: a session's token comes from the session."`
 	ReportVersion string `group:"codex" placeholder:"VERSION" help:"With --stdio: Codex version reported to 'codex --version' (default 0.165.0)."`
 
-	List       codexListCmd       `cmd:"" name:"list" help:"Print the Codex sessions that are up."`
-	SSHInclude codexSSHIncludeCmd `cmd:"" name:"ssh-include" help:"Add the Include line for comlink's session config files to the top of ~/.ssh/config (run once)."`
+	List codexListCmd `cmd:"" name:"list" help:"Print the Codex sessions that are up."`
 }
 
 func (c *codexCmd) flags() session.Flags {
@@ -57,8 +56,6 @@ func (c *codexCmd) flags() session.Flags {
 }
 
 type codexListCmd struct{}
-
-type codexSSHIncludeCmd struct{}
 
 type acpCmd struct {
 	Server    string `required:"" placeholder:"URL" help:"comlink server base URL (ws:// or wss://); dials <server>/acp."`
@@ -75,7 +72,7 @@ func main() {
 		// Without this the command list shows only leaves, which leaves out
 		// `comlink codex` itself.
 		kong.ConfigureHelp(kong.HelpOptions{NoExpandSubcommands: true}),
-		kong.Groups{"codex": "Flags of 'comlink codex' itself (not of list or ssh-include):"},
+		kong.Groups{"codex": "Flags of 'comlink codex' itself (not of list):"},
 		kong.Vars{"version": "comlink " + Version},
 	)
 	ctx.FatalIfErrorf(ctx.Run())
@@ -95,8 +92,8 @@ func help(options kong.HelpOptions, ctx *kong.Context) error {
 }
 
 func (c *codexCmd) Run(kctx *kong.Context) error {
-	// kong also runs a parent's Run after its subcommand's; list and
-	// ssh-include have done their work by then.
+	// kong also runs a parent's Run after its subcommand's; list has done
+	// its work by then.
 	if kctx.Command() != "codex" {
 		return nil
 	}
@@ -166,21 +163,6 @@ func (c *codexListCmd) Run(parent *codexCmd) error {
 		return err
 	}
 	return store.PrintList(os.Stdout, os.Stderr)
-}
-
-func (c *codexSSHIncludeCmd) Run(parent *codexCmd) error {
-	if err := parent.flags().CheckUnset("ssh-include"); err != nil {
-		return err
-	}
-	store, err := session.Open()
-	if err != nil {
-		return err
-	}
-	sshConfig, err := session.SSHConfigPath()
-	if err != nil {
-		return err
-	}
-	return store.Include(sshConfig, os.Stdout)
 }
 
 func (c *acpCmd) Run() error {

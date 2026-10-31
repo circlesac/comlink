@@ -410,38 +410,40 @@ func TestSessionOpen(t *testing.T) {
 	}
 }
 
-// TestSessionInclude: the Include line goes to the top of ~/.ssh/config,
-// the file is created private when missing, the previous content is backed
-// up once and otherwise preserved byte for byte, and a second run changes
-// nothing.
-func TestSessionInclude(t *testing.T) {
+// upOnce runs Up for agent-a with a context that is already done, so it
+// registers, prints and removes its files at once, and returns its stderr.
+func upOnce(store *session.Store, sshConfig string) (string, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stderr bytes.Buffer
+	err := store.Up(ctx, "agent-a", "wss://agent.example.com", testToken, "/opt/comlink", sshConfig, io.Discard, &stderr)
+	return stderr.String(), err
+}
+
+// TestSessionUpInclude: Up puts the Include line at the top of
+// ~/.ssh/config, creating the file private when missing, backing the
+// previous content up once and otherwise preserving it byte for byte, and
+// says so in one stderr line; with the line already there in any spelling
+// ssh accepts it writes and prints nothing. A config it cannot change stops
+// it before any session file is written.
+func TestSessionUpInclude(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
-	line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
-	if got := store.IncludeLine(); got != line {
-		t.Fatalf("IncludeLine = %q, want %q", got, line)
-	}
-	spaced := &session.Store{Dir: filepath.Join(dir, "with space", "comlink")}
-	if got, want := spaced.IncludeLine(), `Include "`+filepath.Join(dir, "with space", "comlink", "ssh", "*.conf")+`"`; got != want {
-		t.Fatalf("IncludeLine with whitespace = %q, want %q", got, want)
-	}
-
+	pattern := filepath.Join(dir, "comlink", "ssh", "*.conf")
+	line := "Include " + pattern
 	config := filepath.Join(dir, "home", ".ssh", "config")
 	backup := config + ".comlink-bak"
-	include := func(t *testing.T) string {
+	up := func(t *testing.T) string {
 		t.Helper()
-		var out bytes.Buffer
-		if err := store.Include(config, &out); err != nil {
-			t.Fatalf("Include: %v", err)
+		stderr, err := upOnce(store, config)
+		if err != nil {
+			t.Fatalf("Up: %v", err)
 		}
-		return out.String()
+		return stderr
 	}
-	unchanged := config + " already includes " + store.IncludePattern() + "; nothing changed\n"
-	if included, err := store.Included(config); err != nil || included {
-		t.Fatalf("Included(missing) = %v, %v", included, err)
-	}
-	if got, want := include(t), "created "+config+" with \""+line+"\"\n"; got != want {
-		t.Fatalf("Include(missing) printed %q, want %q", got, want)
+
+	if got, want := up(t), "comlink: created "+config+" with \""+line+"\"\n"; got != want {
+		t.Fatalf("Up without a config printed %q, want %q", got, want)
 	}
 	if b, _ := os.ReadFile(config); string(b) != line+"\n" {
 		t.Fatalf("created config %q", b)
@@ -453,11 +455,8 @@ func TestSessionInclude(t *testing.T) {
 		t.Fatalf("created .ssh mode %o, want 700", m)
 	}
 	absent(t, backup)
-	if included, err := store.Included(config); err != nil || !included {
-		t.Fatalf("Included(created) = %v, %v", included, err)
-	}
-	if got := include(t); got != unchanged {
-		t.Fatalf("Include again printed %q, want %q", got, unchanged)
+	if got := up(t); got != "" {
+		t.Fatalf("Up again printed %q", got)
 	}
 
 	// An existing file: the line is prepended, the rest is byte-identical,
@@ -469,11 +468,11 @@ func TestSessionInclude(t *testing.T) {
 	if err := os.Chmod(config, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := include(t), "added \""+line+"\" to the top of "+config+"\nprevious content backed up to "+backup+"\n"; got != want {
-		t.Fatalf("Include(existing) printed %q, want %q", got, want)
+	if got, want := up(t), "comlink: added \""+line+"\" to the top of "+config+"; previous content backed up to "+backup+"\n"; got != want {
+		t.Fatalf("Up on an existing config printed %q, want %q", got, want)
 	}
 	if b, _ := os.ReadFile(config); string(b) != line+"\n"+original {
-		t.Fatalf("config after include %q", b)
+		t.Fatalf("config after Up %q", b)
 	}
 	if m := mode(t, config); m != 0o644 {
 		t.Fatalf("config mode %o, want the original 644", m)
@@ -481,25 +480,25 @@ func TestSessionInclude(t *testing.T) {
 	if b, _ := os.ReadFile(backup); string(b) != original {
 		t.Fatalf("backup %q, want the previous content", b)
 	}
-	if got := include(t); got != unchanged {
-		t.Fatalf("Include again printed %q, want %q", got, unchanged)
+	if got := up(t); got != "" {
+		t.Fatalf("Up again printed %q", got)
 	}
 	// The user removed the line: it is added back, and the first backup is kept.
 	if err := os.WriteFile(config, []byte("Host x\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := include(t), "added \""+line+"\" to the top of "+config+"\n"; got != want {
-		t.Fatalf("Include after removal printed %q, want %q", got, want)
+	if got, want := up(t), "comlink: added \""+line+"\" to the top of "+config+"\n"; got != want {
+		t.Fatalf("Up after removal printed %q, want %q", got, want)
 	}
 	if b, _ := os.ReadFile(config); string(b) != line+"\nHost x\n" {
-		t.Fatalf("config after re-include %q", b)
+		t.Fatalf("config after re-adding %q", b)
 	}
 	if b, _ := os.ReadFile(backup); string(b) != original {
 		t.Fatalf("backup overwritten: %q", b)
 	}
 
-	// Spellings ssh accepts for the same line count as included.
-	pattern := filepath.Join(dir, "comlink", "ssh", "*.conf")
+	// Spellings ssh accepts for the same line count as present; anything
+	// else gets the line added on top.
 	for _, content := range []string{
 		"include " + pattern + "\n",
 		"  Include\t" + pattern + "  \n",
@@ -511,8 +510,11 @@ func TestSessionInclude(t *testing.T) {
 		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if included, err := store.Included(config); err != nil || !included {
-			t.Errorf("Included(%q) = %v, %v", content, included, err)
+		if got := up(t); got != "" {
+			t.Errorf("Up with %q printed %q", content, got)
+		}
+		if b, _ := os.ReadFile(config); string(b) != content {
+			t.Errorf("Up changed %q to %q", content, b)
 		}
 	}
 	for _, content := range []string{
@@ -525,25 +527,43 @@ func TestSessionInclude(t *testing.T) {
 		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if included, err := store.Included(config); err != nil || included {
-			t.Errorf("Included(%q) = %v, %v", content, included, err)
+		if got, want := up(t), "comlink: added \""+line+"\" to the top of "+config+"\n"; got != want {
+			t.Errorf("Up with %q printed %q, want %q", content, got, want)
+		}
+		if b, _ := os.ReadFile(config); string(b) != line+"\n"+content {
+			t.Errorf("Up changed %q to %q", content, b)
 		}
 	}
 
-	// A config that cannot be read is an error, not "not included".
-	unreadable := filepath.Join(dir, "unreadable")
-	if err := os.Mkdir(unreadable, 0o700); err != nil {
+	// A state directory whose path holds whitespace gets a quoted pattern,
+	// which the next session recognises.
+	spaced := &session.Store{Dir: filepath.Join(dir, "with space", "comlink")}
+	spacedConfig := filepath.Join(dir, "spaced", "config")
+	spacedLine := `Include "` + filepath.Join(dir, "with space", "comlink", "ssh", "*.conf") + `"`
+	if got, err := upOnce(spaced, spacedConfig); err != nil || got != "comlink: created "+spacedConfig+" with "+strconv.Quote(spacedLine)+"\n" {
+		t.Fatalf("Up with whitespace in the state directory: %q, %v", got, err)
+	}
+	if b, _ := os.ReadFile(spacedConfig); string(b) != spacedLine+"\n" {
+		t.Fatalf("config %q, want %q", b, spacedLine)
+	}
+	if got, err := upOnce(spaced, spacedConfig); err != nil || got != "" {
+		t.Fatalf("Up again with whitespace in the state directory: %q, %v", got, err)
+	}
+
+	// A config that cannot be read or changed is an error and no session
+	// file is written.
+	refused := filepath.Join(dir, "refused")
+	refusedStore := &session.Store{Dir: filepath.Join(refused, "comlink")}
+	unreadable := filepath.Join(refused, "unreadable")
+	if err := os.MkdirAll(unreadable, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Included(unreadable); err == nil {
-		t.Fatal("Included(directory) = nil error")
+	if _, err := upOnce(refusedStore, unreadable); err == nil {
+		t.Fatal("Up with a directory as the config: nil error")
 	}
-	if err := store.Include(unreadable, io.Discard); err == nil {
-		t.Fatal("Include(directory) = nil error")
-	}
-	// A backup that cannot be written stops the change.
+	absent(t, refusedStore.Dir)
 	if os.Getuid() != 0 {
-		blockedDir := filepath.Join(dir, "blocked")
+		blockedDir := filepath.Join(refused, "blocked")
 		blocked := filepath.Join(blockedDir, "config")
 		if err := os.Mkdir(blockedDir, 0o700); err != nil {
 			t.Fatal(err)
@@ -555,31 +575,33 @@ func TestSessionInclude(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o700) })
-		if err := store.Include(blocked, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "write backup ") {
-			t.Fatalf("Include in a read-only directory: %v", err)
+		if _, err := upOnce(refusedStore, blocked); err == nil || !strings.HasPrefix(err.Error(), "write backup ") {
+			t.Fatalf("Up with a config in a read-only directory: %v", err)
 		}
 		if b, _ := os.ReadFile(blocked); string(b) != "Host y\n" {
 			t.Fatalf("config changed although the backup failed: %q", b)
 		}
+		absent(t, refusedStore.Dir)
 	}
 }
 
-// TestSessionIncludeSymlink: when ~/.ssh/config is a symbolic link (or a
-// chain of them, absolute or relative), the file it finally names gets the
-// Include line and its backup, the links stay links to the same place, and
-// the rest of the file is byte-identical with its mode kept. A link to a file
-// that does not exist yet creates that file; a link loop is an error.
-func TestSessionIncludeSymlink(t *testing.T) {
+// TestSessionUpIncludeSymlink: when ~/.ssh/config is a symbolic link (or a
+// chain of them, absolute or relative), Up gives the file it finally names
+// the Include line and its backup, the links stay links to the same place,
+// and the rest of the file is byte-identical with its mode kept. A link to a
+// file that does not exist yet creates that file; a link loop is an error
+// before any session file is written.
+func TestSessionUpIncludeSymlink(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
-	line := store.IncludeLine()
-	include := func(t *testing.T, path string) string {
+	line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
+	up := func(t *testing.T, path string) string {
 		t.Helper()
-		var out bytes.Buffer
-		if err := store.Include(path, &out); err != nil {
-			t.Fatalf("Include(%s): %v", path, err)
+		stderr, err := upOnce(store, path)
+		if err != nil {
+			t.Fatalf("Up(%s): %v", path, err)
 		}
-		return out.String()
+		return stderr
 	}
 	symlink := func(t *testing.T, dest, link string) {
 		t.Helper()
@@ -616,8 +638,8 @@ func TestSessionIncludeSymlink(t *testing.T) {
 			t.Fatal(err)
 		}
 		symlink(t, target, config)
-		if got, want := include(t, config), "added \""+line+"\" to the top of "+config+" -> "+target+"\nprevious content backed up to "+target+".comlink-bak\n"; got != want {
-			t.Fatalf("Include printed %q, want %q", got, want)
+		if got, want := up(t, config), "comlink: added \""+line+"\" to the top of "+config+" -> "+target+"; previous content backed up to "+target+".comlink-bak\n"; got != want {
+			t.Fatalf("Up printed %q, want %q", got, want)
 		}
 		stillLink(t, config, target)
 		if b, _ := os.ReadFile(target); string(b) != line+"\n"+original {
@@ -633,11 +655,8 @@ func TestSessionIncludeSymlink(t *testing.T) {
 		if entries, _ := os.ReadDir(filepath.Dir(target)); len(entries) != 2 {
 			t.Fatalf("%s holds %v, want the target and its backup only", filepath.Dir(target), entries)
 		}
-		if included, err := store.Included(config); err != nil || !included {
-			t.Fatalf("Included(link) = %v, %v", included, err)
-		}
-		if got, want := include(t, config), config+" -> "+target+" already includes "+store.IncludePattern()+"; nothing changed\n"; got != want {
-			t.Fatalf("Include again printed %q, want %q", got, want)
+		if got := up(t, config); got != "" {
+			t.Fatalf("Up again printed %q", got)
 		}
 		stillLink(t, config, target)
 	})
@@ -656,8 +675,8 @@ func TestSessionIncludeSymlink(t *testing.T) {
 		symlink(t, "../dotfiles/config", hop)
 		symlink(t, "hop", config)
 		target := filepath.Join(mustEvalSymlinks(t, base), "dotfiles", "config")
-		if got, want := include(t, config), "added \""+line+"\" to the top of "+config+" -> "+target+"\nprevious content backed up to "+target+".comlink-bak\n"; got != want {
-			t.Fatalf("Include printed %q, want %q", got, want)
+		if got, want := up(t, config), "comlink: added \""+line+"\" to the top of "+config+" -> "+target+"; previous content backed up to "+target+".comlink-bak\n"; got != want {
+			t.Fatalf("Up printed %q, want %q", got, want)
 		}
 		stillLink(t, config, "hop")
 		stillLink(t, hop, "../dotfiles/config")
@@ -670,8 +689,8 @@ func TestSessionIncludeSymlink(t *testing.T) {
 		target := filepath.Join(dir, "dangling", "dotfiles", "new", "config")
 		config := filepath.Join(dir, "dangling", "home", ".ssh", "config")
 		symlink(t, target, config)
-		if got, want := include(t, config), "created "+config+" -> "+target+" with \""+line+"\"\n"; got != want {
-			t.Fatalf("Include printed %q, want %q", got, want)
+		if got, want := up(t, config), "comlink: created "+config+" -> "+target+" with \""+line+"\"\n"; got != want {
+			t.Fatalf("Up printed %q, want %q", got, want)
 		}
 		stillLink(t, config, target)
 		if b, _ := os.ReadFile(target); string(b) != line+"\n" {
@@ -686,19 +705,21 @@ func TestSessionIncludeSymlink(t *testing.T) {
 	})
 
 	t.Run("loop", func(t *testing.T) {
+		loopStore := &session.Store{Dir: filepath.Join(dir, "loop", "comlink")}
 		config := filepath.Join(dir, "loop", "config")
 		symlink(t, "config", config)
-		if err := store.Include(config, io.Discard); err == nil || !strings.HasSuffix(err.Error(), ": too many levels of symbolic links") {
-			t.Fatalf("Include on a link loop: %v", err)
+		if _, err := upOnce(loopStore, config); err == nil || !strings.HasSuffix(err.Error(), ": too many levels of symbolic links") {
+			t.Fatalf("Up on a link loop: %v", err)
 		}
 		stillLink(t, config, "config")
+		absent(t, loopStore.Dir)
 	})
 }
 
-// TestSessionUp drives Up in process: it prints what is available and the
-// ssh-include hint, holds the name until the context is done, then removes
-// its files. With the include in place there is no hint, and a stale
-// record is reported as replaced.
+// TestSessionUp drives Up in process: it adds the Include line, prints what
+// is available, holds the name until the context is done, then removes its
+// files and leaves the line. With the line in place it prints nothing about
+// it, and a stale record is reported as replaced.
 func TestSessionUp(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
@@ -747,8 +768,9 @@ func TestSessionUp(t *testing.T) {
 	if ready != want {
 		t.Fatalf("stdout:\n%s\nwant:\n%s", ready, want)
 	}
-	if hint := "comlink: " + sshConfig + " does not include " + store.IncludePattern() + "; run 'comlink codex ssh-include' once so the Codex app can use the alias\n"; stderr.String() != hint {
-		t.Fatalf("stderr %q, want %q", stderr.String(), hint)
+	line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
+	if want := "comlink: created " + sshConfig + " with \"" + line + "\"\n"; stderr.String() != want {
+		t.Fatalf("stderr %q, want %q", stderr.String(), want)
 	}
 	block, err := os.ReadFile(conf)
 	if err != nil {
@@ -764,10 +786,10 @@ func TestSessionUp(t *testing.T) {
 		t.Fatalf("Up returned %v after the context ended", err)
 	}
 	absent(t, record, token, lock, conf)
-
-	if err := store.Include(sshConfig, io.Discard); err != nil {
-		t.Fatal(err)
+	if b, _ := os.ReadFile(sshConfig); string(b) != line+"\n" {
+		t.Fatalf("ssh config after the session %q, want the Include line kept", b)
 	}
+
 	writeStaleSession(t, dir, "agent-a")
 	stalePID := readRecord(t, record).PID
 	_, stderr, stop = start(t, "agent-a")
@@ -778,10 +800,16 @@ func TestSessionUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Refusals: a bad alias before anything is written, and a name that is up.
-	if err := store.Up(context.Background(), "agent\nHost *", "wss://agent.example.com", "", "/opt/comlink", sshConfig, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "invalid alias ") {
+	// Refusals: a bad alias or server before anything is written (not even
+	// the Include line), and a name that is up.
+	untouched := filepath.Join(dir, "untouched", "config")
+	if err := store.Up(context.Background(), "agent\nHost *", "wss://agent.example.com", "", "/opt/comlink", untouched, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "invalid alias ") {
 		t.Fatalf("Up with a bad alias: %v", err)
 	}
+	if err := store.Up(context.Background(), "agent-c", "https://agent.example.com", "", "/opt/comlink", untouched, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
+		t.Fatalf("Up with a bad server: %v", err)
+	}
+	absent(t, untouched)
 	held, err := store.Start("agent-b", "wss://agent.example.com", "", "x")
 	if err != nil {
 		t.Fatal(err)

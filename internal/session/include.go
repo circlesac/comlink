@@ -10,15 +10,15 @@ import (
 	"strings"
 )
 
-// IncludePattern is the glob the ~/.ssh/config Include line loads: every
+// includePattern is the glob the ~/.ssh/config Include line loads: every
 // session's ssh config file.
-func (s *Store) IncludePattern() string { return filepath.Join(s.SSHDir(), "*.conf") }
+func (s *Store) includePattern() string { return filepath.Join(s.SSHDir(), "*.conf") }
 
-// IncludeLine is the ~/.ssh/config line that loads the session config
+// includeLine is the ~/.ssh/config line that loads the session config
 // files. The pattern is double-quoted when it holds whitespace, as ssh
 // requires.
-func (s *Store) IncludeLine() string {
-	pattern := s.IncludePattern()
+func (s *Store) includeLine() string {
+	pattern := s.includePattern()
 	if strings.ContainsAny(pattern, " \t") {
 		pattern = `"` + pattern + `"`
 	}
@@ -34,19 +34,6 @@ func SSHConfigPath() (string, error) {
 	return filepath.Join(home, ".ssh", "config"), nil
 }
 
-// Included reports whether the ssh config at path has an Include line for
-// the session config files. A missing file includes nothing.
-func (s *Store) Included(path string) (bool, error) {
-	b, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return s.includes(string(b)), nil
-}
-
 // includes reports whether config has a line `Include <pattern>`, with the
 // keyword in any case, an optional '=' after it and optional double quotes
 // around the pattern.
@@ -59,17 +46,18 @@ func (s *Store) includes(config string) bool {
 			continue
 		}
 		arg := strings.TrimLeft(line[i:], " \t=")
-		if strings.Trim(arg, `"`) == s.IncludePattern() {
+		if strings.Trim(arg, `"`) == s.includePattern() {
 			return true
 		}
 	}
 	return false
 }
 
-// Include puts the Include line at the top of the ssh config at path, as
-// include does, and prints what it did on out. When path is a symbolic link
-// the file it names is the one changed, and the message shows both.
-func (s *Store) Include(path string, out io.Writer) error {
+// addInclude makes sure the ssh config at path has the Include line, adding
+// it as include does, and says on out in one line when it changed the file.
+// When path is a symbolic link the file it names is the one changed, and the
+// message shows both. Nothing is printed when the line was already there.
+func (s *Store) addInclude(path string, out io.Writer) error {
 	result, err := s.include(path)
 	if err != nil {
 		return err
@@ -80,14 +68,11 @@ func (s *Store) Include(path string, out io.Writer) error {
 	}
 	switch {
 	case result.Created:
-		_, _ = fmt.Fprintf(out, "created %s with %q\n", shown, s.IncludeLine())
+		_, _ = fmt.Fprintf(out, "comlink: created %s with %q\n", shown, s.includeLine())
+	case result.Backup != "":
+		_, _ = fmt.Fprintf(out, "comlink: added %q to the top of %s; previous content backed up to %s\n", s.includeLine(), shown, result.Backup)
 	case result.Added:
-		_, _ = fmt.Fprintf(out, "added %q to the top of %s\n", s.IncludeLine(), shown)
-		if result.Backup != "" {
-			_, _ = fmt.Fprintf(out, "previous content backed up to %s\n", result.Backup)
-		}
-	default:
-		_, _ = fmt.Fprintf(out, "%s already includes %s; nothing changed\n", shown, s.IncludePattern())
+		_, _ = fmt.Fprintf(out, "comlink: added %q to the top of %s\n", s.includeLine(), shown)
 	}
 	return nil
 }
@@ -109,13 +94,13 @@ type includeResult struct {
 // file's own path + ".comlink-bak" (next to the target, not the link); a
 // backup that already exists is kept. Everything else in the file is
 // preserved byte for byte and its mode is kept. The new content is renamed
-// into place whole. Running include again changes nothing.
+// into place whole. When the line is already there nothing is written.
 func (s *Store) include(path string) (includeResult, error) {
 	target, err := resolveLinks(path)
 	if err != nil {
 		return includeResult{}, err
 	}
-	line := s.IncludeLine() + "\n"
+	line := s.includeLine() + "\n"
 	old, err := os.ReadFile(target)
 	if errors.Is(err, fs.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {

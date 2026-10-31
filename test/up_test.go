@@ -229,8 +229,9 @@ func sessionDirs(t *testing.T, state string) (run, ssh []string) {
 
 // TestUpRegistersUntilStopped: `codex --name NAME --server URL` writes the
 // record, the token file and the ssh config file with private modes and
-// nothing else (no temporary files left), prints the alias and the hint to
-// run ssh-include, and removes exactly its files on SIGTERM with exit 0.
+// nothing else (no temporary files left), prints the alias and that it
+// created ~/.ssh/config with the Include line, and removes exactly its files
+// on SIGTERM with exit 0, keeping the line.
 func TestUpRegistersUntilStopped(t *testing.T) {
 	bin := buildComlink(t)
 	env, home, state := sessionEnv(t)
@@ -244,7 +245,8 @@ func TestUpRegistersUntilStopped(t *testing.T) {
 	if up.ready != wantReady {
 		t.Fatalf("stdout:\n%s\nwant:\n%s", up.ready, wantReady)
 	}
-	hint := "comlink: " + filepath.Join(home, ".ssh", "config") + " does not include " + filepath.Join(state, "comlink", "ssh", "*.conf") + "; run 'comlink codex ssh-include' once so the Codex app can use the alias\n"
+	line := "Include " + filepath.Join(state, "comlink", "ssh", "*.conf")
+	added := "comlink: created " + filepath.Join(home, ".ssh", "config") + " with \"" + line + "\"\n"
 
 	got := readRecord(t, record)
 	if want := (session.Record{Name: "agent-a", Server: "wss://agent.example.com/base/", Codex: "wss://agent.example.com/base/codex", PID: up.cmd.Process.Pid}); got != want {
@@ -289,8 +291,11 @@ func TestUpRegistersUntilStopped(t *testing.T) {
 		t.Errorf("run holds %v and ssh holds %v after stop", run, ssh)
 	}
 	// stderr is complete once the process has exited.
-	if up.stderr.String() != hint {
-		t.Fatalf("stderr %q, want only the hint", up.stderr.String())
+	if up.stderr.String() != added {
+		t.Fatalf("stderr %q, want only %q", up.stderr.String(), added)
+	}
+	if b, _ := os.ReadFile(filepath.Join(home, ".ssh", "config")); string(b) != line+"\n" {
+		t.Fatalf("~/.ssh/config after the session %q, want the Include line kept", b)
 	}
 
 	// SIGINT ends it the same way, and a token file is read like elsewhere.
@@ -399,21 +404,31 @@ func TestListShowsLiveSessions(t *testing.T) {
 	b.stop(t, syscall.SIGTERM)
 }
 
-// TestSSHIncludeCommand: `codex ssh-include` creates ~/.ssh/config with the
-// Include line, or puts it at the top of an existing one, backing the
-// previous content up once; running it again changes nothing; a session
-// stops printing its hint afterwards. A ~/.ssh/config that is a symlink
-// stays one: the file it points to gets the line and the backup.
-func TestSSHIncludeCommand(t *testing.T) {
+// TestUpAddsInclude: a session puts the Include line at the top of
+// ~/.ssh/config before it registers anything, creating the file when it is
+// missing, backing the previous content up once and saying so in one stderr
+// line; the line stays after the session ends. When the line is already
+// there in any spelling ssh accepts, nothing is written or printed. A
+// ~/.ssh/config that is a symlink stays one: the file it points to gets the
+// line and the backup. A config that cannot be changed stops the session
+// before any session file exists.
+func TestUpAddsInclude(t *testing.T) {
 	bin := buildComlink(t)
 	env, home, state := sessionEnv(t)
 	config := filepath.Join(home, ".ssh", "config")
 	backup := config + ".comlink-bak"
-	line := "Include " + filepath.Join(state, "comlink", "ssh", "*.conf")
+	pattern := filepath.Join(state, "comlink", "ssh", "*.conf")
+	line := "Include " + pattern
+	// session runs a session to its ready line, stops it and returns its stderr.
+	session := func(t *testing.T) string {
+		t.Helper()
+		up := startUp(t, bin, env, "agent-a", "wss://agent.example.com")
+		up.stop(t, syscall.SIGTERM)
+		return up.stderr.String()
+	}
 
-	stdout, stderr, code := runBinary(t, bin, env, "", "codex", "ssh-include")
-	if code != 0 || stdout != "created "+config+" with \""+line+"\"\n" || stderr != "" {
-		t.Fatalf("ssh-include: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	if got, want := session(t), "comlink: created "+config+" with \""+line+"\"\n"; got != want {
+		t.Fatalf("session without ~/.ssh/config printed %q, want %q", got, want)
 	}
 	if b, _ := os.ReadFile(config); string(b) != line+"\n" {
 		t.Fatalf("config %q", b)
@@ -421,39 +436,64 @@ func TestSSHIncludeCommand(t *testing.T) {
 	if m := mode(t, config); m != 0o600 {
 		t.Fatalf("config mode %o, want 600", m)
 	}
+	if m := mode(t, filepath.Dir(config)); m != 0o700 {
+		t.Fatalf("~/.ssh mode %o, want 700", m)
+	}
 	absent(t, backup)
-	stdout, _, code = runBinary(t, bin, env, "", "codex", "ssh-include")
-	if code != 0 || stdout != config+" already includes "+filepath.Join(state, "comlink", "ssh", "*.conf")+"; nothing changed\n" {
-		t.Fatalf("ssh-include again: exit %d, stdout %q", code, stdout)
+	if got := session(t); got != "" {
+		t.Fatalf("session with the line in place printed %q", got)
 	}
 
-	original := "Host old\n  HostName old.example.com\n"
-	if err := os.WriteFile(config, []byte(original), 0o600); err != nil {
+	// An existing config: the line goes on top, the rest is byte-identical,
+	// the mode is kept and the backup is written once.
+	original := "# keep\r\n\nHost *\n\tServerAliveInterval 30 \n\n  Host old\n    HostName old.example.com"
+	if err := os.WriteFile(config, []byte(original), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	stdout, _, code = runBinary(t, bin, env, "", "codex", "ssh-include")
-	if want := "added \"" + line + "\" to the top of " + config + "\nprevious content backed up to " + backup + "\n"; code != 0 || stdout != want {
-		t.Fatalf("ssh-include on an existing config: exit %d, stdout %q, want %q", code, stdout, want)
+	if err := os.Chmod(config, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := session(t), "comlink: added \""+line+"\" to the top of "+config+"; previous content backed up to "+backup+"\n"; got != want {
+		t.Fatalf("session on an existing config printed %q, want %q", got, want)
 	}
 	if b, _ := os.ReadFile(config); string(b) != line+"\n"+original {
-		t.Fatalf("config %q", b)
+		t.Fatalf("config %q, want the line on top of the previous content", b)
+	}
+	if m := mode(t, config); m != 0o640 {
+		t.Fatalf("config mode %o, want the original 640", m)
 	}
 	if b, _ := os.ReadFile(backup); string(b) != original {
 		t.Fatalf("backup %q", b)
 	}
-	before, _ := os.ReadFile(config)
-	stdout, _, code = runBinary(t, bin, env, "", "codex", "ssh-include")
-	if after, _ := os.ReadFile(config); code != 0 || !bytes.Equal(before, after) || !strings.HasSuffix(stdout, "nothing changed\n") {
-		t.Fatalf("ssh-include again: exit %d, stdout %q, config changed %v", code, stdout, !bytes.Equal(before, after))
+	// The user removed the line: it is added back and the first backup kept.
+	if err := os.WriteFile(config, []byte("Host x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := session(t), "comlink: added \""+line+"\" to the top of "+config+"\n"; got != want {
+		t.Fatalf("session after the line was removed printed %q, want %q", got, want)
 	}
 	if b, _ := os.ReadFile(backup); string(b) != original {
-		t.Fatalf("backup changed: %q", b)
+		t.Fatalf("backup overwritten: %q", b)
 	}
 
-	up := startUp(t, bin, env, "agent-a", "wss://agent.example.com")
-	up.stop(t, syscall.SIGTERM)
-	if up.stderr.String() != "" {
-		t.Fatalf("session printed %q with the include in place", up.stderr.String())
+	// Spellings ssh accepts count as present: nothing is written or printed.
+	for _, content := range []string{
+		"include " + pattern + "\n",
+		"  Include\t" + pattern + "  \n",
+		"Include=" + pattern + "\n",
+		"Include = " + pattern + "\n",
+		`Include "` + pattern + `"` + "\n",
+		"Host a\nInclude " + pattern + "\n",
+	} {
+		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := session(t); got != "" {
+			t.Errorf("session with %q printed %q", content, got)
+		}
+		if b, _ := os.ReadFile(config); string(b) != content {
+			t.Errorf("config %q changed to %q", content, b)
+		}
 	}
 
 	// ~/.ssh/config as a symlink into a dotfiles checkout.
@@ -470,9 +510,8 @@ func TestSSHIncludeCommand(t *testing.T) {
 	if err := os.Symlink(target, config); err != nil {
 		t.Fatal(err)
 	}
-	stdout, _, code = runBinary(t, bin, env, "", "codex", "ssh-include")
-	if want := "added \"" + line + "\" to the top of " + config + " -> " + target + "\nprevious content backed up to " + target + ".comlink-bak\n"; code != 0 || stdout != want {
-		t.Fatalf("ssh-include through a symlink: exit %d, stdout %q, want %q", code, stdout, want)
+	if got, want := session(t), "comlink: added \""+line+"\" to the top of "+config+" -> "+target+"; previous content backed up to "+target+".comlink-bak\n"; got != want {
+		t.Fatalf("session through a symlink printed %q, want %q", got, want)
 	}
 	if dest, err := os.Readlink(config); err != nil || dest != target {
 		t.Fatalf("~/.ssh/config is no longer the symlink to %s: %q, %v", target, dest, err)
@@ -485,6 +524,50 @@ func TestSSHIncludeCommand(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(target + ".comlink-bak"); string(b) != original {
 		t.Fatalf("target backup %q", b)
+	}
+
+	// Configs that cannot be changed: the session fails with one line and
+	// leaves no session file.
+	refused := func(t *testing.T, wantSuffix string) {
+		t.Helper()
+		stdout, stderr, code := runBinary(t, bin, append(env, "COMLINK_TOKEN="+testToken), "", "codex", "--name", "agent-a", "--server", "wss://agent.example.com")
+		if code == 0 || stdout != "" || strings.Count(stderr, "\n") != 1 ||
+			!strings.HasPrefix(stderr, "comlink: error: ") || !strings.HasSuffix(stderr, wantSuffix+"\n") {
+			t.Fatalf("session: exit %d, stdout %q, stderr %q, want one error line ending in %q", code, stdout, stderr, wantSuffix)
+		}
+		if run, ssh := sessionDirs(t, state); len(run)+len(ssh) != 0 {
+			t.Fatalf("run holds %v and ssh holds %v after a refused session", run, ssh)
+		}
+	}
+	if err := os.Remove(config); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("config", config); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, ": too many levels of symbolic links")
+	if dest, err := os.Readlink(config); err != nil || dest != "config" {
+		t.Fatalf("looping ~/.ssh/config changed: %q, %v", dest, err)
+	}
+	if os.Getuid() != 0 {
+		// The backup cannot be written beside a config in a read-only directory.
+		if err := os.Remove(config); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(config, []byte("Host y\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Dir(config), 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(filepath.Dir(config), 0o700) })
+		refused(t, ": permission denied")
+		if b, _ := os.ReadFile(config); string(b) != "Host y\n" {
+			t.Fatalf("config changed although the session was refused: %q", b)
+		}
 	}
 }
 
@@ -673,13 +756,13 @@ func TestCodexHelp(t *testing.T) {
 	for _, want := range []string{
 		"--stdio ", "via a Host block's ProxyCommand; you normally never run it yourself.",
 		"--name=NAME ", "--server=URL ", "--token-file=PATH ", "--report-version=VERSION ",
-		"codex list", "codex ssh-include",
+		"codex list",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("codex --help lacks %q:\n%s", want, stdout)
 		}
 	}
-	if strings.Contains(stdout, "proxy") || strings.Contains(stdout, "codex up") || strings.Contains(stdout, "required") {
+	if strings.Contains(stdout, "proxy") || strings.Contains(stdout, "codex up") || strings.Contains(stdout, "ssh-include") || strings.Contains(stdout, "required") {
 		t.Errorf("codex --help names a removed command or a required flag:\n%s", stdout)
 	}
 	stdout, _, code = runBinary(t, bin, env, "", "--help")
@@ -691,12 +774,13 @@ func TestCodexHelp(t *testing.T) {
 // TestUpRejectsBadArguments: a session refuses an invalid name or server
 // before writing anything and needs both --name and --server;
 // --report-version needs --stdio; `codex --stdio` takes exactly one of
-// --name and --server, and --token-file only with --server; list and
-// ssh-include refuse the flags of `codex` itself; `acp` takes --server and
-// nothing that names a session; the removed commands and flags are unknown.
+// --name and --server, and --token-file only with --server; list refuses
+// the flags of `codex` itself; `acp` takes --server and nothing that names a
+// session; the removed commands and flags are unknown. None of them writes
+// to the state directory or ~/.ssh.
 func TestUpRejectsBadArguments(t *testing.T) {
 	bin := buildComlink(t)
-	env, _, state := sessionEnv(t)
+	env, home, state := sessionEnv(t)
 	for _, tc := range []struct {
 		args []string
 		want string
@@ -716,7 +800,7 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		{[]string{"codex", "--stdio", "--server", "https://agent.example.com"}, `comlink: error: server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
 		{[]string{"codex", "--stdio", "--upstream", "ws://127.0.0.1:1"}, "comlink: error: unknown flag --upstream"},
 		{[]string{"codex", "list", "--name", "a"}, "comlink: error: 'comlink codex list' takes no flags; --stdio, --name, --server, --token-file and --report-version go with 'comlink codex' itself"},
-		{[]string{"codex", "--stdio", "ssh-include"}, "comlink: error: 'comlink codex ssh-include' takes no flags; --stdio, --name, --server, --token-file and --report-version go with 'comlink codex' itself"},
+		{[]string{"codex", "ssh-include"}, "comlink: error: unexpected argument ssh-include"},
 		{[]string{"codex", "proxy", "--name", "a"}, "comlink: error: unexpected argument proxy"},
 		{[]string{"codex", "up", "--name", "a", "--server", "ws://127.0.0.1:1"}, "comlink: error: unexpected argument up"},
 		{[]string{"acp"}, "comlink: error: missing flags: --server=URL"},
@@ -737,4 +821,5 @@ func TestUpRejectsBadArguments(t *testing.T) {
 	if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
 		t.Fatalf("state directory holds %v (%v) after refused commands", entries, err)
 	}
+	absent(t, filepath.Join(home, ".ssh"))
 }
