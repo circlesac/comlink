@@ -82,22 +82,24 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 // Up is `comlink codex --server URL [--name NAME]`. An explicit name is
 // used as is: Start refuses it when it is up, and when the ssh config at
 // sshConfig already applies to it (a Host line of the user's matches it,
-// see sshConfigured) Up warns on stderr and goes on. Without a name Up tries the base defaultName gives, then
-// base-2, base-3 and so on, skipping a candidate the user's ssh
-// configuration applies to and one Start reports as up (also when another
-// session took it after the check), and the ready lines say which name it
-// took and why. Only finitely many sessions can be up, so the only endless
-// run of skips is ssh configuration that matches every suffix (a pattern
-// such as `Host padawan*`): two candidates in a row with ssh configuration
-// end it with an error asking for --name, before anything is written.
-// Once a name passes it makes sure the ssh config at sshConfig includes the
-// session config files (adding the line as include does and saying so on stderr;
-// the line stays after the session), then registers name with server and
-// token, writes the ssh config block whose ProxyCommand runs
-// `<exe> codex --stdio --name NAME`, prints the alias on stdout, and holds
-// the session until ctx is done. It then removes the session's files and
-// returns nil. When the Include line cannot be added no session file is
-// written.
+// see sshConfigured) Up warns on stderr once the session is up. Without a
+// name Up tries the base defaultName gives, then base-2, base-3 and so on,
+// skipping a candidate the user's ssh configuration applies to and one
+// Start reports as up (also when another session took it after the check),
+// and the ready lines say which name it took and why. Only finitely many
+// sessions can be up, so the only endless run of skips is ssh configuration
+// that matches every suffix (a pattern such as `Host padawan*`): two
+// candidates in a row with ssh configuration end it with an error asking
+// for --name, before any session file is written. The first candidate
+// without ssh configuration makes sure the ssh config at sshConfig includes
+// the session config files (adding the line as include does and saying so
+// on stderr; the line stays after the session), so when that candidate is
+// up and the next two are configured the line is there by the time Up
+// refuses. Up then registers name with server and token, writes the ssh
+// config block whose ProxyCommand runs `<exe> codex --stdio --name NAME`,
+// prints the alias on stdout, and holds the session until ctx is done. It
+// then removes the session's files and returns nil. When the Include line
+// cannot be added no session file is written.
 func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig string, stdout, stderr io.Writer) error {
 	if _, err := upstream.Endpoint(server, "codex"); err != nil {
 		return err
@@ -113,6 +115,7 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 	}
 	included := false
 	configured := "" // the previous candidate, when ssh configuration applies to it
+	warning := ""    // why an explicit name's session shadows the user's Host line
 	for n := 1; ; n++ {
 		name := base
 		if n > 1 {
@@ -125,7 +128,7 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 		if where := s.sshConfigured(sshConfig, name); where != "" {
 			why := fmt.Sprintf("%q already has ssh configuration (the Host line at %s matches it)", name, where)
 			if !derived {
-				_, _ = fmt.Fprintf(stderr, "comlink: warning: %s; this session's Host block takes precedence while it runs\n", why)
+				warning = why
 			} else if configured != "" {
 				return fmt.Errorf("%q and %q both have ssh configuration, so a pattern in it likely matches every %s-N; pass --name NAME", configured, name, base)
 			} else {
@@ -152,6 +155,9 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 		}
 		if sess.Replaced != nil {
 			_, _ = fmt.Fprintf(stderr, "comlink: removed stale session %q (pid %d is gone)\n", sess.Replaced.Name, sess.Replaced.PID)
+		}
+		if warning != "" {
+			_, _ = fmt.Fprintf(stderr, "comlink: warning: %s; this session's Host block takes precedence while it runs\n", warning)
 		}
 		_, _ = fmt.Fprintf(stdout, "%s is up (pid %d)\n", sess.Name, sess.PID)
 		switch {

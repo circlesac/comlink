@@ -132,20 +132,28 @@ configuration already applies to it: the Include line below sits at the top
 of `~/.ssh/config`, so while the session ran, `ssh <name>` would get
 comlink's block instead of yours. To tell, the session reads
 `~/.ssh/config` and the files it Includes (no ssh is run) for a `Host` line
-with a pattern that matches the name, case-insensitively with `*` and `?`
-wildcards and `!` negation (`(example-agent has ssh configuration; ...)`).
-A `Host` line that matches every name, such as `Host *`, does not count, so
-options under it like `ControlPath ~/.ssh/cm/%r@%h:%p` or
+with a pattern that matches the name, with `*` and `?` wildcards and `!`
+negation (`(example-agent has ssh configuration; ...)`). Like ssh, which
+lowercases the host you ask for, it matches the lowercased name against
+patterns as written, so `Host EXAMPLE-AGENT` applies to no name; arguments
+are split as ssh splits them, with double or single quotes and backslash
+escapes. A `Host` line that matches every name, such as `Host *`, does not
+count, so options under it like `ControlPath ~/.ssh/cm/%r@%h:%p` or
 `HostName %h.example.com` never make a name look taken. `Include` lines are
-followed wherever they are, the way ssh resolves them (relative to
-`~/.ssh`, `~` for your home, globs expanded, missing files skipped, at most
-16 deep); comlink's own session files are skipped. Two things are not
+followed where ssh would include them for the name (at top level, under a
+`Host` line that matches it, `Host *` included, and under a `Match` block)
+and resolved the way ssh does (relative to `~/.ssh`, `~` for your home,
+globs expanded, missing files skipped, at most 16 deep); comlink's own
+session files are skipped. Two things are not
 detected: `Match` blocks, which are not evaluated because they can run
 commands (`Match exec`), and a short name that reaches a host only through
 DNS search domains. When two names in a row both have ssh
 configuration, a pattern such as `Host example-agent*` most likely matches
 every suffix, so the session stops there, exits non-zero with one line
-ending `; pass --name NAME` and writes nothing.
+ending `; pass --name NAME` and writes no session file. The Include line
+below may already have been added by then: it is added at the first name
+without ssh configuration, so it is there when that name turned out to be
+up and the next two are configured.
 
 When the server's host gives no usable alias, the base name is `comlink`
 instead: an IP address (`ws://127.0.0.1:8787`, `ws://[::1]:8787`),
@@ -156,7 +164,7 @@ address; --name sets another)`.
 
 Pass `--name NAME` to choose the alias yourself. It is used as is: a name
 that is up is refused, and one your ssh configuration already applies to
-gets a one-line warning and the session comes up:
+gets a one-line warning once the session is up:
 
 ```sh
 comlink codex --server wss://example-agent.example.com --name agent-review \
@@ -412,15 +420,21 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   written, and a config that is a symlink (absolute, a relative chain,
   dangling, a loop): the links stay as they were and the target gets the
   line and the backup; and the static scan for the name's `Host` lines: a
-  derived name matched by a `Host` line (one of several patterns, any case,
-  `=`, quotes, `?`) or one in an Included file (absolute, relative to
-  `~/.ssh`, `~`, a glob under a block, an Include loop) skipped for
-  `devbox-2` with the reason, a pattern that matches the suffix too
-  refused with one `--name` line and nothing written, an explicit name
-  warned once naming the Host line and up, and a name only `Host *` (even
-  with `%h` options), a negation, a `Match` block (the documented gap),
-  missing Includes or comlink's own stale file apply to up without a
-  word.
+  derived name matched by a `Host` line (one of several patterns, an
+  upper-case keyword, `=`, double and single quotes, `?`) or one in an
+  Included file (absolute, relative to `~/.ssh`, `~`, a glob under a
+  `Match` block, under `Host *` or the name's own `Host` line, an Include
+  loop) skipped for `devbox-2` with the reason, a pattern that matches the
+  suffix too refused with one `--name` line and nothing written, an
+  explicit name warned once naming the Host line and up, and a name only
+  `Host *` (even with `%h` options), a negation, an upper-case pattern,
+  words that quotes or escapes keep together, an Include under another
+  `Host` line, a `Match` block (the documented gap), missing Includes or
+  comlink's own stale file apply to up without a word; `Host comlink*`
+  refused for a server without a usable label, `Host comlink-*` leaving
+  `comlink` free but refusing `comlink-2` and `comlink-3` when `comlink`
+  is up and warning an explicit `comlink-x`; and an explicit name that is
+  configured and up refused without the warning.
 - `token_test.go`: the token from a file or `$COMLINK_TOKEN`, trimmed, the
   permission warning naming the path and a missing file.
 - `up_test.go`: the built binary with a temporary `HOME` and

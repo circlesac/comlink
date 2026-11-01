@@ -1,8 +1,6 @@
 package session
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,25 +12,28 @@ import (
 // READCONF_MAX_DEPTH.
 const maxIncludeDepth = 16
 
+// everyHost stands for a host no Host line names: it holds only '/', which
+// no alias can contain, so the only patterns that match it are wildcards
+// alone (*, ?*), never one that starts, ends or contains a name, such as
+// comlink-* for the names comlink derives.
+const everyHost = "////////////////"
+
 // sshConfigured reports where the user's ssh configuration already applies
 // to name, which the session's Host block would shadow while it runs: the
 // file and line of the first Host line in the ssh config at sshConfig, or
 // in a file it Includes, with a pattern that matches name, or "" when there
-// is none. A Host line that also matches a random name (Host *, or
+// is none. A Host line that also matches everyHost (Host *, or
 // Host * !other) applies to every host alike and does not count. The files
 // are only read, never run through ssh: ssh -G percent-expands options such
 // as ControlPath %h, runs Match exec commands and may look names up in DNS.
 // Match blocks are not evaluated, and a short name that reaches a host only
 // through DNS search domains has no configuration either.
 func (s *Store) sshConfigured(sshConfig, name string) string {
-	random := make([]byte, 8)
-	_, _ = rand.Read(random)
-	unmatched := "comlink-probe-" + hex.EncodeToString(random)
-	name = strings.ToLower(name)
+	name = strings.ToLower(name) // ssh lowercases the host it is asked for
 	var hosts []hostLine
-	s.scanConfig(sshConfig, filepath.Dir(sshConfig), nil, &hosts)
+	s.scanConfig(sshConfig, filepath.Dir(sshConfig), name, nil, &hosts)
 	for _, h := range hosts {
-		if matchHost(name, h.patterns) && !matchHost(unmatched, h.patterns) {
+		if matchHost(name, h.patterns) && !matchHost(everyHost, h.patterns) {
 			return h.where
 		}
 	}
@@ -46,29 +47,35 @@ type hostLine struct {
 }
 
 // scanConfig appends the Host lines of the ssh config file to hosts and
-// follows its Include lines, wherever they are (an Include under a block
-// still brings in Host lines), the way ssh resolves them: ~ is the home
-// directory (the one holding sshDir, ~/.ssh), a relative path is relative
-// to sshDir and globs expand. Files that are missing or unreadable are
-// skipped, as are the session config files (comlink's own Host blocks) and
-// a file already being read (an Include loop). stack is the chain of files
-// being read; it stops at maxIncludeDepth.
-func (s *Store) scanConfig(file, sshDir string, stack []string, hosts *[]hostLine) {
+// follows the Include lines that apply to name, the way ssh resolves them:
+// one at top level or under a Host line that matches name (Host * too),
+// and one under a Match block, which is not evaluated, so its Host lines
+// count rather than go unseen; ~ is the home directory (the one holding
+// sshDir, ~/.ssh), a relative path is relative to sshDir and globs expand.
+// Files that are missing or unreadable are skipped, as are the session
+// config files (comlink's own Host blocks) and a file already being read
+// (an Include loop). stack is the chain of files being read; it stops at
+// maxIncludeDepth.
+func (s *Store) scanConfig(file, sshDir, name string, stack []string, hosts *[]hostLine) {
 	b, err := os.ReadFile(file)
 	if err != nil {
 		return
 	}
 	stack = append(stack, file)
+	applies := true // whether the block the line is in applies to name
 	for i, line := range strings.Split(string(b), "\n") {
 		keyword, args := configWords(line)
 		switch {
 		case strings.EqualFold(keyword, "Host"):
 			*hosts = append(*hosts, hostLine{fmt.Sprintf("%s:%d", file, i+1), args})
-		case strings.EqualFold(keyword, "Include") && len(stack) <= maxIncludeDepth:
+			applies = matchHost(name, args)
+		case strings.EqualFold(keyword, "Match"):
+			applies = true
+		case strings.EqualFold(keyword, "Include") && applies && len(stack) <= maxIncludeDepth:
 			for _, arg := range args {
 				for _, included := range s.includeFiles(arg, sshDir) {
 					if !slices.Contains(stack, included) {
-						s.scanConfig(included, sshDir, stack, hosts)
+						s.scanConfig(included, sshDir, name, stack, hosts)
 					}
 				}
 			}
@@ -98,9 +105,12 @@ func (s *Store) includeFiles(arg, sshDir string) []string {
 }
 
 // configWords splits an ssh config line the way ssh does: the keyword is
-// separated from its arguments by whitespace or one '=', the arguments are
-// split on whitespace with double quotes grouping, and a '#' that starts a
-// word starts a comment. A blank or comment line has no keyword.
+// separated from its arguments by whitespace or one '=', and the arguments
+// are split as argv_split does: on whitespace outside quotes, with double
+// or single quotes grouping, a backslash escaping a following quote or
+// backslash (and, outside quotes, a space) and otherwise kept, and a '#'
+// that starts a word starting a comment. A blank or comment line has no
+// keyword.
 func configWords(line string) (keyword string, args []string) {
 	line = strings.TrimLeft(line, " \t\r")
 	if line == "" || line[0] == '#' {
@@ -118,17 +128,23 @@ func configWords(line string) (keyword string, args []string) {
 			return keyword, args
 		}
 		var arg strings.Builder
-		quoted := false
+		var quote byte
+	word:
 		for ; rest != ""; rest = rest[1:] {
 			c := rest[0]
-			if c == '"' {
-				quoted = !quoted
-				continue
+			switch {
+			case c == '\\' && len(rest) > 1 && (strings.IndexByte(`'"\`, rest[1]) >= 0 || quote == 0 && rest[1] == ' '):
+				rest = rest[1:]
+				arg.WriteByte(rest[0])
+			case quote == 0 && (c == ' ' || c == '\t' || c == '\r'):
+				break word
+			case quote == 0 && (c == '"' || c == '\''):
+				quote = c
+			case quote != 0 && c == quote:
+				quote = 0
+			default:
+				arg.WriteByte(c)
 			}
-			if !quoted && (c == ' ' || c == '\t' || c == '\r') {
-				break
-			}
-			arg.WriteByte(c)
 		}
 		args = append(args, arg.String())
 	}
@@ -136,11 +152,11 @@ func configWords(line string) (keyword string, args []string) {
 
 // matchHost reports whether a Host line with patterns matches the
 // lowercased name as ssh decides it: some pattern without '!' matches and
-// no pattern with '!' does. Patterns are compared lowercased.
+// no pattern with '!' does. Patterns are compared as written, so
+// Host DEVBOX matches no name ssh is asked for.
 func matchHost(name string, patterns []string) bool {
 	matched := false
 	for _, p := range patterns {
-		p = strings.ToLower(p)
 		if negated, ok := strings.CutPrefix(p, "!"); ok {
 			if matchWildcard(negated, name) {
 				return false

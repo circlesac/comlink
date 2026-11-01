@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -917,10 +918,14 @@ func TestSessionUpDefaultName(t *testing.T) {
 // does). A derived name with such a line is skipped for devbox-2 and the
 // name line says why; an explicit name gets one warning line naming the Host
 // line and comes up. When the next suffix matches too (a pattern such as
-// Host dev*) Up fails with one line asking for --name and writes nothing. A
-// name that no specific Host line matches comes up without a word: Host *
-// with options ssh would percent-expand for the name, a negated name, a
-// Match block (not evaluated), a missing, looping or ~user Include, and
+// Host dev*) Up fails with one line asking for --name and writes nothing.
+// Words are split as ssh's argv_split does, the lowercased name is matched
+// against patterns as written, and an Include is followed only where it
+// applies to the name (top level, a Host line that matches it, a Match
+// block). A name that no specific Host line matches comes up without a
+// word: Host * with options ssh would percent-expand for the name, a
+// negated name, an upper-case pattern, a Match block (not evaluated), a
+// missing, looping or ~user Include or one under another Host line, and
 // comlink's own stale session file. %d in a config, file or location is
 // the test directory; files are relative to ~/.ssh unless absolute.
 func TestSessionUpExistingSSHHost(t *testing.T) {
@@ -937,14 +942,20 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 	}{
 		{"a Host line", "Host other\n  User x\n\nHost devbox\n  User someone\n", nil, skip, "%d/home/.ssh/config:5"},
 		{"one of several patterns", "Host other devbox\n", nil, skip, "%d/home/.ssh/config:2"},
-		{"upper case and =", "HOST=DEVBOX\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"an upper-case keyword and =", "HOST=devbox\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"an upper-case pattern", "Host DEVBOX\n", nil, none, ""},
 		{"a ? wildcard", "Host dev?ox\n", nil, skip, "%d/home/.ssh/config:2"},
 		{"a quoted pattern and a comment", "  Host \"other\" \"devbox\" # mine\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"a single-quoted pattern", "Host 'devbox'\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"quotes and escapes that keep words together", "Host 'other devbox' other\\ devbox dev\\box \"devbox\\\" x\"\n", nil, none, ""},
 		{"an absolute Include", "Include %d/extra.conf\n", map[string]string{"%d/extra.conf": "Host devbox\n"}, skip, "%d/extra.conf:1"},
 		{"a relative Include", "Include extra.conf\n", map[string]string{"extra.conf": "# extra\nHost devbox\n"}, skip, "%d/home/.ssh/extra.conf:2"},
-		{"a glob Include under a block", "Host other\n  Include conf.d/*.conf\n", map[string]string{"conf.d/a.conf": "Host x\n", "conf.d/b.conf": "Host devbox\n"}, skip, "%d/home/.ssh/conf.d/b.conf:1"},
+		{"a glob Include under a Match block", "Match all\n  Include conf.d/*.conf\n", map[string]string{"conf.d/a.conf": "Host x\n", "conf.d/b.conf": "Host devbox\n"}, skip, "%d/home/.ssh/conf.d/b.conf:1"},
 		{"a ~ Include", "Include = \"~/.ssh/conf.d/devbox.conf\"\n", map[string]string{"conf.d/devbox.conf": "Host devbox\n"}, skip, "%d/home/.ssh/conf.d/devbox.conf:1"},
 		{"an Include loop", "Include config\nHost devbox\n", nil, skip, "%d/home/.ssh/config:3"},
+		{"an Include under Host *", "Host *\n  Include extra.conf\n", map[string]string{"extra.conf": "Host devbox\n"}, skip, "%d/home/.ssh/extra.conf:1"},
+		{"an Include under the name's Host line", "Host devbox\n  Include extra.conf\n", map[string]string{"extra.conf": "Host devbox*\n"}, skip, "%d/home/.ssh/config:2"},
+		{"an Include under another Host line", "Host work-*\n  Include extra.conf\n", map[string]string{"extra.conf": "Host devbox*\n"}, none, ""},
 		{"a Host pattern", "Host dev*\n  Port 2222\n", nil, refuse, "%d/home/.ssh/config:2"},
 		{"an Included Host pattern", "Include extra.conf\n", map[string]string{"extra.conf": "Host devbox*\n"}, refuse, "%d/home/.ssh/extra.conf:1"},
 		{"Host * only", "Host *\n  User someone\n", nil, none, ""},
@@ -1061,6 +1072,97 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 		if stderr.Len() != 0 || !strings.HasPrefix(stdout.String(), tc.name+" is up (pid ") {
 			t.Fatalf("Up(%q) printed %q and %q", tc.server, stdout.String(), stderr.String())
 		}
+	}
+}
+
+// TestSessionUpComlinkHostPattern: a Host pattern for names that start
+// with comlink, the base of a server without a usable host label, is the
+// user's configuration like any other, however comlink tells patterns that
+// match every host apart. Under Host comlink* both comlink and comlink-2
+// are configured, so Up refuses; under Host comlink-* comlink is free,
+// and with comlink up the next two candidates are configured, so Up
+// refuses after skipping comlink; an explicit comlink-x is warned about.
+func TestSessionUpComlinkHostPattern(t *testing.T) {
+	for _, tc := range []struct {
+		desc, pattern, up, err string
+	}{
+		{"Host comlink*", "comlink*", "", `"comlink" and "comlink-2" both have ssh configuration, so a pattern in it likely matches every comlink-N; pass --name NAME`},
+		{"Host comlink-*", "comlink-*", "", ""},
+		{"Host comlink-* with comlink up", "comlink-*", "comlink", `"comlink-2" and "comlink-3" both have ssh configuration, so a pattern in it likely matches every comlink-N; pass --name NAME`},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			dir := t.TempDir()
+			store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+			config := filepath.Join(dir, "home", ".ssh", "config")
+			if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(config, []byte("Include "+filepath.Join(store.SSHDir(), "*.conf")+"\nHost "+tc.pattern+"\n  User someone\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.up != "" {
+				sess, err := store.Start(tc.up, "ws://127.0.0.1:8787", testToken, "x")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = sess.Close() }()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var stdout, stderr bytes.Buffer
+			err := store.Up(ctx, "", "ws://127.0.0.1:8787", testToken, "/opt/comlink", config, &stdout, &stderr)
+			if tc.err != "" {
+				if err == nil || err.Error() != tc.err || stdout.Len() != 0 || stderr.Len() != 0 {
+					t.Fatalf("Up = %v, printed %q and %q; want %q", err, stdout.String(), stderr.String(), tc.err)
+				}
+				for _, name := range []string{"comlink-2", "comlink-3"} {
+					record, token, _, conf := sessionFiles(store.Dir, name)
+					absent(t, record, token, conf)
+				}
+				return
+			}
+			want := "comlink is up (pid " + strconv.Itoa(os.Getpid()) + ")\n  name:       comlink (the server host 127.0.0.1 is an IP address; --name sets another)\n"
+			if err != nil || !strings.HasPrefix(stdout.String(), want) || stderr.Len() != 0 {
+				t.Fatalf("Up = %v, printed:\n%s\n%q\nwant prefix:\n%s", err, stdout.String(), stderr.String(), want)
+			}
+
+			stdout.Reset()
+			if err := store.Up(ctx, "comlink-x", "ws://127.0.0.1:8787", testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
+				t.Fatalf("Up --name comlink-x: %v", err)
+			}
+			if want := `comlink: warning: "comlink-x" already has ssh configuration (the Host line at ` + config + `:2 matches it); this session's Host block takes precedence while it runs` + "\n"; stderr.String() != want {
+				t.Fatalf("Up --name comlink-x printed %q, want %q", stderr.String(), want)
+			}
+		})
+	}
+}
+
+// TestSessionUpConfiguredNameThatIsUp: an explicit name that the user's ssh
+// configuration applies to and that is already up is refused with the
+// already-up error alone; the warning that the session's Host block takes
+// precedence is not printed, because no session comes up.
+func TestSessionUpConfiguredNameThatIsUp(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	config := filepath.Join(dir, "home", ".ssh", "config")
+	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("Include "+filepath.Join(store.SSHDir(), "*.conf")+"\nHost devbox\n  User someone\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := store.Start("devbox", "wss://devbox.example.com", testToken, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+	var stdout, stderr bytes.Buffer
+	err = store.Up(context.Background(), "devbox", "wss://devbox.example.com", testToken, "/opt/comlink", config, &stdout, &stderr)
+	if want := fmt.Sprintf("session %q is already up (pid %d)", "devbox", os.Getpid()); err == nil || err.Error() != want {
+		t.Fatalf("Up --name devbox = %v, want %q", err, want)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("refused Up printed %q and %q", stdout.String(), stderr.String())
 	}
 }
 
