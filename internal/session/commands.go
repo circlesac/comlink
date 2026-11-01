@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
+	"net/url"
 	"strings"
 
 	"github.com/circlesac/comlink/internal/sshd"
@@ -24,23 +26,17 @@ type Flags struct {
 }
 
 // Check rejects the combinations `comlink codex` refuses. Without Stdio,
-// Name and Server are both required and ReportVersion is refused; with
-// it, exactly one of Name and Server is required, and TokenFile goes only
-// with Server, because a session's token comes from the session.
+// Server is required, Name is optional (Up derives it from Server) and
+// ReportVersion is refused; with it, exactly one of Name and Server is
+// required, and TokenFile goes only with Server, because a session's token
+// comes from the session.
 func (f Flags) Check() error {
 	if !f.Stdio {
 		if f.ReportVersion != "" {
 			return errors.New("--report-version goes with --stdio")
 		}
-		var missing []string
-		if f.Name == "" {
-			missing = append(missing, "--name=NAME")
-		}
 		if f.Server == "" {
-			missing = append(missing, "--server=URL")
-		}
-		if len(missing) > 0 {
-			return fmt.Errorf("missing flags: %s", strings.Join(missing, ", "))
+			return errors.New("missing flags: --server=URL")
 		}
 		return nil
 	}
@@ -83,8 +79,9 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 	return store.Resolve(f.Name)
 }
 
-// Up is `comlink codex --name NAME --server URL`. Once name and server are
-// valid it makes sure the ssh config at sshConfig includes the session
+// Up is `comlink codex --server URL [--name NAME]`. An empty name is
+// derived from server as defaultName does, and the ready lines say so.
+// Once name and server are valid it makes sure the ssh config at sshConfig includes the session
 // config files (adding the line as include does and saying so on stderr;
 // the line stays after the session), then registers name with server and
 // token, writes the ssh config block whose ProxyCommand runs
@@ -93,11 +90,18 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 // returns nil. When the Include line cannot be added no session file is
 // written.
 func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig string, stdout, stderr io.Writer) error {
-	block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
-	if err != nil {
+	if _, err := upstream.Endpoint(server, "codex"); err != nil {
 		return err
 	}
-	if _, err := upstream.Endpoint(server, "codex"); err != nil {
+	derived := name == ""
+	if derived {
+		var err error
+		if name, err = defaultName(server); err != nil {
+			return err
+		}
+	}
+	block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
+	if err != nil {
 		return err
 	}
 	if err := s.addInclude(sshConfig, stderr); err != nil {
@@ -111,11 +115,43 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 		_, _ = fmt.Fprintf(stderr, "comlink: removed stale session %q (pid %d is gone)\n", sess.Replaced.Name, sess.Replaced.PID)
 	}
 	_, _ = fmt.Fprintf(stdout, "%s is up (pid %d)\n", sess.Name, sess.PID)
+	if derived {
+		_, _ = fmt.Fprintf(stdout, "  name:       %s, the first label of the server's host (--name sets another)\n", sess.Name)
+	}
 	_, _ = fmt.Fprintf(stdout, "  server:     %s\n", sess.Server)
 	_, _ = fmt.Fprintf(stdout, "  Codex app:  SSH connection %q (ssh %s)\n", sess.Name, sess.Name)
 	_, _ = fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
 	<-ctx.Done()
 	return sess.Close()
+}
+
+// defaultName is the session name for a valid server URL when --name is
+// not given: the first DNS label of its host, lowercased. The Include line
+// sits at the top of ~/.ssh/config, so the alias applies to every ssh the
+// user runs; an IP address or localhost as the alias would capture the
+// user's own ssh to it. For those, and for a label that is not a valid
+// alias, there is no default and the error asks for --name.
+func defaultName(server string) (string, error) {
+	u, err := url.Parse(server)
+	if err != nil {
+		return "", fmt.Errorf("server URL: %w", err)
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	label, _, _ := strings.Cut(host, ".")
+	var why string
+	switch _, addrErr := netip.ParseAddr(host); {
+	case addrErr == nil:
+		why = "it is an IP address"
+	case host == "localhost" || strings.HasSuffix(host, ".localhost"):
+		why = "it is localhost"
+	case label == "localhost":
+		why = `its first label "localhost" would capture your own ssh to localhost`
+	case !ValidName(label):
+		why = fmt.Sprintf("its first label %q is not a valid alias", label)
+	default:
+		return label, nil
+	}
+	return "", fmt.Errorf("cannot name the session after server host %q: %s; pass --name NAME", host, why)
 }
 
 // Resolve returns the Codex endpoint and the token of the session called

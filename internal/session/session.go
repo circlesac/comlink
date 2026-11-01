@@ -1,5 +1,6 @@
 // Package session is the registry of the Codex app's named sessions.
-// `comlink codex --name NAME` registers NAME for as long as it runs;
+// `comlink codex --server URL [--name NAME]` registers NAME (by default the
+// first label of the server's host) for as long as it runs;
 // `comlink codex --stdio --name NAME`, which ssh runs for the alias, looks NAME
 // up to find the server, and `comlink codex list` shows what is up.
 // Everything lives under the state directory ($XDG_STATE_HOME/comlink,

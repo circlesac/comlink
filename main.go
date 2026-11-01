@@ -1,6 +1,7 @@
 // Command comlink is a front door for coding-agent clients. For the Codex
-// desktop app, `comlink codex --name NAME --server URL` registers NAME as an
-// ssh alias for as long as it runs, and ssh runs `comlink codex --stdio` as
+// desktop app, `comlink codex --server URL [--name NAME]` registers NAME
+// (by default the first label of the server's host) as an ssh alias for as
+// long as it runs, and ssh runs `comlink codex --stdio` as
 // that alias's ProxyCommand: it speaks the server side of SSH on its own
 // stdin/stdout, answers the few shell commands the app sends and relays the
 // agent session to the server's WebSocket. ACP clients, which launch their
@@ -30,20 +31,20 @@ import (
 
 type cli struct {
 	Version kong.VersionFlag `help:"Print the comlink version and exit."`
-	Codex   codexCmd         `cmd:"" name:"codex" help:"Codex desktop app: 'comlink codex --name NAME --server URL' makes <server>/codex the SSH host NAME until stopped, adding the Include line for it to ~/.ssh/config if missing; list prints those sessions."`
+	Codex   codexCmd         `cmd:"" name:"codex" help:"Codex desktop app: 'comlink codex --server URL [--name NAME]' makes <server>/codex the SSH host NAME (default: the first label of the server's host) until stopped, adding the Include line for it to ~/.ssh/config if missing; list prints those sessions."`
 	ACP     acpCmd           `cmd:"" name:"acp" help:"Bridge an ACP client's stdin/stdout (newline-delimited JSON-RPC) to <server>/acp; the client runs this as its agent command."`
 }
 
 // codexCmd runs on its own (kong runs a command that has a Run method even
 // when it has subcommands) and owns its flags, so `comlink codex --help`
 // lists them. Which flags go together is checked by session.Flags.Check:
-// kong cannot say that --name and --server are both required without
-// --stdio and exactly one of them with it, and tagging them required would
-// make usage claim otherwise. kong also accepts these flags after list,
+// kong cannot say that --server is required without --stdio (--name
+// optional) but exactly one of --name and --server is required with it, and
+// tagging either required would make usage claim otherwise. kong also accepts these flags after list,
 // which therefore refuses them.
 type codexCmd struct {
 	Stdio         bool   `group:"codex" help:"Serve one SSH connection on stdin/stdout, reaching the session --name or the server --server. ssh runs this via a Host block's ProxyCommand; you normally never run it yourself."`
-	Name          string `group:"codex" placeholder:"NAME" help:"Session name: the SSH alias the Codex app connects to. With --stdio, the running session to reach."`
+	Name          string `group:"codex" placeholder:"NAME" help:"Session name: the SSH alias the Codex app connects to. Defaults to the first label of the server's host (wss://padawan.example.com gives padawan); needed for an IP address or localhost, and to run several sessions on one server. With --stdio, the running session to reach."`
 	Server        string `group:"codex" placeholder:"URL" help:"comlink server base URL (ws:// or wss://); the Codex app reaches <server>/codex."`
 	TokenFile     string `group:"codex" type:"path" placeholder:"PATH" help:"File whose trimmed contents are the server's bearer token. Falls back to $COMLINK_TOKEN. Not with --stdio --name: a session's token comes from the session."`
 	ReportVersion string `group:"codex" placeholder:"VERSION" help:"With --stdio: Codex version reported to 'codex --version' (default 0.165.0)."`

@@ -116,12 +116,17 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// startUp runs `comlink codex --name name --server server` with env plus
-// args and returns once it has printed that the name is up. The token comes
-// from $COMLINK_TOKEN unless args carry --token-file.
+// startUp runs `comlink codex --name name --server server` (without --name
+// when name is empty) with env plus args and returns once it has printed
+// that the name is up. The token comes from $COMLINK_TOKEN unless args carry
+// --token-file.
 func startUp(t *testing.T, bin string, env []string, name, server string, args ...string) *upProcess {
 	t.Helper()
-	cmd := exec.Command(bin, append([]string{"codex", "--name", name, "--server", server}, args...)...)
+	argv := []string{"codex", "--server", server}
+	if name != "" {
+		argv = append(argv, "--name", name)
+	}
+	cmd := exec.Command(bin, append(argv, args...)...)
 	cmd.Env = append(append([]string(nil), env...), "COMLINK_TOKEN="+testToken)
 	up := &upProcess{cmd: cmd, stdout: make(chan string, 64)}
 	cmd.Stderr = &up.stderr
@@ -742,6 +747,52 @@ func TestUpSeveralNames(t *testing.T) {
 	}
 }
 
+// TestUpDefaultName: without --name the session is named after the first
+// label of the server's host, lowercased, and says so; a second session on
+// the same server without --name collides with the first, and one with its
+// own --name runs beside it.
+func TestUpDefaultName(t *testing.T) {
+	bin := buildComlink(t)
+	env, _, state := sessionEnv(t)
+	server := "wss://Padawan.Example.com:8443/tenant/x"
+
+	up := startUp(t, bin, env, "", server)
+	pid := strconv.Itoa(up.cmd.Process.Pid)
+	want := "padawan is up (pid " + pid + ")\n" +
+		"  name:       padawan, the first label of the server's host (--name sets another)\n" +
+		"  server:     " + server + "\n" +
+		"  Codex app:  SSH connection \"padawan\" (ssh padawan)\n" +
+		"Press Ctrl-C to stop.\n"
+	if up.ready != want {
+		t.Fatalf("stdout:\n%s\nwant:\n%s", up.ready, want)
+	}
+	record, _, _, conf := sessionFiles(state, "padawan")
+	if got := readRecord(t, record); got.Name != "padawan" || got.Codex != server+"/codex" {
+		t.Fatalf("record %+v", got)
+	}
+	if b, err := os.ReadFile(conf); err != nil || !strings.HasPrefix(string(b), "Host padawan\n") || !strings.Contains(string(b), " codex --stdio --name padawan\n") {
+		t.Fatalf("ssh config %q (%v)", b, err)
+	}
+
+	stdout, stderr, code := runBinary(t, bin, env, "", "codex", "--server", server)
+	if code == 0 || stdout != "" || stderr != "comlink: error: session \"padawan\" is already up (pid "+pid+")\n" {
+		t.Fatalf("second session without --name: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	other := startUp(t, bin, env, "padawan-2", server)
+	if !strings.HasPrefix(other.ready, "padawan-2 is up (pid ") || strings.Contains(other.ready, "name:") {
+		t.Fatalf("session with --name:\n%s", other.ready)
+	}
+	stdout, _, code = runBinary(t, bin, env, "", "codex", "list")
+	if code != 0 || !strings.HasPrefix(stdout, "padawan\tup\t") || !strings.Contains(stdout, "\npadawan-2\tup\t") {
+		t.Fatalf("list: exit %d, stdout %q", code, stdout)
+	}
+	other.stop(t, syscall.SIGTERM)
+	up.stop(t, os.Interrupt)
+	if run, ssh := sessionDirs(t, state); len(run) != 0 || len(ssh) != 0 {
+		t.Fatalf("run holds %v and ssh holds %v after both sessions stopped", run, ssh)
+	}
+}
+
 // TestCodexHelp: `comlink codex --help` lists the flags of the session and
 // of --stdio and its subcommands, and its usage line and the top-level
 // command list say that a subcommand is optional.
@@ -772,7 +823,8 @@ func TestCodexHelp(t *testing.T) {
 }
 
 // TestUpRejectsBadArguments: a session refuses an invalid name or server
-// before writing anything and needs both --name and --server;
+// before writing anything and needs --server, and without --name a server
+// host that gives no default name (an IP address, localhost);
 // --report-version needs --stdio; `codex --stdio` takes exactly one of
 // --name and --server, and --token-file only with --server; list refuses
 // the flags of `codex` itself; `acp` takes --server and nothing that names a
@@ -789,8 +841,12 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		{[]string{"codex", "--name", "agent", "--server", "https://agent.example.com"}, `comlink: error: server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
 		{[]string{"codex", "--name", "agent", "--server", "wss://agent.example.com", "--token-file", filepath.Join(state, "absent")}, "comlink: error: read token file: "},
 		{[]string{"codex", "--name", "agent"}, "comlink: error: missing flags: --server=URL"},
-		{[]string{"codex"}, "comlink: error: missing flags: --name=NAME, --server=URL"},
-		{[]string{"codex", "--server", "wss://agent.example.com", "--token-file", "/dev/null"}, "comlink: error: missing flags: --name=NAME"},
+		{[]string{"codex"}, "comlink: error: missing flags: --server=URL"},
+		{[]string{"codex", "--token-file", "/dev/null"}, "comlink: error: missing flags: --server=URL"},
+		{[]string{"codex", "--server", "ws://127.0.0.1:8787"}, `comlink: error: cannot name the session after server host "127.0.0.1": it is an IP address; pass --name NAME`},
+		{[]string{"codex", "--server", "wss://[::1]:8443/x"}, `comlink: error: cannot name the session after server host "::1": it is an IP address; pass --name NAME`},
+		{[]string{"codex", "--server", "ws://localhost:8787"}, `comlink: error: cannot name the session after server host "localhost": it is localhost; pass --name NAME`},
+		{[]string{"codex", "--server", "ws://x.localhost:8787", "--token-file", "/dev/null"}, `comlink: error: cannot name the session after server host "x.localhost": it is localhost; pass --name NAME`},
 		{[]string{"codex", "--name", "a", "--server", "ws://127.0.0.1:1", "--report-version", "0.200.1"}, "comlink: error: --report-version goes with --stdio"},
 		{[]string{"codex", "--stdio"}, "comlink: error: --stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
 		{[]string{"codex", "--stdio", "--token-file", "/dev/null"}, "comlink: error: --stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},

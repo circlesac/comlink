@@ -9,8 +9,8 @@ Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
 SSH on its own stdin/stdout, answers the few shell commands the client sends and relays
 the agent session to a WebSocket endpoint. There is no sshd, no shell and no
 listening port. The Codex app finds hosts through `~/.ssh/config`, so
-`comlink codex --name NAME --server URL` registers NAME as such a host for
-as long as it runs (see [Codex app](#codex-app)). ACP clients launch their
+`comlink codex --server URL` registers a host named after the server (or
+`--name NAME`) for as long as it runs (see [Codex app](#codex-app)). ACP clients launch their
 agent as a local subprocess when they need it, so they need no
 registration: their agent command is `comlink acp --server URL`, which
 bridges stdio to the remote agent's WebSocket and ends with the client (see
@@ -33,20 +33,20 @@ bridges stdio to the remote agent's WebSocket and ends with the client (see
 ## Commands
 
 ```
-comlink codex --name NAME --server URL [--token-file PATH]
+comlink codex --server URL [--name NAME] [--token-file PATH]
 comlink codex --stdio (--name NAME | --server URL [--token-file PATH]) [--report-version V]
 comlink codex list
 comlink acp --server URL [--token-file PATH]
 ```
 
-Commands are grouped by client. `comlink codex --name NAME --server URL`
+Commands are grouped by client. `comlink codex --server URL [--name NAME]`
 registers a Codex session and holds it in the foreground. `comlink codex
 --stdio` serves one SSH connection on stdin/stdout; ssh runs it as the
 session's `ProxyCommand` and you normally never run it yourself (see
 [How the Codex app connects](#how-the-codex-app-connects)). Both are
 `comlink codex` itself, with no subcommand; which flags go together is
-checked when it runs: without `--stdio`, `--name` and `--server` are both
-required and `--report-version` is refused; with it, exactly one of
+checked when it runs: without `--stdio`, `--server` is required, `--name`
+is optional and `--report-version` is refused; with it, exactly one of
 `--name` and `--server`, and `--token-file` only with `--server`.
 `comlink codex list` prints the names that are up and does not take the
 flags of `comlink codex`. There is no setup command: a session adds the one
@@ -100,18 +100,39 @@ needs a named, registered session. Start one and leave it running:
 ```sh
 mkdir -p ~/.config/comlink
 (umask 077; printf '%s' "$TOKEN" > ~/.config/comlink/token)
-comlink codex --name example-agent --server wss://agent.example.com \
+comlink codex --server wss://example-agent.example.com \
   --token-file ~/.config/comlink/token
 ```
 
-It prints what is available and stays in the foreground:
+The session is named after the first label of the server's host,
+lowercased: `wss://example-agent.example.com` gives `example-agent`, and
+`ws://Worker:8787` gives `worker`. That name is the SSH alias the Codex app
+shows. It prints what is available and stays in the foreground:
 
 ```
 example-agent is up (pid 4242)
-  server:     wss://agent.example.com
+  name:       example-agent, the first label of the server's host (--name sets another)
+  server:     wss://example-agent.example.com
   Codex app:  SSH connection "example-agent" (ssh example-agent)
 Press Ctrl-C to stop.
 ```
+
+Pass `--name NAME` for a different alias, or to run several sessions on
+one server: a second session on the same server without `--name` gets the
+same name and is refused as already up.
+
+```sh
+comlink codex --server wss://example-agent.example.com --name agent-review \
+  --token-file ~/.config/comlink/token
+```
+
+`--name` is required when the server's host is an IP address
+(`ws://127.0.0.1:8787`, `ws://[::1]:8787`) or `localhost` (or
+`*.localhost`), or when its first label is `localhost` or is not a valid
+alias. The Include line below sits at the top of `~/.ssh/config`, so an
+alias such as `localhost` or an address would capture your own `ssh` to
+that host. Such a session exits non-zero with one line ending
+`; pass --name NAME` and writes nothing.
 
 Before it registers anything, the session makes sure `~/.ssh/config` has
 `Include /home/alice/.local/state/comlink/ssh/*.conf` (the absolute path of
@@ -152,7 +173,7 @@ Host example-agent
 
 Ctrl-C (SIGINT) or SIGTERM ends it with exit 0 and removes everything it
 registered (the Include line in `~/.ssh/config` stays). Several names can
-be up at once, each with its own server. A name is a run of letters,
+be up at once, each with its own server or sharing one. A name is a run of letters,
 digits, `-`, `_` and `.`; it is the ssh alias and part of the file names,
 so anything else is refused. The token comes from `--token-file`, else
 `$COMLINK_TOKEN`, else the server is dialled without an `Authorization`
@@ -337,6 +358,11 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   missing or unreadable), a failed write undone, stale records (lock not
   held) removed by `List` and replaced by `Start` while `Load` reports them
   as not up, `Up` driven to its ready line and ended through its context,
+  `Up` without a name deriving it from the server's host (lowercased, with
+  a port, a path or a trailing dot) and printing the `name:` line, an
+  explicit name used as is, and no default (one `--name` error, nothing
+  written) for an IPv4 or IPv6 address, `localhost`, `*.localhost`,
+  `localhost.<domain>` or a label that is not a valid alias,
   `Resolve`, `PrintList`, the flag combinations of `comlink codex`
   (`Flags.Check`, `Flags.CheckUnset`) and the endpoint `--stdio` relays to
   (`Flags.Endpoint`, with `--server` without a state directory and with
@@ -367,10 +393,14 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   through real OpenSSH with a config that Includes the session directory, answering
   the version probe and relaying the app-server session to `<server>/codex`
   with the session's token, then failing with the not-up line once the
-  session has stopped; three names up at once, with and without a path
+  session has stopped; a session without `--name` named after its
+  server's host (uppercase, with a port and a path) and saying so, a second
+  one on the same server without `--name` refused as already up and one
+  with its own `--name` beside it; three names up at once, with and without a path
   prefix or trailing slash, each reaching its own server through OpenSSH;
   and the refused arguments (bad name or server, a session without
-  `--name` or `--server`, `--report-version` without `--stdio`, both or
+  `--server`, a session without `--name` on an IPv4, IPv6, `localhost` or
+  `*.localhost` server, `--report-version` without `--stdio`, both or
   neither of `--name` and `--server` with `--stdio`, `--token-file` with
   `--stdio --name`, the flags of `codex` given to `list`, and the removed
   `proxy`, `up` and `ssh-include` subcommands of `codex`, top-level `up`,

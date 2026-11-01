@@ -820,6 +820,78 @@ func TestSessionUp(t *testing.T) {
 	}
 }
 
+// TestSessionUpDefaultName: without a name Up names the session after the
+// first label of the server's host, lowercased, says so on stdout and uses
+// it for the record and the alias. For an IP address, localhost (or
+// *.localhost) or a label that is not a valid alias there is no default: Up
+// fails with one line asking for --name and writes nothing, not even the
+// Include line.
+func TestSessionUpDefaultName(t *testing.T) {
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	sshConfig := filepath.Join(dir, "home", ".ssh", "config")
+	for _, tc := range []struct{ server, name string }{
+		{"wss://padawan.example.com/x", "padawan"},
+		{"wss://padawan-app.foo.workers.dev", "padawan-app"},
+		{"ws://Worker:8787", "worker"},
+		{"wss://PADAWAN.Example.COM:8443/tenant/x/", "padawan"},
+		{"wss://padawan./", "padawan"},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var stdout bytes.Buffer
+		if err := store.Up(ctx, "", tc.server, testToken, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
+			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
+		}
+		want := tc.name + " is up (pid " + strconv.Itoa(os.Getpid()) + ")\n" +
+			"  name:       " + tc.name + ", the first label of the server's host (--name sets another)\n" +
+			"  server:     " + tc.server + "\n" +
+			"  Codex app:  SSH connection \"" + tc.name + "\" (ssh " + tc.name + ")\n" +
+			"Press Ctrl-C to stop.\n"
+		if stdout.String() != want {
+			t.Errorf("Up(%q) stdout:\n%s\nwant:\n%s", tc.server, stdout.String(), want)
+		}
+	}
+
+	// An explicit name is used as is and gets no name line.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout bytes.Buffer
+	if err := store.Up(ctx, "Agent-X", "wss://padawan.example.com", testToken, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stdout.String(), "Agent-X is up (pid ") || strings.Contains(stdout.String(), "name:") {
+		t.Fatalf("Up with --name stdout:\n%s", stdout.String())
+	}
+
+	untouched := t.TempDir()
+	refusedStore := &session.Store{Dir: filepath.Join(untouched, "comlink")}
+	untouchedConfig := filepath.Join(untouched, "home", ".ssh", "config")
+	for _, tc := range []struct{ server, want string }{
+		{"ws://127.0.0.1:8787", `cannot name the session after server host "127.0.0.1": it is an IP address; pass --name NAME`},
+		{"wss://[::1]:8443/x", `cannot name the session after server host "::1": it is an IP address; pass --name NAME`},
+		{"ws://[fe80::1%25en0]:8787", `cannot name the session after server host "fe80::1%en0": it is an IP address; pass --name NAME`},
+		{"ws://localhost:8787", `cannot name the session after server host "localhost": it is localhost; pass --name NAME`},
+		{"ws://LocalHost.", `cannot name the session after server host "localhost": it is localhost; pass --name NAME`},
+		{"ws://x.localhost:8787", `cannot name the session after server host "x.localhost": it is localhost; pass --name NAME`},
+		{"wss://localhost.example.com", `cannot name the session after server host "localhost.example.com": its first label "localhost" would capture your own ssh to localhost; pass --name NAME`},
+		{"wss://.example.com", `cannot name the session after server host ".example.com": its first label "" is not a valid alias; pass --name NAME`},
+		{"wss://a~b.example.com", `cannot name the session after server host "a~b.example.com": its first label "a~b" is not a valid alias; pass --name NAME`},
+	} {
+		err := refusedStore.Up(context.Background(), "", tc.server, testToken, "/opt/comlink", untouchedConfig, io.Discard, io.Discard)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("Up(%q) without a name = %v, want %q", tc.server, err, tc.want)
+		}
+	}
+	// A bad server is still reported as one.
+	if err := refusedStore.Up(context.Background(), "", "https://padawan.example.com", "", "/opt/comlink", untouchedConfig, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
+		t.Fatalf("Up with a bad server and no name: %v", err)
+	}
+	if entries, err := os.ReadDir(untouched); err != nil || len(entries) != 0 {
+		t.Fatalf("%s holds %v (%v) after refused sessions", untouched, entries, err)
+	}
+}
+
 // TestSessionResolveAndPrintList: Resolve returns the session's Codex
 // endpoint with the token, and PrintList prints the live sessions, the
 // removed stale ones and the empty case.
@@ -899,9 +971,11 @@ func TestSessionFlagsCheck(t *testing.T) {
 	}{
 		{session.Flags{Name: "a", Server: "wss://h"}, ""},
 		{session.Flags{Name: "a", Server: "wss://h", TokenFile: "/t"}, ""},
-		{session.Flags{}, "missing flags: --name=NAME, --server=URL"},
+		{session.Flags{}, "missing flags: --server=URL"},
 		{session.Flags{Name: "a"}, "missing flags: --server=URL"},
-		{session.Flags{Server: "wss://h", TokenFile: "/t"}, "missing flags: --name=NAME"},
+		{session.Flags{TokenFile: "/t"}, "missing flags: --server=URL"},
+		{session.Flags{Server: "wss://h"}, ""},
+		{session.Flags{Server: "wss://h", TokenFile: "/t"}, ""},
 		{session.Flags{Name: "a", Server: "wss://h", ReportVersion: "1"}, "--report-version goes with --stdio"},
 		{session.Flags{Stdio: true, Name: "a"}, ""},
 		{session.Flags{Stdio: true, Name: "a", ReportVersion: "1"}, ""},
