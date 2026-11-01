@@ -27,9 +27,10 @@ const everyHost = "////////////////"
 // are only read, never run through ssh: ssh -G percent-expands options such
 // as ControlPath %h, runs Match exec commands and may look names up in DNS.
 // Match blocks are not evaluated, and a short name that reaches a host only
-// through DNS search domains has no configuration either.
+// through DNS search domains has no configuration either. ssh matches Host
+// patterns against the host exactly as typed (it lowercases only the
+// HostName it then connects to), so name is matched as is.
 func (s *Store) sshConfigured(sshConfig, name string) string {
-	name = strings.ToLower(name) // ssh lowercases the host it is asked for
 	var hosts []hostLine
 	s.scanConfig(sshConfig, filepath.Dir(sshConfig), name, nil, &hosts)
 	for _, h := range hosts {
@@ -83,16 +84,28 @@ func (s *Store) scanConfig(file, sshDir, name string, stack []string, hosts *[]h
 	}
 }
 
+// includePath is the glob an Include argument stands for, as ssh resolves
+// it in a user's config: ~ is the home directory (the one holding sshDir,
+// ~/.ssh) and a relative path is relative to sshDir. ok is false for
+// ~user, another user's home.
+func includePath(arg, sshDir string) (path string, ok bool) {
+	switch {
+	case arg == "~" || strings.HasPrefix(arg, "~/"):
+		return filepath.Join(filepath.Dir(sshDir), arg[1:]), true
+	case strings.HasPrefix(arg, "~"):
+		return "", false
+	case !filepath.IsAbs(arg):
+		return filepath.Join(sshDir, arg), true
+	}
+	return filepath.Clean(arg), true
+}
+
 // includeFiles is what an Include argument names: the files its glob
 // matches, without the session config files.
 func (s *Store) includeFiles(arg, sshDir string) []string {
-	switch {
-	case arg == "~" || strings.HasPrefix(arg, "~/"):
-		arg = filepath.Join(filepath.Dir(sshDir), arg[1:])
-	case strings.HasPrefix(arg, "~"):
-		return nil // ~user: another user's home, never this user's Host lines
-	case !filepath.IsAbs(arg):
-		arg = filepath.Join(sshDir, arg)
+	arg, ok := includePath(arg, sshDir)
+	if !ok {
+		return nil // never this user's Host lines
 	}
 	matches, _ := filepath.Glob(arg)
 	var files []string
@@ -150,10 +163,10 @@ func configWords(line string) (keyword string, args []string) {
 	}
 }
 
-// matchHost reports whether a Host line with patterns matches the
-// lowercased name as ssh decides it: some pattern without '!' matches and
-// no pattern with '!' does. Patterns are compared as written, so
-// Host DEVBOX matches no name ssh is asked for.
+// matchHost reports whether a Host line with patterns matches name as ssh
+// decides it: some pattern without '!' matches and no pattern with '!'
+// does. Both are compared as written, case and all, so Host DEVBOX
+// matches DEVBOX and not devbox.
 func matchHost(name string, patterns []string) bool {
 	matched := false
 	for _, p := range patterns {

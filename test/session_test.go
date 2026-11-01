@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,6 +46,30 @@ func TestServerEndpoint(t *testing.T) {
 			t.Errorf("Endpoint(%q) = %q, want an error", server, endpoint)
 		}
 	}
+	// An error never repeats the userinfo or query of the URL.
+	for server, want := range map[string]string{
+		"https://user:secret@agent.example.com/x?token=secret#secret": `server URL "https://agent.example.com/x": want ws://host[/prefix] or wss://host[/prefix]`,
+		"ws://user:secret@[::1/?token=secret":                         "server URL: missing ']' in host",
+	} {
+		if _, err := upstream.Endpoint(server, "codex"); err == nil || err.Error() != want {
+			t.Errorf("Endpoint(%q) = %v, want %q", server, err, want)
+		}
+	}
+}
+
+// TestUpstreamRedact: a URL is printed without its userinfo, query and
+// fragment, and one that does not parse not at all.
+func TestUpstreamRedact(t *testing.T) {
+	for raw, want := range map[string]string{
+		"wss://agent.example.com/base/":                       "wss://agent.example.com/base/",
+		"wss://user:secret@agent.example.com/base/?token=x#y": "wss://agent.example.com/base/",
+		"ws://secret@127.0.0.1:8787?":                         "ws://127.0.0.1:8787",
+		"ws://user:secret@[::1/":                              "<invalid upstream URL>",
+	} {
+		if got := upstream.Redact(raw); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", raw, got, want)
+		}
+	}
 }
 
 func TestSessionValidName(t *testing.T) {
@@ -55,7 +78,7 @@ func TestSessionValidName(t *testing.T) {
 			t.Errorf("ValidName(%q) = false", name)
 		}
 	}
-	for _, name := range []string{"", "two words", "agent\nHost *", "*", "agent?", "!agent", "agent/x", "../agent", "ägent"} {
+	for _, name := range []string{"", "two words", "agent\nHost *", "*", "agent?", "!agent", "agent/x", "../agent", "ägent", "-agent", "-"} {
 		if session.ValidName(name) {
 			t.Errorf("ValidName(%q) = true", name)
 		}
@@ -261,6 +284,23 @@ func TestSessionStoreUpWithoutRecord(t *testing.T) {
 			}
 		}
 	}
+
+	// Close removes the files before it releases the lock: a session that
+	// is held but has lost its token file is not up for Load either.
+	b, _ := json.Marshal(session.Record{Name: "agent-a", Server: "wss://agent.example.com", Codex: "wss://agent.example.com/codex", PID: os.Getpid()})
+	if err := os.WriteFile(record, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(token); err != nil {
+		t.Fatal(err)
+	}
+	var notUp *session.NotUpError
+	if _, _, err := store.Load("agent-a"); !errors.As(err, &notUp) || notUp.Name != "agent-a" {
+		t.Fatalf("Load of a held name without its token file: %v", err)
+	}
+	if _, _, err := store.Resolve("agent-a"); !errors.As(err, &notUp) {
+		t.Fatalf("Resolve of a held name without its token file: %v", err)
+	}
 }
 
 // TestSessionStoreRefusesBadInput: an invalid name or server URL is refused
@@ -269,10 +309,11 @@ func TestSessionStoreRefusesBadInput(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
 	for _, tc := range []struct{ name, server, want string }{
-		{"two words", "wss://agent.example.com", `invalid name "two words": use only letters, digits, '-', '_' and '.'`},
-		{"../up", "wss://agent.example.com", `invalid name "../up": use only letters, digits, '-', '_' and '.'`},
+		{"two words", "wss://agent.example.com", `invalid name "two words": use only letters, digits, '-', '_' and '.', not starting with '-'`},
+		{"../up", "wss://agent.example.com", `invalid name "../up": use only letters, digits, '-', '_' and '.', not starting with '-'`},
+		{"-agent", "wss://agent.example.com", `invalid name "-agent": use only letters, digits, '-', '_' and '.', not starting with '-'`},
 		{"agent", "https://agent.example.com", `server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
-		{"agent", "ws://[::1", `server URL: parse "ws://[::1": missing ']' in host`},
+		{"agent", "ws://[::1", "server URL: missing ']' in host"},
 	} {
 		sess, err := store.Start(tc.name, tc.server, testToken, "x")
 		if err == nil || err.Error() != tc.want {
@@ -537,6 +578,43 @@ func TestSessionUpInclude(t *testing.T) {
 			t.Errorf("Up with %q printed %q, want %q", content, got, want)
 		}
 		if b, _ := os.ReadFile(config); string(b) != line+"\n"+content {
+			t.Errorf("Up changed %q to %q", content, b)
+		}
+	}
+
+	// With the state directory under the home directory, the line spelled
+	// with ~ or relative to ~/.ssh, as ssh resolves them, is the same line.
+	homeStore := &session.Store{Dir: filepath.Join(dir, "home", ".local", "state", "comlink")}
+	for _, content := range []string{
+		"Include ~/.local/state/comlink/ssh/*.conf\n",
+		"Include \"~/.local/state/comlink/ssh/*.conf\"\nHost a\n",
+		"Include ../.local/state/comlink/ssh/*.conf\n",
+		"Include extra.conf ../.local/state/comlink/ssh/*.conf\n",
+	} {
+		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := upOnce(homeStore, config); err != nil || got != "" {
+			t.Errorf("Up with %q: printed %q, %v", content, got, err)
+		}
+		if b, _ := os.ReadFile(config); string(b) != content {
+			t.Errorf("Up changed %q to %q", content, b)
+		}
+	}
+	for _, content := range []string{
+		"Include ~/state/comlink/ssh/*.conf\n",
+		"Include .local/state/comlink/ssh/*.conf\n",
+		"Include ~nobody/.local/state/comlink/ssh/*.conf\n",
+		"Host a\nInclude ~/.local/state/comlink/ssh/*.conf\n",
+	} {
+		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		homeLine := "Include " + filepath.Join(homeStore.SSHDir(), "*.conf")
+		if got, err := upOnce(homeStore, config); err != nil || got != "comlink: added \""+homeLine+"\" to the top of "+config+"\n" {
+			t.Errorf("Up with %q: printed %q, %v", content, got, err)
+		}
+		if b, _ := os.ReadFile(config); string(b) != homeLine+"\n"+content {
 			t.Errorf("Up changed %q to %q", content, b)
 		}
 	}
@@ -1075,6 +1153,41 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 	}
 }
 
+// TestSessionUpExplicitNameCase: ssh matches Host patterns against the
+// host exactly as typed, so an explicit Agent-X is configured by
+// Host Agent-X and not by Host agent-x.
+func TestSessionUpExplicitNameCase(t *testing.T) {
+	for _, tc := range []struct{ pattern, warning string }{
+		{"Agent-X", "configured"},
+		{"Agent-*", "configured"},
+		{"agent-x", ""},
+		{"AGENT-X", ""},
+	} {
+		dir := t.TempDir()
+		store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+		config := filepath.Join(dir, "home", ".ssh", "config")
+		if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(config, []byte("Include "+filepath.Join(store.SSHDir(), "*.conf")+"\nHost "+tc.pattern+"\n  User someone\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var stdout, stderr bytes.Buffer
+		if err := store.Up(ctx, "Agent-X", "wss://agent.example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
+			t.Fatalf("Host %s: Up --name Agent-X: %v", tc.pattern, err)
+		}
+		want := ""
+		if tc.warning != "" {
+			want = `comlink: warning: "Agent-X" already has ssh configuration (the Host line at ` + config + `:2 matches it); this session's Host block takes precedence while it runs` + "\n"
+		}
+		if stderr.String() != want || !strings.HasPrefix(stdout.String(), "Agent-X is up (pid ") {
+			t.Errorf("Host %s: Up --name Agent-X printed %q and %q, want stderr %q", tc.pattern, stdout.String(), stderr.String(), want)
+		}
+	}
+}
+
 // TestSessionUpComlinkHostPattern: a Host pattern for names that start
 // with comlink, the base of a server without a usable host label, is the
 // user's configuration like any other, however comlink tells patterns that
@@ -1326,35 +1439,5 @@ func TestSessionFlagsEndpoint(t *testing.T) {
 	var notUp *session.NotUpError
 	if _, _, err := (session.Flags{Stdio: true, Name: "agent-b"}).Endpoint(logger); !errors.As(err, &notUp) {
 		t.Fatalf("Endpoint(--name) of a name that is not up = %v", err)
-	}
-}
-
-// A name that equals a value ssh prints for every host (the login in
-// `user`, a keyword such as `none` or `any`) is not ssh configuration: the
-// derived name is used as is.
-func TestSessionUpNameEqualsSSHDefault(t *testing.T) {
-	names := []string{"none", "any", "yes"}
-	if u, err := user.Current(); err == nil && session.ValidName(strings.ToLower(u.Username)) {
-		names = append(names, strings.ToLower(u.Username))
-	}
-	for _, name := range names {
-		dir := t.TempDir()
-		store := &session.Store{Dir: filepath.Join(dir, "comlink")}
-		config := filepath.Join(dir, "home", ".ssh", "config")
-		if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(config, []byte("# nothing for any host\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		var stdout, stderr bytes.Buffer
-		if err := store.Up(ctx, "", "wss://"+name+".example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
-			t.Fatalf("Up for %q: %v", name, err)
-		}
-		if want := name + " is up (pid "; !strings.HasPrefix(stdout.String(), want) {
-			t.Fatalf("Up for %q stdout:\n%s\nwant prefix %q", name, stdout.String(), want)
-		}
 	}
 }

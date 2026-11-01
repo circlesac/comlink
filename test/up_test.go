@@ -177,7 +177,8 @@ func mustEvalSymlinks(t *testing.T, path string) string {
 	return resolved
 }
 
-// stop sends sig and waits; a session must exit 0 on SIGINT and SIGTERM.
+// stop sends sig and waits; a session must exit 0 on SIGINT, SIGTERM and
+// SIGHUP.
 func (up *upProcess) stop(t *testing.T, sig os.Signal) {
 	t.Helper()
 	if err := up.cmd.Process.Signal(sig); err != nil {
@@ -236,7 +237,7 @@ func sessionDirs(t *testing.T, state string) (run, ssh []string) {
 // record, the token file and the ssh config file with private modes and
 // nothing else (no temporary files left), prints the alias and that it
 // created ~/.ssh/config with the Include line, and removes exactly its files
-// on SIGTERM with exit 0, keeping the line.
+// on SIGTERM with exit 0, keeping the line; SIGINT and SIGHUP end it alike.
 func TestUpRegistersUntilStopped(t *testing.T) {
 	bin := buildComlink(t)
 	env, home, state := sessionEnv(t)
@@ -311,6 +312,39 @@ func TestUpRegistersUntilStopped(t *testing.T) {
 	}
 	up.stop(t, os.Interrupt)
 	absent(t, filepath.Join(state, "comlink", "run", "agent-b.json"))
+
+	// So does SIGHUP, which the session gets when its terminal is closed.
+	up = startUp(t, bin, env, "agent-c", "ws://127.0.0.1:1")
+	up.stop(t, syscall.SIGHUP)
+	record, token, lock, conf = sessionFiles(state, "agent-c")
+	absent(t, record, token, lock, conf)
+}
+
+// TestUpRedactsServerURL: a server URL with userinfo, a query or a fragment
+// is printed without them by the session and by `codex list`; the record,
+// which only its owner can read, keeps it whole.
+func TestUpRedactsServerURL(t *testing.T) {
+	bin := buildComlink(t)
+	env, _, state := sessionEnv(t)
+	server := "wss://user:pass-secret@agent.example.com/base/?token=query-secret#fragment-secret"
+	up := startUp(t, bin, env, "agent-a", server)
+	if want := "  server:     wss://agent.example.com/base/\n"; !strings.Contains(up.ready, want) {
+		t.Fatalf("stdout:\n%s\nwant the line %q", up.ready, want)
+	}
+	record, _, _, _ := sessionFiles(state, "agent-a")
+	if got := readRecord(t, record); got.Server != server {
+		t.Fatalf("record server %q, want %q", got.Server, server)
+	}
+	stdout, stderr, code := runBinary(t, bin, env, "", "codex", "list")
+	if want := "agent-a\tup\tpid " + strconv.Itoa(up.cmd.Process.Pid) + "\twss://agent.example.com/base/\n"; code != 0 || stdout != want {
+		t.Fatalf("list: exit %d, stdout %q, want %q; stderr %q", code, stdout, want, stderr)
+	}
+	up.stop(t, syscall.SIGTERM)
+	for what, out := range map[string]string{"session stdout": up.ready, "session stderr": up.stderr.String(), "list stderr": stderr} {
+		if strings.Contains(out, "secret") {
+			t.Errorf("%s shows a secret of the URL: %q", what, out)
+		}
+	}
 }
 
 // TestUpRefusesANameThatIsUp: a second session with the same name exits
@@ -919,7 +953,7 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"codex", "--name", "agent\nHost *", "--server", "wss://agent.example.com"}, `comlink: error: invalid alias "agent\nHost *": use only letters, digits, '-', '_' and '.'`},
+		{[]string{"codex", "--name", "agent\nHost *", "--server", "wss://agent.example.com"}, `comlink: error: invalid alias "agent\nHost *": use only letters, digits, '-', '_' and '.', not starting with '-'`},
 		{[]string{"codex", "--name", "agent", "--server", "https://agent.example.com"}, `comlink: error: server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
 		{[]string{"codex", "--name", "agent", "--server", "wss://agent.example.com", "--token-file", filepath.Join(state, "absent")}, "comlink: error: read token file: "},
 		{[]string{"codex", "--name", "agent"}, "comlink: error: missing flags: --server=URL"},
@@ -930,7 +964,7 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		{[]string{"codex", "--stdio", "--token-file", "/dev/null"}, "comlink: error: --stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
 		{[]string{"codex", "--stdio", "--name", "a", "--server", "ws://127.0.0.1:1"}, "comlink: error: --stdio takes --name or --server, not both"},
 		{[]string{"codex", "--stdio", "--name", "a", "--token-file", "/dev/null"}, "comlink: error: --token-file goes with --server; a session's token comes from 'comlink codex --name NAME'"},
-		{[]string{"codex", "--stdio", "--name", "two words"}, `comlink: error: invalid name "two words": use only letters, digits, '-', '_' and '.'`},
+		{[]string{"codex", "--stdio", "--name", "two words"}, `comlink: error: invalid name "two words": use only letters, digits, '-', '_' and '.', not starting with '-'`},
 		{[]string{"codex", "--stdio", "--server", "https://agent.example.com"}, `comlink: error: server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
 		{[]string{"codex", "--stdio", "--upstream", "ws://127.0.0.1:1"}, "comlink: error: unknown flag --upstream"},
 		{[]string{"codex", "list", "--name", "a"}, "comlink: error: 'comlink codex list' takes no flags; --stdio, --name, --server, --token-file and --report-version go with 'comlink codex' itself"},
@@ -941,7 +975,8 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		{[]string{"acp", "--name", "a"}, "comlink: error: unknown flag --name"},
 		{[]string{"acp", "--upstream", "ws://127.0.0.1:1/acp"}, "comlink: error: unknown flag --upstream"},
 		{[]string{"acp", "--server", "https://agent.example.com"}, `comlink: error: server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
-		{[]string{"acp", "--server", "ws://[::1"}, `comlink: error: server URL: parse "ws://[::1": missing ']' in host`},
+		{[]string{"acp", "--server", "ws://[::1"}, "comlink: error: server URL: missing ']' in host"},
+		{[]string{"codex", "--name=-agent", "--server", "wss://agent.example.com"}, `comlink: error: invalid alias "-agent": use only letters, digits, '-', '_' and '.', not starting with '-'`},
 		{[]string{"up", "--name", "a", "--server", "ws://127.0.0.1:1"}, "comlink: error: unexpected argument up"},
 		{[]string{"list"}, "comlink: error: unexpected argument list"},
 		{[]string{"ssh-include"}, "comlink: error: unexpected argument ssh-include"},

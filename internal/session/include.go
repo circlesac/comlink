@@ -34,27 +34,25 @@ func SSHConfigPath() (string, error) {
 	return filepath.Join(home, ".ssh", "config"), nil
 }
 
-// includes reports whether config has a line `Include <pattern>` at top
-// level, before the first Host or Match keyword (ssh applies an Include
-// under a block only to that block), with the keyword in any case, an
-// optional '=' after it and optional double quotes around the pattern.
-func (s *Store) includes(config string) bool {
+// includes reports whether config, the ssh config in sshDir (~/.ssh), has
+// an Include line for the session config files at top level, before the
+// first Host or Match keyword (ssh applies an Include under a block only to
+// that block). The line is read the way ssh reads it (see configWords), and
+// any argument that resolves to the pattern counts: the absolute pattern,
+// one starting with ~/ or one relative to sshDir (see includePath).
+func (s *Store) includes(config, sshDir string) bool {
 	for _, line := range strings.Split(config, "\n") {
-		line = strings.TrimSpace(line)
-		// ssh separates the keyword from its argument with whitespace or '='.
-		i := strings.IndexAny(line, " \t=")
-		if i < 0 {
-			i = len(line)
-		}
-		if strings.EqualFold(line[:i], "Host") || strings.EqualFold(line[:i], "Match") {
+		keyword, args := configWords(line)
+		if strings.EqualFold(keyword, "Host") || strings.EqualFold(keyword, "Match") {
 			return false
 		}
-		if !strings.EqualFold(line[:i], "Include") {
+		if !strings.EqualFold(keyword, "Include") {
 			continue
 		}
-		arg := strings.TrimLeft(line[i:], " \t=")
-		if strings.Trim(arg, `"`) == s.includePattern() {
-			return true
+		for _, arg := range args {
+			if path, ok := includePath(arg, sshDir); ok && path == s.includePattern() {
+				return true
+			}
 		}
 	}
 	return false
@@ -121,7 +119,7 @@ func (s *Store) include(path string) (includeResult, error) {
 	if err != nil {
 		return includeResult{}, err
 	}
-	if s.includes(string(old)) {
+	if s.includes(string(old), filepath.Dir(path)) {
 		return includeResult{Target: target}, nil
 	}
 	info, err := os.Stat(target)

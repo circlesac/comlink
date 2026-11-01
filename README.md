@@ -67,7 +67,7 @@ internal/sshd/         SSH server, client-agnostic: host key, global and session
 internal/codex/        Codex app route: command matching and the WebSocket relay
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
 internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the static ~/.ssh/config scan of a session name, picking a free name without --name, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
-internal/upstream/     the <server>/codex and <server>/acp endpoints of a base URL; upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors; token loading from a file or $COMLINK_TOKEN
+internal/upstream/     the <server>/codex and <server>/acp endpoints of a base URL; upstream WebSocket dial with the bearer token, the read limit and URL redaction for errors and printed output; token loading from a file or $COMLINK_TOKEN
 test/                  all tests, black-box through the exported API and the built binary; testdata/ holds the captured Codex commands
 ```
 
@@ -133,9 +133,10 @@ of `~/.ssh/config`, so while the session ran, `ssh <name>` would get
 comlink's block instead of yours. To tell, the session reads
 `~/.ssh/config` and the files it Includes (no ssh is run) for a `Host` line
 with a pattern that matches the name, with `*` and `?` wildcards and `!`
-negation (`(example-agent has ssh configuration; ...)`). Like ssh, which
-lowercases the host you ask for, it matches the lowercased name against
-patterns as written, so `Host EXAMPLE-AGENT` applies to no name; arguments
+negation (`(example-agent has ssh configuration; ...)`). Like ssh, it
+matches the name exactly as written, case and all, so `Host Agent-Review`
+applies to `--name Agent-Review` and `Host EXAMPLE-AGENT` not to
+`example-agent` (derived names are lowercase); arguments
 are split as ssh splits them, with double or single quotes and backslash
 escapes. A `Host` line that matches every name, such as `Host *`, does not
 count, so options under it like `ControlPath ~/.ssh/cm/%r@%h:%p` or
@@ -195,8 +196,12 @@ points to gets the line; the backup then sits next to that file, as
 (`<link> -> <target>`). A link to a file that does not exist yet creates
 that file. When the line is already there at top level (before the first
 `Host` or `Match` line; under a block ssh applies it only to that block),
-in any spelling ssh accepts, nothing is written and nothing is printed. The file is rewritten by
-renaming a complete copy into place, so ssh never reads half of it. When the
+in any spelling ssh accepts (the keyword in any case, `=`, quotes, and the
+pattern absolute, as `~/.local/state/comlink/ssh/*.conf` or relative to
+`~/.ssh`), nothing is written and nothing is printed. The file is rewritten by
+renaming a complete copy into place, so ssh never reads half of it; a
+hard-linked `~/.ssh/config` is therefore detached from its other links,
+which keep the old content (a symlink is followed and kept, as above). When the
 line cannot be added (a link loop, a file or backup that cannot be
 written), the session exits non-zero with one error line before it creates
 any session file. The line stays when the session ends; with no session up
@@ -213,11 +218,15 @@ Host example-agent
   StrictHostKeyChecking accept-new
 ```
 
-Ctrl-C (SIGINT) or SIGTERM ends it with exit 0 and removes everything it
+Ctrl-C (SIGINT), SIGTERM or SIGHUP (closing its terminal) ends it with
+exit 0 and removes everything it
 registered (the Include line in `~/.ssh/config` stays). Several names can
 be up at once, each with its own server or sharing one. A name is a run of letters,
-digits, `-`, `_` and `.`; it is the ssh alias and part of the file names,
-so anything else is refused. The token comes from `--token-file`, else
+digits, `-`, `_` and `.` that does not start with `-`; it is the ssh alias
+(which `ssh` would take for an option if it started with `-`) and part of
+the file names, so anything else is refused. The server URL is printed
+without its userinfo, query or fragment, here and in `comlink codex list`,
+in case they hold a secret. The token comes from `--token-file`, else
 `$COMLINK_TOKEN`, else the server is dialled without an `Authorization`
 header; a token file that group or others can read is used with a
 one-line warning naming the file. Check an alias by hand with
@@ -268,6 +277,11 @@ A session is up while its lock is held. The kernel releases the lock when
 the session process ends, however it ends, so a record left behind by a
 killed session is stale even if its pid has since been reused; a new
 session on that name removes it and continues, and `list` removes it. The
+session holds the lock exclusively; a look at a name (`list`, `--stdio
+--name`) only takes it shared for an instant, so looks never make a stale
+name seem up or keep a new session from starting, and `list` removes a
+stale name's files while it holds the lock shared, so a session that comes
+up meanwhile keeps its files. The
 pid in the record is for display. On a build without flock (not unix)
 liveness falls back to whether the recorded pid exists.
 
@@ -391,13 +405,18 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   real OpenSSH with the built binary as its `ProxyCommand` (`codex --stdio
   --server`); and the built binary run directly: the token file permission
   warning, a missing token file and the missing home directory.
+- `lock_test.go` (unix): with the test holding a stale name's lock shared,
+  as a concurrent look would, `Load` still reports it not up and `List`
+  still removes it, while a name a session holds stays up.
 - `session_test.go`: the Codex session registry in process. The `/codex`
   and `/acp` endpoints for bases with and without a path prefix or trailing
-  slash, the name rule, the state directory from `XDG_STATE_HOME` or the
+  slash, endpoint errors and `upstream.Redact` without the URL's userinfo or
+  query, the name rule (no leading `-`), the state directory from `XDG_STATE_HOME` or the
   home directory, `Start`/`Load`/`List`/`Close` with the file modes, no
   temporary file left beside them and the token kept out of the record, a
   refused second start (without a pid when the live session's record is
-  missing or unreadable), a failed write undone, stale records (lock not
+  missing or unreadable), `Load` reporting a held name without its token
+  file as not up, a failed write undone, stale records (lock not
   held) removed by `List` and replaced by `Start` while `Load` reports them
   as not up, `Up` driven to its ready line and ended through its context,
   `Up` without a name deriving it from the server's host (lowercased, with
@@ -413,7 +432,7 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   Include that `Up` adds: created private, prepended with the rest
   byte-identical and the mode kept, backed up once, kept after the session,
   nothing written or printed when present at top level in any spelling ssh
-  accepts and the line added on top when it sits under a `Host` or `Match`
+  accepts (also `~/...` and relative to `~/.ssh`) and the line added on top when it sits under a `Host` or `Match`
   block, a
   quoted pattern for a state directory holding whitespace, nothing touched
   for a bad alias or server, the failure cases with no session file
@@ -426,7 +445,9 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   `Match` block, under `Host *` or the name's own `Host` line, an Include
   loop) skipped for `devbox-2` with the reason, a pattern that matches the
   suffix too refused with one `--name` line and nothing written, an
-  explicit name warned once naming the Host line and up, and a name only
+  explicit name warned once naming the Host line and up, `--name Agent-X`
+  configured by `Host Agent-X` and `Host Agent-*` but not by `Host agent-x`
+  or `Host AGENT-X`, and a name only
   `Host *` (even with `%h` options), a negation, an upper-case pattern,
   words that quotes or escapes keep together, an Include under another
   `Host` line, a `Match` block (the documented gap), missing Includes or
@@ -441,7 +462,9 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   `XDG_STATE_HOME`. `codex --name NAME --server URL` writes the record, token and ssh config with private modes, nothing else
   and no token outside the token file, prints the alias and that it
   created `~/.ssh/config` with the Include line, and removes exactly its
-  session files on SIGTERM or SIGINT with exit 0, keeping the line; a second session on a name that is up is refused naming the pid;
+  session files on SIGTERM, SIGINT or SIGHUP with exit 0, keeping the line;
+  a server URL with userinfo, a query and a fragment shown without them by
+  the session and `codex list` and kept whole in the record; a second session on a name that is up is refused naming the pid;
   a killed session leaves a stale record that the next one replaces and
   `codex list` removes; `codex list` output; a session adding the Include line
   to a missing or existing `~/.ssh/config` (prepended, the rest
@@ -465,7 +488,7 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   `padawan-2` and `padawan-3` saying why, all listed, `padawan` again once
   it stopped, and `comlink` for an IP address; three names up at once, with and without a path
   prefix or trailing slash, each reaching its own server through OpenSSH;
-  and the refused arguments (bad name or server, a session without
+  and the refused arguments (bad name, one starting with `-`, or server, a session without
   `--server`, `--report-version` without `--stdio`, both or
   neither of `--name` and `--server` with `--stdio`, `--token-file` with
   `--stdio --name`, the flags of `codex` given to `list`, and the removed

@@ -26,14 +26,18 @@ const ReadLimit = 64 << 20
 // Endpoint returns the endpoint a comlink server serves protocol at under
 // its base URL, <server>/<protocol> ("codex" or "acp"), joined whether or not
 // the base has a path prefix or a trailing slash. The scheme must be ws or
-// wss.
+// wss. An error shows server only as Redact does.
 func Endpoint(server, protocol string) (string, error) {
 	u, err := url.Parse(server)
 	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err // the cause, without the URL and its secrets
+		}
 		return "", fmt.Errorf("server URL: %w", err)
 	}
 	if (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
-		return "", fmt.Errorf("server URL %q: want ws://host[/prefix] or wss://host[/prefix]", server)
+		return "", fmt.Errorf("server URL %q: want ws://host[/prefix] or wss://host[/prefix]", Redact(server))
 	}
 	return u.JoinPath(protocol).String(), nil
 }
@@ -69,12 +73,14 @@ func redactDialError(err error, rawURL string) error {
 	if errors.As(err, &urlErr) {
 		err = urlErr.Err // the cause, without the URL
 	}
-	return fmt.Errorf("dial %s: %w", redactURL(rawURL), err)
+	return fmt.Errorf("dial %s: %w", Redact(rawURL), err)
 }
 
-// redactURL returns raw without its userinfo, query and fragment. A URL that
-// does not parse is not echoed at all: its secret part cannot be told apart.
-func redactURL(raw string) string {
+// Redact returns raw without its userinfo, query and fragment, which may
+// carry a secret (wss://user:secret@host/, ?token=...), for printing a
+// server or upstream URL. A URL that does not parse is not echoed at all:
+// its secret part cannot be told apart.
+func Redact(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "<invalid upstream URL>"

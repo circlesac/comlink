@@ -97,7 +97,8 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 // up and the next two are configured the line is there by the time Up
 // refuses. Up then registers name with server and token, writes the ssh
 // config block whose ProxyCommand runs `<exe> codex --stdio --name NAME`,
-// prints the alias on stdout, and holds the session until ctx is done. It
+// prints the alias and the server (redacted; the record keeps it whole) on
+// stdout, and holds the session until ctx is done. It
 // then removes the session's files and returns nil. When the Include line
 // cannot be added no session file is written.
 func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig string, stdout, stderr io.Writer) error {
@@ -166,7 +167,7 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 		case derived:
 			_, _ = fmt.Fprintf(stdout, "  name:       %s (%s; --name sets another)\n", sess.Name, strings.Join(skipped, ", "))
 		}
-		_, _ = fmt.Fprintf(stdout, "  server:     %s\n", sess.Server)
+		_, _ = fmt.Fprintf(stdout, "  server:     %s\n", upstream.Redact(sess.Server))
 		_, _ = fmt.Fprintf(stdout, "  Codex app:  SSH connection %q (ssh %s)\n", sess.Name, sess.Name)
 		_, _ = fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
 		<-ctx.Done()
@@ -209,8 +210,8 @@ func (s *Store) Resolve(name string) (endpoint, token string, err error) {
 	return record.Codex, token, nil
 }
 
-// PrintList prints one line per session that is up (name, pid and server;
-// never the token) on stdout, reports removed stale records on stderr and
+// PrintList prints one line per session that is up (name, pid and server
+// without its userinfo or query; never the token) on stdout, reports removed stale records on stderr and
 // says on stderr when nothing is up.
 func (s *Store) PrintList(stdout, stderr io.Writer) error {
 	live, stale, err := s.List()
@@ -225,7 +226,7 @@ func (s *Store) PrintList(stdout, stderr io.Writer) error {
 		return nil
 	}
 	for _, r := range live {
-		_, _ = fmt.Fprintf(stdout, "%s\tup\tpid %d\t%s\n", r.Name, r.PID, r.Server)
+		_, _ = fmt.Fprintf(stdout, "%s\tup\tpid %d\t%s\n", r.Name, r.PID, upstream.Redact(r.Server))
 	}
 	return nil
 }

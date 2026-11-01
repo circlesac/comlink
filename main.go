@@ -120,9 +120,10 @@ func (c *codexCmd) Run(kctx *kong.Context) error {
 	if err != nil {
 		return err
 	}
-	// The session ends on SIGINT or SIGTERM; armed before anything is
-	// written so a signal during setup still removes the files.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// The session ends on SIGINT, SIGTERM or SIGHUP (its terminal closed);
+	// armed before anything is written so a signal during setup still
+	// removes the files.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	return store.Up(ctx, c.Name, c.Server, token, exe, sshConfig, os.Stdout, os.Stderr)
 }

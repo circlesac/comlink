@@ -77,10 +77,11 @@ func (s *Store) lockPath(n string) string   { return filepath.Join(s.runDir(), n
 func (s *Store) confPath(n string) string   { return filepath.Join(s.SSHDir(), n+".conf") }
 
 // ValidName reports whether name is a non-empty run of letters, digits,
-// '-', '_' and '.': it is a file name here and an ssh Host alias in the
-// config block.
+// '-', '_' and '.' that does not start with '-': it is a file name here and
+// an ssh Host alias in the config block, and ssh would read `ssh -name` as
+// an option.
 func ValidName(name string) bool {
-	if name == "" {
+	if name == "" || name[0] == '-' {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
@@ -120,7 +121,7 @@ type Session struct {
 // process is gone) is removed and replaced, and returned as Replaced.
 func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 	if !ValidName(name) {
-		return nil, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.'", name)
+		return nil, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
 	}
 	codex, err := upstream.Endpoint(server, "codex")
 	if err != nil {
@@ -239,11 +240,12 @@ func (s *Store) read(name string) (Record, error) {
 }
 
 // Load returns the record and the token of name when it is up, and a
-// *NotUpError when it has no record or its session process is gone. It does
+// *NotUpError when it has no record or token file (as inside Close) or its
+// session process is gone. It does
 // not remove a stale record; List and Start do.
 func (s *Store) Load(name string) (Record, string, error) {
 	if !ValidName(name) {
-		return Record{}, "", fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.'", name)
+		return Record{}, "", fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
 	}
 	r, err := s.read(name)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -256,6 +258,11 @@ func (s *Store) Load(name string) (Record, string, error) {
 		return Record{}, "", &NotUpError{Name: name}
 	}
 	token, err := os.ReadFile(s.tokenPath(name))
+	if errors.Is(err, fs.ErrNotExist) {
+		// Close removes the files before it releases the lock, so a session
+		// that is ending can be held without its token.
+		return Record{}, "", &NotUpError{Name: name}
+	}
 	if err != nil {
 		return Record{}, "", fmt.Errorf("read token file: %w", err)
 	}
@@ -263,7 +270,11 @@ func (s *Store) Load(name string) (Record, string, error) {
 }
 
 // List returns the records that are up, sorted by name, and removes and
-// returns those whose session process is gone.
+// returns those whose session process is gone. A stale name's files are
+// removed only while List holds its lock shared, which keeps a session from
+// taking the name meanwhile; a name a session holds by then is live, and
+// one whose record is gone by then (its session closed) is neither. A name
+// whose lock file cannot be opened is left alone.
 func (s *Store) List() (live, stale []Record, err error) {
 	entries, err := os.ReadDir(s.runDir())
 	if errors.Is(err, fs.ErrNotExist) {
@@ -283,12 +294,22 @@ func (s *Store) List() (live, stale []Record, err error) {
 			// not a session; it is left alone.
 			continue
 		}
-		if held(s.lockPath(name), r.PID) {
-			live = append(live, r)
+		lock, err := share(s.lockPath(name), r.PID)
+		if errors.Is(err, errLocked) {
+			// Read again: a session may have replaced the record read above.
+			if r, err := s.read(name); err == nil {
+				live = append(live, r)
+			}
 			continue
 		}
-		s.removeFiles(name)
-		stale = append(stale, r)
+		if err != nil {
+			continue // a lock file that cannot be opened: left alone
+		}
+		if r, err = s.read(name); err == nil {
+			s.removeFiles(name)
+			stale = append(stale, r)
+		}
+		_ = lock.Close()
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].Name < live[j].Name })
 	sort.Slice(stale, func(i, j int) bool { return stale[i].Name < stale[j].Name })

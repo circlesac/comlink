@@ -44,13 +44,13 @@ func TestConfigBlockAlias(t *testing.T) {
 			t.Errorf("alias %q: block\n%s", alias, block)
 		}
 	}
-	for _, alias := range []string{"", "two words", "agent\nHost *", "agent\r", "*", "agent?", "!agent", "agent,other", "tab\there", "agent/x", "ägent", `"agent"`} {
+	for _, alias := range []string{"", "two words", "agent\nHost *", "agent\r", "*", "agent?", "!agent", "agent,other", "tab\there", "agent/x", "ägent", `"agent"`, "-agent", "-oProxyCommand=x"} {
 		block, err := sshd.ConfigBlock(alias, []string{"/x/comlink", "run"})
 		if err == nil || block != "" {
 			t.Errorf("alias %q accepted: %q, %v", alias, block, err)
 			continue
 		}
-		if want := fmt.Sprintf("invalid alias %q: use only letters, digits, '-', '_' and '.'", alias); err.Error() != want {
+		if want := fmt.Sprintf("invalid alias %q: use only letters, digits, '-', '_' and '.', not starting with '-'", alias); err.Error() != want {
 			t.Errorf("alias %q: error %q, want %q", alias, err, want)
 		}
 	}
