@@ -81,6 +81,9 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 
 // Up is `comlink codex --server URL [--name NAME]`. An empty name is
 // derived from server as defaultName does, and the ready lines say so.
+// Before writing anything it asks ssh whether the config at sshConfig
+// already applies to the name (checkSSHConfig): a derived name is then
+// refused, an explicit one gets a warning on stderr.
 // Once name and server are valid it makes sure the ssh config at sshConfig includes the session
 // config files (adding the line as include does and saying so on stderr;
 // the line stays after the session), then registers name with server and
@@ -102,6 +105,9 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 	}
 	block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
 	if err != nil {
+		return err
+	}
+	if err := s.checkSSHConfig(sshConfig, name, derived, stderr); err != nil {
 		return err
 	}
 	if err := s.addInclude(sshConfig, stderr); err != nil {

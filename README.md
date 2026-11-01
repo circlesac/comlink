@@ -65,7 +65,7 @@ main.go                CLI declaration and wiring
 internal/sshd/         SSH server, client-agnostic: host key, global and session requests; hands exec to a route; renders an ssh config block around a given ProxyCommand
 internal/codex/        Codex app route: command matching and the WebSocket relay
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
-internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
+internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the ssh -G check of a session name, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
 internal/upstream/     the <server>/codex and <server>/acp endpoints of a base URL; upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors; token loading from a file or $COMLINK_TOKEN
 test/                  all tests, black-box through the exported API and the built binary; testdata/ holds the captured Codex commands
 ```
@@ -134,6 +134,25 @@ alias such as `localhost` or an address would capture your own `ssh` to
 that host. Such a session exits non-zero with one line ending
 `; pass --name NAME` and writes nothing.
 
+For the same reason a derived name must not be one your ssh configuration
+already knows. Before writing anything the session runs `ssh -G -F
+~/.ssh/config <name>` and the same for a random name nothing matches, and
+compares the two (with each name replaced in its own output). When they
+differ, a `Host` block or pattern, a `Match` block or a file you Include
+applies to the name, and while the session ran `ssh <name>` would get
+comlink's block instead of yours, so the session refuses:
+
+```
+comlink: error: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); pass --name NAME to pick another alias
+```
+
+With an explicit `--name` the same check only prints a one-line warning
+and the session comes up. The check is skipped when `ssh` is not on PATH or
+`ssh -G` fails, and for a name whose comlink ssh config file is still there
+(a session that is up, or one that did not stop cleanly). A short name that
+reaches a host only through DNS search domains has no ssh configuration and
+is not detected.
+
 Before it registers anything, the session makes sure `~/.ssh/config` has
 `Include /home/alice/.local/state/comlink/ssh/*.conf` (the absolute path of
 the session directory), the line that lets ssh and the Codex app find every
@@ -152,8 +171,9 @@ dotfiles checkout), the link is left as it is and the file it finally
 points to gets the line; the backup then sits next to that file, as
 `<target>.comlink-bak`, and the stderr line names both paths
 (`<link> -> <target>`). A link to a file that does not exist yet creates
-that file. When the line is already there, in any spelling ssh accepts,
-nothing is written and nothing is printed. The file is rewritten by
+that file. When the line is already there at top level (before the first
+`Host` or `Match` line; under a block ssh applies it only to that block),
+in any spelling ssh accepts, nothing is written and nothing is printed. The file is rewritten by
 renaming a complete copy into place, so ssh never reads half of it. When the
 line cannot be added (a link loop, a file or backup that cannot be
 written), the session exits non-zero with one error line before it creates
@@ -369,12 +389,18 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   `--name` for a session that is or is not up), and the `~/.ssh/config`
   Include that `Up` adds: created private, prepended with the rest
   byte-identical and the mode kept, backed up once, kept after the session,
-  nothing written or printed when present in any spelling ssh accepts, a
+  nothing written or printed when present at top level in any spelling ssh
+  accepts and the line added on top when it sits under a `Host` or `Match`
+  block, a
   quoted pattern for a state directory holding whitespace, nothing touched
   for a bad alias or server, the failure cases with no session file
   written, and a config that is a symlink (absolute, a relative chain,
   dangling, a loop): the links stay as they were and the target gets the
-  line and the backup.
+  line and the backup; and the `ssh -G` check against real ssh: a derived
+  name with a `Host` block, a `Host` pattern, a `Match` block or an
+  Included `Host` block refused with nothing written, an explicit one
+  warned once and up, and a name without configuration or with only
+  comlink's own stale file up without a word.
 - `token_test.go`: the token from a file or `$COMLINK_TOKEN`, trimmed, the
   permission warning naming the path and a missing file.
 - `up_test.go`: the built binary with a temporary `HOME` and
@@ -386,10 +412,15 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   `codex list` removes; `codex list` output; a session adding the Include line
   to a missing or existing `~/.ssh/config` (prepended, the rest
   byte-identical, the mode kept, backed up once), writing and printing
-  nothing when the line is there in any spelling ssh accepts, writing
+  nothing when the line is there at top level in any spelling ssh accepts
+  and adding it on top when it sits under a `Host` block, writing
   through a symlinked `~/.ssh/config`, and exiting non-zero with one error
   line and no session file for a looping link or a config it cannot back
-  up; `codex --stdio --name`
+  up; with the real ssh and a `~/.ssh/config` that has `Host devbox`, a
+  session without `--name` for `wss://devbox.example.com` refused with one
+  line, nothing in the state directory and the config unchanged, with
+  `--name devbox` warning once and coming up, and one for another host
+  coming up silently; `codex --stdio --name`
   through real OpenSSH with a config that Includes the session directory, answering
   the version probe and relaying the app-server session to `<server>/codex`
   with the session's token, then failing with the not-up line once the

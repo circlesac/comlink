@@ -34,15 +34,22 @@ func SSHConfigPath() (string, error) {
 	return filepath.Join(home, ".ssh", "config"), nil
 }
 
-// includes reports whether config has a line `Include <pattern>`, with the
-// keyword in any case, an optional '=' after it and optional double quotes
-// around the pattern.
+// includes reports whether config has a line `Include <pattern>` at top
+// level, before the first Host or Match keyword (ssh applies an Include
+// under a block only to that block), with the keyword in any case, an
+// optional '=' after it and optional double quotes around the pattern.
 func (s *Store) includes(config string) bool {
 	for _, line := range strings.Split(config, "\n") {
 		line = strings.TrimSpace(line)
 		// ssh separates the keyword from its argument with whitespace or '='.
 		i := strings.IndexAny(line, " \t=")
-		if i < 0 || !strings.EqualFold(line[:i], "Include") {
+		if i < 0 {
+			i = len(line)
+		}
+		if strings.EqualFold(line[:i], "Host") || strings.EqualFold(line[:i], "Match") {
+			return false
+		}
+		if !strings.EqualFold(line[:i], "Include") {
 			continue
 		}
 		arg := strings.TrimLeft(line[i:], " \t=")

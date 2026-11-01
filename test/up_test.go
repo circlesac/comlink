@@ -413,7 +413,8 @@ func TestListShowsLiveSessions(t *testing.T) {
 // ~/.ssh/config before it registers anything, creating the file when it is
 // missing, backing the previous content up once and saying so in one stderr
 // line; the line stays after the session ends. When the line is already
-// there in any spelling ssh accepts, nothing is written or printed. A
+// there at top level (before any Host or Match block) in any spelling ssh
+// accepts, nothing is written or printed; under a block it does not count. A
 // ~/.ssh/config that is a symlink stays one: the file it points to gets the
 // line and the backup. A config that cannot be changed stops the session
 // before any session file exists.
@@ -481,14 +482,15 @@ func TestUpAddsInclude(t *testing.T) {
 		t.Fatalf("backup overwritten: %q", b)
 	}
 
-	// Spellings ssh accepts count as present: nothing is written or printed.
+	// Spellings ssh accepts at top level count as present: nothing is
+	// written or printed.
 	for _, content := range []string{
 		"include " + pattern + "\n",
 		"  Include\t" + pattern + "  \n",
 		"Include=" + pattern + "\n",
 		"Include = " + pattern + "\n",
 		`Include "` + pattern + `"` + "\n",
-		"Host a\nInclude " + pattern + "\n",
+		"# top\nInclude " + pattern + "\nHost a\n",
 	} {
 		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -499,6 +501,18 @@ func TestUpAddsInclude(t *testing.T) {
 		if b, _ := os.ReadFile(config); string(b) != content {
 			t.Errorf("config %q changed to %q", content, b)
 		}
+	}
+	// Under a Host block the line applies only to that block, so it does not
+	// count: the line goes on top.
+	nested := "Host a\nInclude " + pattern + "\n"
+	if err := os.WriteFile(config, []byte(nested), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := session(t), "comlink: added \""+line+"\" to the top of "+config+"\n"; got != want {
+		t.Fatalf("session with %q printed %q, want %q", nested, got, want)
+	}
+	if b, _ := os.ReadFile(config); string(b) != line+"\n"+nested {
+		t.Fatalf("config %q, want the line on top of %q", b, nested)
 	}
 
 	// ~/.ssh/config as a symlink into a dotfiles checkout.
@@ -790,6 +804,52 @@ func TestUpDefaultName(t *testing.T) {
 	up.stop(t, os.Interrupt)
 	if run, ssh := sessionDirs(t, state); len(run) != 0 || len(ssh) != 0 {
 		t.Fatalf("run holds %v and ssh holds %v after both sessions stopped", run, ssh)
+	}
+}
+
+// TestUpExistingSSHHost: with the real ssh and a ~/.ssh/config that has a
+// Host block for the name, a session without --name is refused with one
+// line and writes nothing; with --name it warns once and comes up; a name
+// without configuration comes up silently.
+func TestUpExistingSSHHost(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("ssh not on PATH")
+	}
+	bin := buildComlink(t)
+	env, home, state := sessionEnv(t)
+	config := filepath.Join(home, ".ssh", "config")
+	original := "Host devbox\n  User someone\n"
+	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runBinary(t, bin, append(env, "COMLINK_TOKEN="+testToken), "", "codex", "--server", "wss://devbox.example.com")
+	want := `comlink: error: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); pass --name NAME to pick another alias` + "\n"
+	if code == 0 || stdout != "" || stderr != want {
+		t.Fatalf("session without --name: exit %d, stdout %q, stderr %q, want %q", code, stdout, stderr, want)
+	}
+	if b, _ := os.ReadFile(config); string(b) != original {
+		t.Fatalf("~/.ssh/config changed to %q", b)
+	}
+	if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
+		t.Fatalf("state holds %v (%v) after a refused session", entries, err)
+	}
+	absent(t, config+".comlink-bak")
+
+	up := startUp(t, bin, env, "devbox", "wss://devbox.example.com")
+	up.stop(t, syscall.SIGTERM)
+	if !strings.HasPrefix(up.stderr.String(), `comlink: warning: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); this session's Host block takes precedence while it runs`+"\n") ||
+		strings.Count(up.stderr.String(), "warning") != 1 {
+		t.Fatalf("session with --name devbox printed %q", up.stderr.String())
+	}
+
+	up = startUp(t, bin, env, "", "wss://padawan.example.com")
+	up.stop(t, syscall.SIGTERM)
+	if up.stderr.String() != "" {
+		t.Fatalf("session for padawan printed %q", up.stderr.String())
 	}
 }
 

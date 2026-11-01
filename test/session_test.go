@@ -423,8 +423,9 @@ func upOnce(store *session.Store, sshConfig string) (string, error) {
 // TestSessionUpInclude: Up puts the Include line at the top of
 // ~/.ssh/config, creating the file private when missing, backing the
 // previous content up once and otherwise preserving it byte for byte, and
-// says so in one stderr line; with the line already there in any spelling
-// ssh accepts it writes and prints nothing. A config it cannot change stops
+// says so in one stderr line; with the line already there at top level
+// (before any Host or Match block) in any spelling ssh accepts it writes and
+// prints nothing. A config it cannot change stops
 // it before any session file is written.
 func TestSessionUpInclude(t *testing.T) {
 	dir := t.TempDir()
@@ -497,15 +498,16 @@ func TestSessionUpInclude(t *testing.T) {
 		t.Fatalf("backup overwritten: %q", b)
 	}
 
-	// Spellings ssh accepts for the same line count as present; anything
-	// else gets the line added on top.
+	// Spellings ssh accepts for the same line count as present at top level;
+	// anything else, including the line under a Host or Match block, gets
+	// the line added on top.
 	for _, content := range []string{
 		"include " + pattern + "\n",
 		"  Include\t" + pattern + "  \n",
 		"Include=" + pattern + "\n",
 		"Include = " + pattern + "\n",
 		`Include "` + pattern + `"` + "\n",
-		"Host a\nInclude " + pattern + "\n",
+		"# top\nInclude " + pattern + "\nHost a\n",
 	} {
 		if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -519,6 +521,8 @@ func TestSessionUpInclude(t *testing.T) {
 	}
 	for _, content := range []string{
 		"# Include " + pattern + "\n",
+		"Host a\nInclude " + pattern + "\n",
+		"match all\n  Include " + pattern + "\n",
 		"Include " + pattern + "x\n",
 		"Include " + filepath.Join(dir, "other", "*.conf") + "\n",
 		"IncludeX " + pattern + "\n",
@@ -889,6 +893,105 @@ func TestSessionUpDefaultName(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(untouched); err != nil || len(entries) != 0 {
 		t.Fatalf("%s holds %v (%v) after refused sessions", untouched, entries, err)
+	}
+}
+
+// TestSessionUpExistingSSHHost: before writing anything Up asks ssh -G,
+// with -F naming the config it edits, whether that config already applies
+// to the name, comparing the output with that of a name nothing matches. A
+// derived name with configuration of its own (a Host block or pattern, a
+// Match block, a Host block in an Included file) is refused with one line
+// and nothing is written; an explicit name gets one warning line and comes
+// up; a name without configuration comes up without one. A stale ssh config
+// file comlink left for the name is its own and does not count.
+func TestSessionUpExistingSSHHost(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("ssh not on PATH")
+	}
+	refusal := `"devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); pass --name NAME to pick another alias`
+	warning := `comlink: warning: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); this session's Host block takes precedence while it runs` + "\n"
+	for _, tc := range []struct{ desc, config string }{
+		{"a Host block", "Host other\n  User x\n\nHost devbox\n  User someone\n"},
+		{"a Host pattern", "Host dev*\n  Port 2222\n"},
+		{"a Match block", "Match originalhost devbox\n  User someone\n"},
+		{"an Included Host block", "Include %s\n"},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			dir := t.TempDir()
+			store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+			config := filepath.Join(dir, "home", ".ssh", "config")
+			if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			content := tc.config
+			if strings.Contains(content, "%s") {
+				extra := filepath.Join(dir, "extra.conf")
+				if err := os.WriteFile(extra, []byte("Host devbox\n  User someone\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				content = strings.ReplaceAll(content, "%s", extra)
+			}
+			if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			// A cancelled context: a session that wrongly comes up returns at once.
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var stdout, stderr bytes.Buffer
+			if err := store.Up(ctx, "", "wss://devbox.example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err == nil || err.Error() != refusal {
+				t.Fatalf("Up without a name = %v, want %q", err, refusal)
+			}
+			if stdout.Len() != 0 || stderr.Len() != 0 {
+				t.Fatalf("refused Up printed %q and %q", stdout.String(), stderr.String())
+			}
+			if b, _ := os.ReadFile(config); string(b) != content {
+				t.Fatalf("refused Up changed the config to %q", b)
+			}
+			absent(t, store.Dir, config+".comlink-bak")
+
+			stderr.Reset()
+			if err := store.Up(ctx, "devbox", "wss://devbox.example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
+				t.Fatalf("Up --name devbox: %v", err)
+			}
+			line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
+			if want := warning + "comlink: added \"" + line + "\" to the top of " + config + "; previous content backed up to " + config + ".comlink-bak\n"; stderr.String() != want {
+				t.Fatalf("Up --name devbox printed %q, want %q", stderr.String(), want)
+			}
+			if !strings.HasPrefix(stdout.String(), "devbox is up (pid ") {
+				t.Fatalf("Up --name devbox stdout %q", stdout.String())
+			}
+		})
+	}
+
+	// No configuration for the name: it comes up without a word, as does a
+	// derived name whose only configuration is comlink's own stale file.
+	dir := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	config := filepath.Join(dir, "home", ".ssh", "config")
+	line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
+	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte(line+"\nHost other\n  User someone\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.SSHDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.SSHDir(), "devbox.conf"), []byte("Host devbox\n  User stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range []string{"wss://padawan.example.com", "wss://devbox.example.com"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var stdout, stderr bytes.Buffer
+		if err := store.Up(ctx, "", server, testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
+			t.Fatalf("Up(%q) without a name: %v", server, err)
+		}
+		if stderr.Len() != 0 || !strings.Contains(stdout.String(), " is up (pid ") {
+			t.Fatalf("Up(%q) printed %q and %q", server, stdout.String(), stderr.String())
+		}
 	}
 }
 
