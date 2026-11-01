@@ -79,13 +79,19 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 	return store.Resolve(f.Name)
 }
 
-// Up is `comlink codex --server URL [--name NAME]`. An empty name is
-// derived from server as defaultName does, and the ready lines say so.
-// Before writing anything it asks ssh whether the config at sshConfig
-// already applies to the name (checkSSHConfig): a derived name is then
-// refused, an explicit one gets a warning on stderr.
-// Once name and server are valid it makes sure the ssh config at sshConfig includes the session
-// config files (adding the line as include does and saying so on stderr;
+// Up is `comlink codex --server URL [--name NAME]`. An explicit name is
+// used as is: Start refuses it when it is up, and when the ssh config at
+// sshConfig already applies to it (a Host line of the user's matches it,
+// see sshConfigured) Up warns on stderr and goes on. Without a name Up tries the base defaultName gives, then
+// base-2, base-3 and so on, skipping a candidate the user's ssh
+// configuration applies to and one Start reports as up (also when another
+// session took it after the check), and the ready lines say which name it
+// took and why. Only finitely many sessions can be up, so the only endless
+// run of skips is ssh configuration that matches every suffix (a pattern
+// such as `Host padawan*`): two candidates in a row with ssh configuration
+// end it with an error asking for --name, before anything is written.
+// Once a name passes it makes sure the ssh config at sshConfig includes the
+// session config files (adding the line as include does and saying so on stderr;
 // the line stays after the session), then registers name with server and
 // token, writes the ssh config block whose ProxyCommand runs
 // `<exe> codex --stdio --name NAME`, prints the alias on stdout, and holds
@@ -97,67 +103,94 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 		return err
 	}
 	derived := name == ""
+	base := name
+	var skipped []string // why the derived name is not the first label of the host
 	if derived {
-		var err error
-		if name, err = defaultName(server); err != nil {
-			return err
+		var why string
+		if base, why = defaultName(server); why != "" {
+			skipped = append(skipped, why)
 		}
 	}
-	block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
-	if err != nil {
-		return err
+	included := false
+	configured := "" // the previous candidate, when ssh configuration applies to it
+	for n := 1; ; n++ {
+		name := base
+		if n > 1 {
+			name = fmt.Sprintf("%s-%d", base, n)
+		}
+		block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
+		if err != nil {
+			return err
+		}
+		if where := s.sshConfigured(sshConfig, name); where != "" {
+			why := fmt.Sprintf("%q already has ssh configuration (the Host line at %s matches it)", name, where)
+			if !derived {
+				_, _ = fmt.Fprintf(stderr, "comlink: warning: %s; this session's Host block takes precedence while it runs\n", why)
+			} else if configured != "" {
+				return fmt.Errorf("%q and %q both have ssh configuration, so a pattern in it likely matches every %s-N; pass --name NAME", configured, name, base)
+			} else {
+				configured = name
+				skipped = append(skipped, name+" has ssh configuration")
+				continue
+			}
+		}
+		configured = ""
+		if !included {
+			if err := s.addInclude(sshConfig, stderr); err != nil {
+				return err
+			}
+			included = true
+		}
+		sess, err := s.Start(name, server, token, block)
+		var up *upError
+		if derived && errors.As(err, &up) {
+			skipped = append(skipped, name+" is already up")
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if sess.Replaced != nil {
+			_, _ = fmt.Fprintf(stderr, "comlink: removed stale session %q (pid %d is gone)\n", sess.Replaced.Name, sess.Replaced.PID)
+		}
+		_, _ = fmt.Fprintf(stdout, "%s is up (pid %d)\n", sess.Name, sess.PID)
+		switch {
+		case derived && len(skipped) == 0:
+			_, _ = fmt.Fprintf(stdout, "  name:       %s, the first label of the server's host (--name sets another)\n", sess.Name)
+		case derived:
+			_, _ = fmt.Fprintf(stdout, "  name:       %s (%s; --name sets another)\n", sess.Name, strings.Join(skipped, ", "))
+		}
+		_, _ = fmt.Fprintf(stdout, "  server:     %s\n", sess.Server)
+		_, _ = fmt.Fprintf(stdout, "  Codex app:  SSH connection %q (ssh %s)\n", sess.Name, sess.Name)
+		_, _ = fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
+		<-ctx.Done()
+		return sess.Close()
 	}
-	if err := s.checkSSHConfig(sshConfig, name, derived, stderr); err != nil {
-		return err
-	}
-	if err := s.addInclude(sshConfig, stderr); err != nil {
-		return err
-	}
-	sess, err := s.Start(name, server, token, block)
-	if err != nil {
-		return err
-	}
-	if sess.Replaced != nil {
-		_, _ = fmt.Fprintf(stderr, "comlink: removed stale session %q (pid %d is gone)\n", sess.Replaced.Name, sess.Replaced.PID)
-	}
-	_, _ = fmt.Fprintf(stdout, "%s is up (pid %d)\n", sess.Name, sess.PID)
-	if derived {
-		_, _ = fmt.Fprintf(stdout, "  name:       %s, the first label of the server's host (--name sets another)\n", sess.Name)
-	}
-	_, _ = fmt.Fprintf(stdout, "  server:     %s\n", sess.Server)
-	_, _ = fmt.Fprintf(stdout, "  Codex app:  SSH connection %q (ssh %s)\n", sess.Name, sess.Name)
-	_, _ = fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
-	<-ctx.Done()
-	return sess.Close()
 }
 
-// defaultName is the session name for a valid server URL when --name is
-// not given: the first DNS label of its host, lowercased. The Include line
-// sits at the top of ~/.ssh/config, so the alias applies to every ssh the
-// user runs; an IP address or localhost as the alias would capture the
-// user's own ssh to it. For those, and for a label that is not a valid
-// alias, there is no default and the error asks for --name.
-func defaultName(server string) (string, error) {
-	u, err := url.Parse(server)
-	if err != nil {
-		return "", fmt.Errorf("server URL: %w", err)
-	}
+// defaultName is the base of the session name for a valid server URL when
+// --name is not given: the first DNS label of its host, lowercased. The
+// Include line sits at the top of ~/.ssh/config, so the alias applies to
+// every ssh the user runs; an IP address or localhost as the alias would
+// capture the user's own ssh to it. For those, and for a label that is not
+// a valid alias, the base is comlink and why says the reason.
+func defaultName(server string) (name, why string) {
+	u, _ := url.Parse(server) // upstream.Endpoint has parsed it
 	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 	label, _, _ := strings.Cut(host, ".")
-	var why string
 	switch _, addrErr := netip.ParseAddr(host); {
 	case addrErr == nil:
-		why = "it is an IP address"
+		why = fmt.Sprintf("the server host %s is an IP address", host)
 	case host == "localhost" || strings.HasSuffix(host, ".localhost"):
-		why = "it is localhost"
+		why = fmt.Sprintf("the server host %s is localhost", host)
 	case label == "localhost":
-		why = `its first label "localhost" would capture your own ssh to localhost`
+		why = fmt.Sprintf("the first label %q of the server host %s would capture your own ssh to localhost", label, host)
 	case !ValidName(label):
-		why = fmt.Sprintf("its first label %q is not a valid alias", label)
+		why = fmt.Sprintf("the first label %q of the server host %s is not a valid alias", label, host)
 	default:
-		return label, nil
+		return label, ""
 	}
-	return "", fmt.Errorf("cannot name the session after server host %q: %s; pass --name NAME", host, why)
+	return "comlink", why
 }
 
 // Resolve returns the Codex endpoint and the token of the session called

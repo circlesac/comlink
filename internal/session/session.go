@@ -93,6 +93,19 @@ func ValidName(name string) bool {
 	return true
 }
 
+// upError is Start's error for a name that is up.
+type upError struct {
+	name string
+	pid  int // 0 when the record does not say
+}
+
+func (e *upError) Error() string {
+	if e.pid <= 0 {
+		return fmt.Sprintf("session %q is already up", e.name)
+	}
+	return fmt.Sprintf("session %q is already up (pid %d)", e.name, e.pid)
+}
+
 // Session is a registered name, held by the session process until Close.
 type Session struct {
 	Record
@@ -125,10 +138,10 @@ func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 			// The record can be missing or unreadable while the lock is
 			// held (deleted, or the moment inside Close between removing
 			// it and releasing the lock); then there is no pid to name.
-			if oldErr != nil || old.PID <= 0 {
-				return nil, fmt.Errorf("session %q is already up", name)
+			if oldErr != nil {
+				old.PID = 0
 			}
-			return nil, fmt.Errorf("session %q is already up (pid %d)", name, old.PID)
+			return nil, &upError{name: name, pid: old.PID}
 		}
 		return nil, err
 	}

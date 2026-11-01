@@ -44,7 +44,7 @@ type cli struct {
 // which therefore refuses them.
 type codexCmd struct {
 	Stdio         bool   `group:"codex" help:"Serve one SSH connection on stdin/stdout, reaching the session --name or the server --server. ssh runs this via a Host block's ProxyCommand; you normally never run it yourself."`
-	Name          string `group:"codex" placeholder:"NAME" help:"Session name: the SSH alias the Codex app connects to. Defaults to the first label of the server's host (wss://padawan.example.com gives padawan); needed for an IP address or localhost, and to run several sessions on one server. With --stdio, the running session to reach."`
+	Name          string `group:"codex" placeholder:"NAME" help:"Session name: the SSH alias the Codex app connects to. Defaults to the first label of the server's host (wss://padawan.example.com gives padawan; comlink for an IP address or localhost), followed by -2, -3, ... when that name is up or already has ssh configuration. With --stdio, the running session to reach."`
 	Server        string `group:"codex" placeholder:"URL" help:"comlink server base URL (ws:// or wss://); the Codex app reaches <server>/codex."`
 	TokenFile     string `group:"codex" type:"path" placeholder:"PATH" help:"File whose trimmed contents are the server's bearer token. Falls back to $COMLINK_TOKEN. Not with --stdio --name: a session's token comes from the session."`
 	ReportVersion string `group:"codex" placeholder:"VERSION" help:"With --stdio: Codex version reported to 'codex --version' (default 0.165.0)."`

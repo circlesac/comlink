@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -827,19 +828,29 @@ func TestSessionUp(t *testing.T) {
 // TestSessionUpDefaultName: without a name Up names the session after the
 // first label of the server's host, lowercased, says so on stdout and uses
 // it for the record and the alias. For an IP address, localhost (or
-// *.localhost) or a label that is not a valid alias there is no default: Up
-// fails with one line asking for --name and writes nothing, not even the
-// Include line.
+// *.localhost), a first label "localhost" or a label that is not a valid
+// alias the name is comlink and the name line says why. A name that is up
+// is skipped for the next suffix, and the name line says so too.
 func TestSessionUpDefaultName(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
 	sshConfig := filepath.Join(dir, "home", ".ssh", "config")
-	for _, tc := range []struct{ server, name string }{
-		{"wss://padawan.example.com/x", "padawan"},
-		{"wss://padawan-app.foo.workers.dev", "padawan-app"},
-		{"ws://Worker:8787", "worker"},
-		{"wss://PADAWAN.Example.COM:8443/tenant/x/", "padawan"},
-		{"wss://padawan./", "padawan"},
+	pid := strconv.Itoa(os.Getpid())
+	for _, tc := range []struct{ server, name, line string }{
+		{"wss://padawan.example.com/x", "padawan", "padawan, the first label of the server's host (--name sets another)"},
+		{"wss://padawan-app.foo.workers.dev", "padawan-app", "padawan-app, the first label of the server's host (--name sets another)"},
+		{"ws://Worker:8787", "worker", "worker, the first label of the server's host (--name sets another)"},
+		{"wss://PADAWAN.Example.COM:8443/tenant/x/", "padawan", "padawan, the first label of the server's host (--name sets another)"},
+		{"wss://padawan./", "padawan", "padawan, the first label of the server's host (--name sets another)"},
+		{"ws://127.0.0.1:8787", "comlink", "comlink (the server host 127.0.0.1 is an IP address; --name sets another)"},
+		{"wss://[::1]:8443/x", "comlink", "comlink (the server host ::1 is an IP address; --name sets another)"},
+		{"ws://[fe80::1%25en0]:8787", "comlink", "comlink (the server host fe80::1%en0 is an IP address; --name sets another)"},
+		{"ws://localhost:8787", "comlink", "comlink (the server host localhost is localhost; --name sets another)"},
+		{"ws://LocalHost.", "comlink", "comlink (the server host localhost is localhost; --name sets another)"},
+		{"ws://x.localhost:8787", "comlink", "comlink (the server host x.localhost is localhost; --name sets another)"},
+		{"wss://localhost.example.com", "comlink", `comlink (the first label "localhost" of the server host localhost.example.com would capture your own ssh to localhost; --name sets another)`},
+		{"wss://.example.com", "comlink", `comlink (the first label "" of the server host .example.com is not a valid alias; --name sets another)`},
+		{"wss://a~b.example.com", "comlink", `comlink (the first label "a~b" of the server host a~b.example.com is not a valid alias; --name sets another)`},
 	} {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -847,8 +858,8 @@ func TestSessionUpDefaultName(t *testing.T) {
 		if err := store.Up(ctx, "", tc.server, testToken, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
 			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
 		}
-		want := tc.name + " is up (pid " + strconv.Itoa(os.Getpid()) + ")\n" +
-			"  name:       " + tc.name + ", the first label of the server's host (--name sets another)\n" +
+		want := tc.name + " is up (pid " + pid + ")\n" +
+			"  name:       " + tc.line + "\n" +
 			"  server:     " + tc.server + "\n" +
 			"  Codex app:  SSH connection \"" + tc.name + "\" (ssh " + tc.name + ")\n" +
 			"Press Ctrl-C to stop.\n"
@@ -868,94 +879,153 @@ func TestSessionUpDefaultName(t *testing.T) {
 		t.Fatalf("Up with --name stdout:\n%s", stdout.String())
 	}
 
-	untouched := t.TempDir()
-	refusedStore := &session.Store{Dir: filepath.Join(untouched, "comlink")}
-	untouchedConfig := filepath.Join(untouched, "home", ".ssh", "config")
-	for _, tc := range []struct{ server, want string }{
-		{"ws://127.0.0.1:8787", `cannot name the session after server host "127.0.0.1": it is an IP address; pass --name NAME`},
-		{"wss://[::1]:8443/x", `cannot name the session after server host "::1": it is an IP address; pass --name NAME`},
-		{"ws://[fe80::1%25en0]:8787", `cannot name the session after server host "fe80::1%en0": it is an IP address; pass --name NAME`},
-		{"ws://localhost:8787", `cannot name the session after server host "localhost": it is localhost; pass --name NAME`},
-		{"ws://LocalHost.", `cannot name the session after server host "localhost": it is localhost; pass --name NAME`},
-		{"ws://x.localhost:8787", `cannot name the session after server host "x.localhost": it is localhost; pass --name NAME`},
-		{"wss://localhost.example.com", `cannot name the session after server host "localhost.example.com": its first label "localhost" would capture your own ssh to localhost; pass --name NAME`},
-		{"wss://.example.com", `cannot name the session after server host ".example.com": its first label "" is not a valid alias; pass --name NAME`},
-		{"wss://a~b.example.com", `cannot name the session after server host "a~b.example.com": its first label "a~b" is not a valid alias; pass --name NAME`},
+	// Names that are up are skipped, for a label and for comlink alike.
+	for _, name := range []string{"padawan", "padawan-2", "comlink"} {
+		sess, err := store.Start(name, "wss://padawan.example.com", testToken, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = sess.Close() }()
+	}
+	for _, tc := range []struct{ server, name, line string }{
+		{"wss://padawan.example.com", "padawan-3", "padawan-3 (padawan is already up, padawan-2 is already up; --name sets another)"},
+		{"ws://127.0.0.1:8787", "comlink-2", "comlink-2 (the server host 127.0.0.1 is an IP address, comlink is already up; --name sets another)"},
 	} {
-		err := refusedStore.Up(context.Background(), "", tc.server, testToken, "/opt/comlink", untouchedConfig, io.Discard, io.Discard)
-		if err == nil || err.Error() != tc.want {
-			t.Errorf("Up(%q) without a name = %v, want %q", tc.server, err, tc.want)
+		stdout.Reset()
+		if err := store.Up(ctx, "", tc.server, testToken, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
+			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
+		}
+		if want := tc.name + " is up (pid " + pid + ")\n  name:       " + tc.line + "\n"; !strings.HasPrefix(stdout.String(), want) {
+			t.Errorf("Up(%q) stdout:\n%s\nwant prefix:\n%s", tc.server, stdout.String(), want)
 		}
 	}
-	// A bad server is still reported as one.
-	if err := refusedStore.Up(context.Background(), "", "https://padawan.example.com", "", "/opt/comlink", untouchedConfig, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
+
+	// A bad server is still reported as one, and nothing is written.
+	untouched := t.TempDir()
+	refusedStore := &session.Store{Dir: filepath.Join(untouched, "comlink")}
+	if err := refusedStore.Up(context.Background(), "", "https://padawan.example.com", "", "/opt/comlink", filepath.Join(untouched, "config"), io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
 		t.Fatalf("Up with a bad server and no name: %v", err)
 	}
 	if entries, err := os.ReadDir(untouched); err != nil || len(entries) != 0 {
-		t.Fatalf("%s holds %v (%v) after refused sessions", untouched, entries, err)
+		t.Fatalf("%s holds %v (%v) after a refused session", untouched, entries, err)
 	}
 }
 
-// TestSessionUpExistingSSHHost: before writing anything Up asks ssh -G,
-// with -F naming the config it edits, whether that config already applies
-// to the name, comparing the output with that of a name nothing matches. A
-// derived name with configuration of its own (a Host block or pattern, a
-// Match block, a Host block in an Included file) is refused with one line
-// and nothing is written; an explicit name gets one warning line and comes
-// up; a name without configuration comes up without one. A stale ssh config
-// file comlink left for the name is its own and does not count.
+// TestSessionUpExistingSSHHost: before writing anything Up reads the ssh
+// config it edits, and the files that config Includes, for a Host line with
+// a pattern that matches the name (and not a random one too, as Host *
+// does). A derived name with such a line is skipped for devbox-2 and the
+// name line says why; an explicit name gets one warning line naming the Host
+// line and comes up. When the next suffix matches too (a pattern such as
+// Host dev*) Up fails with one line asking for --name and writes nothing. A
+// name that no specific Host line matches comes up without a word: Host *
+// with options ssh would percent-expand for the name, a negated name, a
+// Match block (not evaluated), a missing, looping or ~user Include, and
+// comlink's own stale session file. %d in a config, file or location is
+// the test directory; files are relative to ~/.ssh unless absolute.
 func TestSessionUpExistingSSHHost(t *testing.T) {
-	if _, err := exec.LookPath("ssh"); err != nil {
-		t.Skip("ssh not on PATH")
-	}
-	refusal := `"devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); pass --name NAME to pick another alias`
-	warning := `comlink: warning: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); this session's Host block takes precedence while it runs` + "\n"
-	for _, tc := range []struct{ desc, config string }{
-		{"a Host block", "Host other\n  User x\n\nHost devbox\n  User someone\n"},
-		{"a Host pattern", "Host dev*\n  Port 2222\n"},
-		{"a Match block", "Match originalhost devbox\n  User someone\n"},
-		{"an Included Host block", "Include %s\n"},
+	const (
+		none = iota
+		skip
+		refuse
+	)
+	for _, tc := range []struct {
+		desc, config string
+		files        map[string]string
+		want         int
+		where        string // the Host line the warning names
+	}{
+		{"a Host line", "Host other\n  User x\n\nHost devbox\n  User someone\n", nil, skip, "%d/home/.ssh/config:5"},
+		{"one of several patterns", "Host other devbox\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"upper case and =", "HOST=DEVBOX\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"a ? wildcard", "Host dev?ox\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"a quoted pattern and a comment", "  Host \"other\" \"devbox\" # mine\n", nil, skip, "%d/home/.ssh/config:2"},
+		{"an absolute Include", "Include %d/extra.conf\n", map[string]string{"%d/extra.conf": "Host devbox\n"}, skip, "%d/extra.conf:1"},
+		{"a relative Include", "Include extra.conf\n", map[string]string{"extra.conf": "# extra\nHost devbox\n"}, skip, "%d/home/.ssh/extra.conf:2"},
+		{"a glob Include under a block", "Host other\n  Include conf.d/*.conf\n", map[string]string{"conf.d/a.conf": "Host x\n", "conf.d/b.conf": "Host devbox\n"}, skip, "%d/home/.ssh/conf.d/b.conf:1"},
+		{"a ~ Include", "Include = \"~/.ssh/conf.d/devbox.conf\"\n", map[string]string{"conf.d/devbox.conf": "Host devbox\n"}, skip, "%d/home/.ssh/conf.d/devbox.conf:1"},
+		{"an Include loop", "Include config\nHost devbox\n", nil, skip, "%d/home/.ssh/config:3"},
+		{"a Host pattern", "Host dev*\n  Port 2222\n", nil, refuse, "%d/home/.ssh/config:2"},
+		{"an Included Host pattern", "Include extra.conf\n", map[string]string{"extra.conf": "Host devbox*\n"}, refuse, "%d/home/.ssh/extra.conf:1"},
+		{"Host * only", "Host *\n  User someone\n", nil, none, ""},
+		{"Host * with percent expansion", "Host *\n  ControlPath ~/.ssh/cm-%r@%h:%p\n  HostName %h.example.com\n  UserKnownHostsFile ~/.ssh/kh_%h\n", nil, none, ""},
+		{"Host * except another", "Host * !other\n", nil, none, ""},
+		{"a negated name", "Host dev* !devbox\n", nil, skip, ""},
+		{"a Match block", "Match originalhost devbox\n  User someone\n", nil, none, ""},
+		{"a commented Host line", "# Host devbox\nHost\n", nil, none, ""},
+		{"missing and odd Includes", "Include nothing/*.conf %d/absent ~nobody/devbox.conf %d\n", nil, none, ""},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			dir := t.TempDir()
+			expand := func(s string) string { return strings.ReplaceAll(s, "%d", dir) }
 			store := &session.Store{Dir: filepath.Join(dir, "comlink")}
 			config := filepath.Join(dir, "home", ".ssh", "config")
-			if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			content := tc.config
-			if strings.Contains(content, "%s") {
-				extra := filepath.Join(dir, "extra.conf")
-				if err := os.WriteFile(extra, []byte("Host devbox\n  User someone\n"), 0o600); err != nil {
+			for name, content := range tc.files {
+				path := expand(name)
+				if !filepath.IsAbs(path) {
+					path = filepath.Join(filepath.Dir(config), path)
+				}
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 					t.Fatal(err)
 				}
-				content = strings.ReplaceAll(content, "%s", extra)
+				if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The Include line is there already, so Up prints only about the
+			// name and the line numbers stay put.
+			content := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf") + "\n" + expand(tc.config)
+			if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+				t.Fatal(err)
 			}
 			if err := os.WriteFile(config, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
 
-			// A cancelled context: a session that wrongly comes up returns at once.
+			// A cancelled context: a session that comes up returns at once.
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			var stdout, stderr bytes.Buffer
-			if err := store.Up(ctx, "", "wss://devbox.example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err == nil || err.Error() != refusal {
-				t.Fatalf("Up without a name = %v, want %q", err, refusal)
-			}
-			if stdout.Len() != 0 || stderr.Len() != 0 {
-				t.Fatalf("refused Up printed %q and %q", stdout.String(), stderr.String())
+			err := store.Up(ctx, "", "wss://devbox.example.com", testToken, "/opt/comlink", config, &stdout, &stderr)
+			switch tc.want {
+			case refuse:
+				if want := `"devbox" and "devbox-2" both have ssh configuration, so a pattern in it likely matches every devbox-N; pass --name NAME`; err == nil || err.Error() != want {
+					t.Fatalf("Up without a name = %v, want %q", err, want)
+				}
+				if stdout.Len() != 0 || stderr.Len() != 0 {
+					t.Fatalf("refused Up printed %q and %q", stdout.String(), stderr.String())
+				}
+				absent(t, store.Dir, config+".comlink-bak")
+			case skip:
+				if err != nil {
+					t.Fatalf("Up without a name: %v", err)
+				}
+				name, line := "devbox-2", "devbox-2 (devbox has ssh configuration; --name sets another)"
+				if tc.where == "" { // only devbox-2 matches: devbox is not configuration
+					name, line = "devbox", "devbox, the first label of the server's host (--name sets another)"
+				}
+				if want := name + " is up (pid " + strconv.Itoa(os.Getpid()) + ")\n  name:       " + line + "\n"; !strings.HasPrefix(stdout.String(), want) || stderr.Len() != 0 {
+					t.Fatalf("Up without a name printed:\n%s\n%q\nwant prefix:\n%s", stdout.String(), stderr.String(), want)
+				}
+			case none:
+				if err != nil || !strings.HasPrefix(stdout.String(), "devbox is up (pid ") || stderr.Len() != 0 {
+					t.Fatalf("Up without a name: %v, printed %q and %q", err, stdout.String(), stderr.String())
+				}
 			}
 			if b, _ := os.ReadFile(config); string(b) != content {
-				t.Fatalf("refused Up changed the config to %q", b)
+				t.Fatalf("Up changed the config to %q", b)
 			}
-			absent(t, store.Dir, config+".comlink-bak")
 
+			stdout.Reset()
 			stderr.Reset()
 			if err := store.Up(ctx, "devbox", "wss://devbox.example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
 				t.Fatalf("Up --name devbox: %v", err)
 			}
-			line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
-			if want := warning + "comlink: added \"" + line + "\" to the top of " + config + "; previous content backed up to " + config + ".comlink-bak\n"; stderr.String() != want {
+			want := ""
+			if tc.where != "" {
+				want = `comlink: warning: "devbox" already has ssh configuration (the Host line at ` + expand(tc.where) + ` matches it); this session's Host block takes precedence while it runs` + "\n"
+			}
+			if stderr.String() != want {
 				t.Fatalf("Up --name devbox printed %q, want %q", stderr.String(), want)
 			}
 			if !strings.HasPrefix(stdout.String(), "devbox is up (pid ") {
@@ -964,16 +1034,15 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 		})
 	}
 
-	// No configuration for the name: it comes up without a word, as does a
-	// derived name whose only configuration is comlink's own stale file.
+	// comlink's own session files are not the user's configuration, even a
+	// stale one for the name, also through an Include spelled with ~.
 	dir := t.TempDir()
-	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+	store := &session.Store{Dir: filepath.Join(dir, "home", "state", "comlink")}
 	config := filepath.Join(dir, "home", ".ssh", "config")
-	line := "Include " + filepath.Join(dir, "comlink", "ssh", "*.conf")
 	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, []byte(line+"\nHost other\n  User someone\n"), 0o600); err != nil {
+	if err := os.WriteFile(config, []byte("Include "+filepath.Join(store.SSHDir(), "*.conf")+"\nInclude ~/state/comlink/ssh/*\nHost other\n  User someone\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(store.SSHDir(), 0o700); err != nil {
@@ -982,15 +1051,15 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(store.SSHDir(), "devbox.conf"), []byte("Host devbox\n  User stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, server := range []string{"wss://padawan.example.com", "wss://devbox.example.com"} {
+	for _, tc := range []struct{ server, name string }{{"wss://padawan.example.com", "padawan"}, {"wss://devbox.example.com", "devbox"}} {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		var stdout, stderr bytes.Buffer
-		if err := store.Up(ctx, "", server, testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
-			t.Fatalf("Up(%q) without a name: %v", server, err)
+		if err := store.Up(ctx, "", tc.server, testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
+			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
 		}
-		if stderr.Len() != 0 || !strings.Contains(stdout.String(), " is up (pid ") {
-			t.Fatalf("Up(%q) printed %q and %q", server, stdout.String(), stderr.String())
+		if stderr.Len() != 0 || !strings.HasPrefix(stdout.String(), tc.name+" is up (pid ") {
+			t.Fatalf("Up(%q) printed %q and %q", tc.server, stdout.String(), stderr.String())
 		}
 	}
 }
@@ -1155,5 +1224,35 @@ func TestSessionFlagsEndpoint(t *testing.T) {
 	var notUp *session.NotUpError
 	if _, _, err := (session.Flags{Stdio: true, Name: "agent-b"}).Endpoint(logger); !errors.As(err, &notUp) {
 		t.Fatalf("Endpoint(--name) of a name that is not up = %v", err)
+	}
+}
+
+// A name that equals a value ssh prints for every host (the login in
+// `user`, a keyword such as `none` or `any`) is not ssh configuration: the
+// derived name is used as is.
+func TestSessionUpNameEqualsSSHDefault(t *testing.T) {
+	names := []string{"none", "any", "yes"}
+	if u, err := user.Current(); err == nil && session.ValidName(strings.ToLower(u.Username)) {
+		names = append(names, strings.ToLower(u.Username))
+	}
+	for _, name := range names {
+		dir := t.TempDir()
+		store := &session.Store{Dir: filepath.Join(dir, "comlink")}
+		config := filepath.Join(dir, "home", ".ssh", "config")
+		if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(config, []byte("# nothing for any host\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var stdout, stderr bytes.Buffer
+		if err := store.Up(ctx, "", "wss://"+name+".example.com", testToken, "/opt/comlink", config, &stdout, &stderr); err != nil {
+			t.Fatalf("Up for %q: %v", name, err)
+		}
+		if want := name + " is up (pid "; !strings.HasPrefix(stdout.String(), want) {
+			t.Fatalf("Up for %q stdout:\n%s\nwant prefix %q", name, stdout.String(), want)
+		}
 	}
 }

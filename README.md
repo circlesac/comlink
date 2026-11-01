@@ -46,7 +46,8 @@ session's `ProxyCommand` and you normally never run it yourself (see
 [How the Codex app connects](#how-the-codex-app-connects)). Both are
 `comlink codex` itself, with no subcommand; which flags go together is
 checked when it runs: without `--stdio`, `--server` is required, `--name`
-is optional and `--report-version` is refused; with it, exactly one of
+is optional (the session picks a free name and says which) and
+`--report-version` is refused; with it, exactly one of
 `--name` and `--server`, and `--token-file` only with `--server`.
 `comlink codex list` prints the names that are up and does not take the
 flags of `comlink codex`. There is no setup command: a session adds the one
@@ -65,7 +66,7 @@ main.go                CLI declaration and wiring
 internal/sshd/         SSH server, client-agnostic: host key, global and session requests; hands exec to a route; renders an ssh config block around a given ProxyCommand
 internal/codex/        Codex app route: command matching and the WebSocket relay
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
-internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the ssh -G check of a session name, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
+internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the static ~/.ssh/config scan of a session name, picking a free name without --name, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
 internal/upstream/     the <server>/codex and <server>/acp endpoints of a base URL; upstream WebSocket dial with the bearer token, the read limit and URL redaction in errors; token loading from a file or $COMLINK_TOKEN
 test/                  all tests, black-box through the exported API and the built binary; testdata/ holds the captured Codex commands
 ```
@@ -117,41 +118,54 @@ example-agent is up (pid 4242)
 Press Ctrl-C to stop.
 ```
 
-Pass `--name NAME` for a different alias, or to run several sessions on
-one server: a second session on the same server without `--name` gets the
-same name and is refused as already up.
+When that name is taken the session picks the next of `example-agent-2`,
+`example-agent-3`, ... and says why on the `name:` line, so several sessions
+on one server need no flags:
+
+```
+example-agent-2 is up (pid 4243)
+  name:       example-agent-2 (example-agent is already up; --name sets another)
+```
+
+A name is taken when a comlink session with it is up, or when your ssh
+configuration already applies to it: the Include line below sits at the top
+of `~/.ssh/config`, so while the session ran, `ssh <name>` would get
+comlink's block instead of yours. To tell, the session reads
+`~/.ssh/config` and the files it Includes (no ssh is run) for a `Host` line
+with a pattern that matches the name, case-insensitively with `*` and `?`
+wildcards and `!` negation (`(example-agent has ssh configuration; ...)`).
+A `Host` line that matches every name, such as `Host *`, does not count, so
+options under it like `ControlPath ~/.ssh/cm/%r@%h:%p` or
+`HostName %h.example.com` never make a name look taken. `Include` lines are
+followed wherever they are, the way ssh resolves them (relative to
+`~/.ssh`, `~` for your home, globs expanded, missing files skipped, at most
+16 deep); comlink's own session files are skipped. Two things are not
+detected: `Match` blocks, which are not evaluated because they can run
+commands (`Match exec`), and a short name that reaches a host only through
+DNS search domains. When two names in a row both have ssh
+configuration, a pattern such as `Host example-agent*` most likely matches
+every suffix, so the session stops there, exits non-zero with one line
+ending `; pass --name NAME` and writes nothing.
+
+When the server's host gives no usable alias, the base name is `comlink`
+instead: an IP address (`ws://127.0.0.1:8787`, `ws://[::1]:8787`),
+`localhost` or `*.localhost`, a first label `localhost`, or one that is not
+a valid alias. Such an alias would capture your own `ssh` to that host. The
+`name:` line says so, as in `comlink (the server host 127.0.0.1 is an IP
+address; --name sets another)`.
+
+Pass `--name NAME` to choose the alias yourself. It is used as is: a name
+that is up is refused, and one your ssh configuration already applies to
+gets a one-line warning and the session comes up:
 
 ```sh
 comlink codex --server wss://example-agent.example.com --name agent-review \
   --token-file ~/.config/comlink/token
 ```
 
-`--name` is required when the server's host is an IP address
-(`ws://127.0.0.1:8787`, `ws://[::1]:8787`) or `localhost` (or
-`*.localhost`), or when its first label is `localhost` or is not a valid
-alias. The Include line below sits at the top of `~/.ssh/config`, so an
-alias such as `localhost` or an address would capture your own `ssh` to
-that host. Such a session exits non-zero with one line ending
-`; pass --name NAME` and writes nothing.
-
-For the same reason a derived name must not be one your ssh configuration
-already knows. Before writing anything the session runs `ssh -G -F
-~/.ssh/config <name>` and the same for a random name nothing matches, and
-compares the two (with each name replaced in its own output). When they
-differ, a `Host` block or pattern, a `Match` block or a file you Include
-applies to the name, and while the session ran `ssh <name>` would get
-comlink's block instead of yours, so the session refuses:
-
 ```
-comlink: error: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); pass --name NAME to pick another alias
+comlink: warning: "agent-review" already has ssh configuration (the Host line at /home/alice/.ssh/config:4 matches it); this session's Host block takes precedence while it runs
 ```
-
-With an explicit `--name` the same check only prints a one-line warning
-and the session comes up. The check is skipped when `ssh` is not on PATH or
-`ssh -G` fails, and for a name whose comlink ssh config file is still there
-(a session that is up, or one that did not stop cleanly). A short name that
-reaches a host only through DNS search domains has no ssh configuration and
-is not detected.
 
 Before it registers anything, the session makes sure `~/.ssh/config` has
 `Include /home/alice/.local/state/comlink/ssh/*.conf` (the absolute path of
@@ -380,9 +394,10 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   as not up, `Up` driven to its ready line and ended through its context,
   `Up` without a name deriving it from the server's host (lowercased, with
   a port, a path or a trailing dot) and printing the `name:` line, an
-  explicit name used as is, and no default (one `--name` error, nothing
-  written) for an IPv4 or IPv6 address, `localhost`, `*.localhost`,
-  `localhost.<domain>` or a label that is not a valid alias,
+  explicit name used as is, `comlink` with the reason on the `name:` line
+  for an IPv4 or IPv6 address, `localhost`, `*.localhost`,
+  `localhost.<domain>` or a label that is not a valid alias, and the next
+  suffix (`padawan-3`, `comlink-2`) when names are up,
   `Resolve`, `PrintList`, the flag combinations of `comlink codex`
   (`Flags.Check`, `Flags.CheckUnset`) and the endpoint `--stdio` relays to
   (`Flags.Endpoint`, with `--server` without a state directory and with
@@ -396,11 +411,16 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   for a bad alias or server, the failure cases with no session file
   written, and a config that is a symlink (absolute, a relative chain,
   dangling, a loop): the links stay as they were and the target gets the
-  line and the backup; and the `ssh -G` check against real ssh: a derived
-  name with a `Host` block, a `Host` pattern, a `Match` block or an
-  Included `Host` block refused with nothing written, an explicit one
-  warned once and up, and a name without configuration or with only
-  comlink's own stale file up without a word.
+  line and the backup; and the static scan for the name's `Host` lines: a
+  derived name matched by a `Host` line (one of several patterns, any case,
+  `=`, quotes, `?`) or one in an Included file (absolute, relative to
+  `~/.ssh`, `~`, a glob under a block, an Include loop) skipped for
+  `devbox-2` with the reason, a pattern that matches the suffix too
+  refused with one `--name` line and nothing written, an explicit name
+  warned once naming the Host line and up, and a name only `Host *` (even
+  with `%h` options), a negation, a `Match` block (the documented gap),
+  missing Includes or comlink's own stale file apply to up without a
+  word.
 - `token_test.go`: the token from a file or `$COMLINK_TOKEN`, trimmed, the
   permission warning naming the path and a missing file.
 - `up_test.go`: the built binary with a temporary `HOME` and
@@ -416,22 +436,23 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   and adding it on top when it sits under a `Host` block, writing
   through a symlinked `~/.ssh/config`, and exiting non-zero with one error
   line and no session file for a looping link or a config it cannot back
-  up; with the real ssh and a `~/.ssh/config` that has `Host devbox`, a
-  session without `--name` for `wss://devbox.example.com` refused with one
-  line, nothing in the state directory and the config unchanged, with
-  `--name devbox` warning once and coming up, and one for another host
-  coming up silently; `codex --stdio --name`
+  up; a `~/.ssh/config` with `Host padawan*` refusing a
+  session without `--name` for `wss://padawan.example.com` with one line,
+  nothing in the state directory and the config unchanged, one with
+  `Host padawan` making it `padawan-2` with the reason and nothing written
+  for `padawan`, and `--name padawan` warning once, naming the Host line,
+  and coming up;
+  `codex --stdio --name`
   through real OpenSSH with a config that Includes the session directory, answering
   the version probe and relaying the app-server session to `<server>/codex`
   with the session's token, then failing with the not-up line once the
-  session has stopped; a session without `--name` named after its
-  server's host (uppercase, with a port and a path) and saying so, a second
-  one on the same server without `--name` refused as already up and one
-  with its own `--name` beside it; three names up at once, with and without a path
+  session has stopped; sessions without `--name` named after their
+  server's host (uppercase, with a port and a path): `padawan`, then
+  `padawan-2` and `padawan-3` saying why, all listed, `padawan` again once
+  it stopped, and `comlink` for an IP address; three names up at once, with and without a path
   prefix or trailing slash, each reaching its own server through OpenSSH;
   and the refused arguments (bad name or server, a session without
-  `--server`, a session without `--name` on an IPv4, IPv6, `localhost` or
-  `*.localhost` server, `--report-version` without `--stdio`, both or
+  `--server`, `--report-version` without `--stdio`, both or
   neither of `--name` and `--server` with `--stdio`, `--token-file` with
   `--stdio --name`, the flags of `codex` given to `list`, and the removed
   `proxy`, `up` and `ssh-include` subcommands of `codex`, top-level `up`,

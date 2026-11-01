@@ -762,9 +762,10 @@ func TestUpSeveralNames(t *testing.T) {
 }
 
 // TestUpDefaultName: without --name the session is named after the first
-// label of the server's host, lowercased, and says so; a second session on
-// the same server without --name collides with the first, and one with its
-// own --name runs beside it.
+// label of the server's host, lowercased, and says so. Further sessions on
+// the same server without --name take padawan-2, padawan-3 and say why;
+// all are listed, and once padawan stops a new session takes padawan again.
+// A server whose host gives no name (an IP address) gets comlink.
 func TestUpDefaultName(t *testing.T) {
 	bin := buildComlink(t)
 	env, _, state := sessionEnv(t)
@@ -788,50 +789,62 @@ func TestUpDefaultName(t *testing.T) {
 		t.Fatalf("ssh config %q (%v)", b, err)
 	}
 
-	stdout, stderr, code := runBinary(t, bin, env, "", "codex", "--server", server)
-	if code == 0 || stdout != "" || stderr != "comlink: error: session \"padawan\" is already up (pid "+pid+")\n" {
-		t.Fatalf("second session without --name: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	second := startUp(t, bin, env, "", server)
+	if want := "padawan-2 is up (pid " + strconv.Itoa(second.cmd.Process.Pid) + ")\n" +
+		"  name:       padawan-2 (padawan is already up; --name sets another)\n"; !strings.HasPrefix(second.ready, want) {
+		t.Fatalf("second session without --name:\n%s\nwant prefix:\n%s", second.ready, want)
 	}
-	other := startUp(t, bin, env, "padawan-2", server)
-	if !strings.HasPrefix(other.ready, "padawan-2 is up (pid ") || strings.Contains(other.ready, "name:") {
-		t.Fatalf("session with --name:\n%s", other.ready)
+	third := startUp(t, bin, env, "", server)
+	if want := "padawan-3 is up (pid " + strconv.Itoa(third.cmd.Process.Pid) + ")\n" +
+		"  name:       padawan-3 (padawan is already up, padawan-2 is already up; --name sets another)\n"; !strings.HasPrefix(third.ready, want) {
+		t.Fatalf("third session without --name:\n%s\nwant prefix:\n%s", third.ready, want)
 	}
-	stdout, _, code = runBinary(t, bin, env, "", "codex", "list")
-	if code != 0 || !strings.HasPrefix(stdout, "padawan\tup\t") || !strings.Contains(stdout, "\npadawan-2\tup\t") {
+	stdout, _, code := runBinary(t, bin, env, "", "codex", "list")
+	if code != 0 || !strings.HasPrefix(stdout, "padawan\tup\t") || !strings.Contains(stdout, "\npadawan-2\tup\t") || !strings.Contains(stdout, "\npadawan-3\tup\t") {
 		t.Fatalf("list: exit %d, stdout %q", code, stdout)
 	}
-	other.stop(t, syscall.SIGTERM)
 	up.stop(t, os.Interrupt)
+	again := startUp(t, bin, env, "", server)
+	if !strings.HasPrefix(again.ready, "padawan is up (pid ") || !strings.Contains(again.ready, "  name:       padawan, the first label") {
+		t.Fatalf("session after padawan stopped:\n%s", again.ready)
+	}
+
+	ip := startUp(t, bin, env, "", "ws://127.0.0.1:8787")
+	if want := "comlink is up (pid " + strconv.Itoa(ip.cmd.Process.Pid) + ")\n" +
+		"  name:       comlink (the server host 127.0.0.1 is an IP address; --name sets another)\n"; !strings.HasPrefix(ip.ready, want) {
+		t.Fatalf("session for an IP address:\n%s\nwant prefix:\n%s", ip.ready, want)
+	}
+	for _, p := range []*upProcess{ip, again, third, second} {
+		p.stop(t, syscall.SIGTERM)
+	}
 	if run, ssh := sessionDirs(t, state); len(run) != 0 || len(ssh) != 0 {
-		t.Fatalf("run holds %v and ssh holds %v after both sessions stopped", run, ssh)
+		t.Fatalf("run holds %v and ssh holds %v after all sessions stopped", run, ssh)
 	}
 }
 
-// TestUpExistingSSHHost: with the real ssh and a ~/.ssh/config that has a
-// Host block for the name, a session without --name is refused with one
-// line and writes nothing; with --name it warns once and comes up; a name
-// without configuration comes up silently.
+// TestUpExistingSSHHost: with a ~/.ssh/config that has a Host block for
+// the derived name, a session without --name takes padawan-2, says why and
+// writes nothing for padawan; with --name padawan it warns once, naming the
+// Host line, and comes up. A pattern that matches every suffix
+// (Host padawan*) fails with one line asking for --name and writes nothing.
 func TestUpExistingSSHHost(t *testing.T) {
-	if _, err := exec.LookPath("ssh"); err != nil {
-		t.Skip("ssh not on PATH")
-	}
 	bin := buildComlink(t)
 	env, home, state := sessionEnv(t)
 	config := filepath.Join(home, ".ssh", "config")
-	original := "Host devbox\n  User someone\n"
 	if err := os.MkdirAll(filepath.Dir(config), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, []byte(original), 0o600); err != nil {
+
+	wildcard := "Host padawan*\n  User someone\n"
+	if err := os.WriteFile(config, []byte(wildcard), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	stdout, stderr, code := runBinary(t, bin, append(env, "COMLINK_TOKEN="+testToken), "", "codex", "--server", "wss://devbox.example.com")
-	want := `comlink: error: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); pass --name NAME to pick another alias` + "\n"
+	stdout, stderr, code := runBinary(t, bin, append(env, "COMLINK_TOKEN="+testToken), "", "codex", "--server", "wss://padawan.example.com")
+	want := `comlink: error: "padawan" and "padawan-2" both have ssh configuration, so a pattern in it likely matches every padawan-N; pass --name NAME` + "\n"
 	if code == 0 || stdout != "" || stderr != want {
-		t.Fatalf("session without --name: exit %d, stdout %q, stderr %q, want %q", code, stdout, stderr, want)
+		t.Fatalf("session without --name under Host padawan*: exit %d, stdout %q, stderr %q, want %q", code, stdout, stderr, want)
 	}
-	if b, _ := os.ReadFile(config); string(b) != original {
+	if b, _ := os.ReadFile(config); string(b) != wildcard {
 		t.Fatalf("~/.ssh/config changed to %q", b)
 	}
 	if entries, err := os.ReadDir(state); err != nil || len(entries) != 0 {
@@ -839,17 +852,28 @@ func TestUpExistingSSHHost(t *testing.T) {
 	}
 	absent(t, config+".comlink-bak")
 
-	up := startUp(t, bin, env, "devbox", "wss://devbox.example.com")
-	up.stop(t, syscall.SIGTERM)
-	if !strings.HasPrefix(up.stderr.String(), `comlink: warning: "devbox" already has ssh configuration (ssh -G devbox differs from an unmatched host); this session's Host block takes precedence while it runs`+"\n") ||
-		strings.Count(up.stderr.String(), "warning") != 1 {
-		t.Fatalf("session with --name devbox printed %q", up.stderr.String())
+	if err := os.WriteFile(config, []byte("Host padawan\n  User someone\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	up = startUp(t, bin, env, "", "wss://padawan.example.com")
+	up := startUp(t, bin, env, "", "wss://padawan.example.com")
+	if want := "padawan-2 is up (pid " + strconv.Itoa(up.cmd.Process.Pid) + ")\n" +
+		"  name:       padawan-2 (padawan has ssh configuration; --name sets another)\n"; !strings.HasPrefix(up.ready, want) {
+		t.Fatalf("session without --name under Host padawan:\n%s\nwant prefix:\n%s", up.ready, want)
+	}
+	if strings.Contains(up.stderr.String(), "warning") {
+		t.Fatalf("derived session warned: %q", up.stderr.String())
+	}
+	if _, ssh := sessionDirs(t, state); len(ssh) != 1 || ssh[0] != "padawan-2.conf" {
+		t.Fatalf("ssh holds %v, want only padawan-2.conf", ssh)
+	}
+	absent(t, filepath.Join(state, "comlink", "run", "padawan.json"))
 	up.stop(t, syscall.SIGTERM)
-	if up.stderr.String() != "" {
-		t.Fatalf("session for padawan printed %q", up.stderr.String())
+
+	up = startUp(t, bin, env, "padawan", "wss://padawan.example.com")
+	up.stop(t, syscall.SIGTERM)
+	if !strings.HasPrefix(up.stderr.String(), `comlink: warning: "padawan" already has ssh configuration (the Host line at `+config+`:2 matches it); this session's Host block takes precedence while it runs`+"\n") ||
+		strings.Count(up.stderr.String(), "warning") != 1 {
+		t.Fatalf("session with --name padawan printed %q", up.stderr.String())
 	}
 }
 
@@ -883,9 +907,7 @@ func TestCodexHelp(t *testing.T) {
 }
 
 // TestUpRejectsBadArguments: a session refuses an invalid name or server
-// before writing anything and needs --server, and without --name a server
-// host that gives no default name (an IP address, localhost);
-// --report-version needs --stdio; `codex --stdio` takes exactly one of
+// before writing anything and needs --server; --report-version needs --stdio; `codex --stdio` takes exactly one of
 // --name and --server, and --token-file only with --server; list refuses
 // the flags of `codex` itself; `acp` takes --server and nothing that names a
 // session; the removed commands and flags are unknown. None of them writes
@@ -903,10 +925,6 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		{[]string{"codex", "--name", "agent"}, "comlink: error: missing flags: --server=URL"},
 		{[]string{"codex"}, "comlink: error: missing flags: --server=URL"},
 		{[]string{"codex", "--token-file", "/dev/null"}, "comlink: error: missing flags: --server=URL"},
-		{[]string{"codex", "--server", "ws://127.0.0.1:8787"}, `comlink: error: cannot name the session after server host "127.0.0.1": it is an IP address; pass --name NAME`},
-		{[]string{"codex", "--server", "wss://[::1]:8443/x"}, `comlink: error: cannot name the session after server host "::1": it is an IP address; pass --name NAME`},
-		{[]string{"codex", "--server", "ws://localhost:8787"}, `comlink: error: cannot name the session after server host "localhost": it is localhost; pass --name NAME`},
-		{[]string{"codex", "--server", "ws://x.localhost:8787", "--token-file", "/dev/null"}, `comlink: error: cannot name the session after server host "x.localhost": it is localhost; pass --name NAME`},
 		{[]string{"codex", "--name", "a", "--server", "ws://127.0.0.1:1", "--report-version", "0.200.1"}, "comlink: error: --report-version goes with --stdio"},
 		{[]string{"codex", "--stdio"}, "comlink: error: --stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
 		{[]string{"codex", "--stdio", "--token-file", "/dev/null"}, "comlink: error: --stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
