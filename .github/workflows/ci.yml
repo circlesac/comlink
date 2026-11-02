@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ fromJSON(vars.LINUX_RUNNER) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+      - run: go vet ./...
+      - run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+      - name: coverage is at least 80%
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub("%", "", $NF); print $NF }')
+          awk -v total="$total" 'BEGIN { exit !(total >= 80) }'
+      - name: build and run the binary
+        run: |
+          go build -o comlink .
+          ./comlink --help
+          ./comlink --version
