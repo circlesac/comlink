@@ -111,9 +111,12 @@ func (c *codexCmd) Run(kctx *kong.Context) error {
 		return err
 	}
 	// Run a token command once now, so a broken one fails here rather than
-	// at the Codex app's first connection; its token is not kept.
-	if _, err := cred.Bearer(); err != nil {
-		return err
+	// at the Codex app's first connection; its token is not kept. Not for
+	// arguments Up refuses anyway, so a usage error never waits on it.
+	if _, err := upstream.Endpoint(c.Server, "codex"); err == nil && (c.Name == "" || session.ValidName(c.Name)) {
+		if _, err := cred.Bearer(); err != nil {
+			return err
+		}
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -139,7 +142,7 @@ func (c *codexCmd) Run(kctx *kong.Context) error {
 // session's or the server's Codex endpoint.
 func (c *codexCmd) serve() error {
 	logger := log.New(os.Stderr, "comlink: ", 0)
-	url, token, err := c.flags().Endpoint(logger)
+	url, cred, err := c.flags().Endpoint(logger)
 	if err != nil {
 		return err
 	}
@@ -157,7 +160,7 @@ func (c *codexCmd) serve() error {
 	}
 	return sshd.Serve(&sshd.StdioConn{In: os.Stdin, Out: os.Stdout}, signer, &codex.Route{
 		Upstream:      url,
-		Token:         token,
+		Credential:    cred,
 		ReportVersion: reportVersion,
 		Logger:        logger,
 	})

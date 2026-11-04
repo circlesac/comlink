@@ -641,6 +641,17 @@ func sshConfigFor(t *testing.T, state string) string {
 	return path
 }
 
+// withPath is env with PATH set to path.
+func withPath(env []string, path string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "PATH=") {
+			out = append(out, kv)
+		}
+	}
+	return append(out, "PATH="+path)
+}
+
 // sshByName runs the real ssh client against alias through the included
 // session config, with the remote forward the Codex app asks for.
 func sshByName(env []string, config, alias, command string) *exec.Cmd {
@@ -753,9 +764,10 @@ func TestUpCodexStdioByName(t *testing.T) {
 }
 
 // TestUpCodexStdioByNameRunsTokenCommand: a session started with
-// --token-command stores the command instead of a token and runs it once at
-// start and again for every connection the Codex app opens, sending its
-// output as the bearer token.
+// --token-command stores the command (with the session's PATH and working
+// directory) instead of a token and runs it once at start and again for
+// every connection the Codex app opens, sending its output as the bearer
+// token, also when those connections run with another PATH.
 func TestUpCodexStdioByNameRunsTokenCommand(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skip("ssh not on PATH")
@@ -764,9 +776,17 @@ func TestUpCodexStdioByNameRunsTokenCommand(t *testing.T) {
 	env, _, state := sessionEnv(t)
 	server := newServerUpstream(t)
 	config := sshConfigFor(t, state)
+	// The helper is only on the session's PATH; the connections run with a
+	// PATH without it, as the Codex app's ssh does, and still find it.
+	helperDir := t.TempDir()
 	counter := filepath.Join(t.TempDir(), "runs")
-	helper := "echo run >> " + quote(counter) + "; printf %s " + testToken
-	up := startUp(t, bin, env, "agent-a", wsURLOf(server.Server), "--token-command", helper)
+	script := "#!/bin/sh\necho run >> " + quote(counter) + "\nprintf %s " + testToken + "\n"
+	if err := os.WriteFile(filepath.Join(helperDir, "example-token-helper"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := withPath(env, helperDir+":"+os.Getenv("PATH"))
+	env = withPath(env, os.Getenv("PATH"))
+	up := startUp(t, bin, sessionPath, "agent-a", wsURLOf(server.Server), "--token-command", "example-token-helper")
 	if run, _ := sessionDirs(t, state); strings.Join(run, " ") != "agent-a.json agent-a.lock agent-a.token-command" {
 		t.Fatalf("run holds %v, want the token command file and no token file", run)
 	}

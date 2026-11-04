@@ -160,8 +160,9 @@ func writeStaleSession(t *testing.T, dir, name string) {
 
 // TestSessionTokenCommand: a session started with a token command stores
 // the command (mode 0600), never a token; Load returns the command unrun;
-// Resolve runs it for each connection, so each gets the command's current
-// output, and a failing command fails Resolve; Close removes the file.
+// Resolve hands it over unrun with the pinned working directory and PATH,
+// each Bearer runs it again, a failing command fails Bearer, and a broken
+// file is an error; Close removes the file.
 func TestSessionTokenCommand(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
@@ -170,20 +171,27 @@ func TestSessionTokenCommand(t *testing.T) {
 	counter := filepath.Join(dir, "runs")
 	helper := "echo run >> " + counter + "; printf 'tok-%s' \"$(wc -l < " + counter + " | tr -d ' ')\""
 
-	sess, err := store.Start("agent-a", "wss://agent.example.com", upstream.Credential{Command: helper}, "x")
+	sess, err := store.Start("agent-a", "wss://agent.example.com", upstream.Credential{Command: helper, Dir: dir, Path: "/usr/bin:/bin"}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	absent(t, token, counter)
-	if b, err := os.ReadFile(command); err != nil || string(b) != helper || mode(t, command) != 0o600 {
+	if b, err := os.ReadFile(command); err != nil || mode(t, command) != 0o600 || !strings.Contains(string(b), `"dir":`) {
 		t.Fatalf("token command file %q (%v)", b, err)
 	}
-	if _, cred, err := store.Load("agent-a"); err != nil || cred != (upstream.Credential{Command: helper}) {
+	pinned := upstream.Credential{Command: helper, Dir: dir, Path: "/usr/bin:/bin"}
+	if _, cred, err := store.Load("agent-a"); err != nil || cred != pinned {
 		t.Fatalf("Load = %+v, %v", cred, err)
 	}
+	// Resolve hands over the command unrun; each Bearer runs it again.
+	endpoint, cred, err := store.Resolve("agent-a")
+	if err != nil || endpoint != "wss://agent.example.com/codex" || cred != pinned {
+		t.Fatalf("Resolve = %q, %+v, %v", endpoint, cred, err)
+	}
+	absent(t, counter)
 	for _, want := range []string{"tok-1", "tok-2"} {
-		if endpoint, got, err := store.Resolve("agent-a"); err != nil || endpoint != "wss://agent.example.com/codex" || got != want {
-			t.Fatalf("Resolve = %q, %q, %v, want %q", endpoint, got, err, want)
+		if got, err := cred.Bearer(); err != nil || got != want {
+			t.Fatalf("Bearer = %q, %v, want %q", got, err, want)
 		}
 	}
 	if err := sess.Close(); err != nil {
@@ -196,8 +204,17 @@ func TestSessionTokenCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = failing.Close() }()
-	if _, got, err := store.Resolve("agent-b"); err == nil || err.Error() != "token command failed: exit status 4" || got != "" {
-		t.Fatalf("Resolve with a failing command = %q, %v", got, err)
+	if _, cred, err := store.Resolve("agent-b"); err != nil || cred.Command != "exit 4" {
+		t.Fatalf("Resolve with a failing command = %+v, %v", cred, err)
+	} else if got, err := cred.Bearer(); err == nil || err.Error() != "token command failed: exit status 4" || got != "" {
+		t.Fatalf("Bearer of a failing command = %q, %v", got, err)
+	}
+	// A token command file that is not one is an error, not a missing token.
+	if err := os.WriteFile(filepath.Join(dir, "comlink", "run", "agent-b.token-command"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Load("agent-b"); err == nil || err.Error() != "read token command file: not a token command" {
+		t.Fatalf("Load of a bad token command file = %v", err)
 	}
 }
 
@@ -1350,8 +1367,8 @@ func TestSessionResolveAndPrintList(t *testing.T) {
 		{"agent-a", "wss://a.example.com/codex"},
 		{"agent-b", "wss://b.example.com/x/codex"},
 	} {
-		if url, token, err := store.Resolve(tc.name); err != nil || url != tc.want || token != testToken {
-			t.Errorf("Resolve(%q) = %q, token ok %v, %v; want %q", tc.name, url, token == testToken, err, tc.want)
+		if url, cred, err := store.Resolve(tc.name); err != nil || url != tc.want || cred.Token != testToken {
+			t.Errorf("Resolve(%q) = %q, token ok %v, %v; want %q", tc.name, url, cred.Token == testToken, err, tc.want)
 		}
 	}
 	var notUp *session.NotUpError
@@ -1448,12 +1465,12 @@ func TestSessionFlagsEndpoint(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("HOME", "")
 	t.Setenv("COMLINK_TOKEN", testToken)
-	if url, token, err := (session.Flags{Stdio: true, Server: "wss://agent.example.com/base/"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/base/codex" || token != testToken {
-		t.Fatalf("Endpoint(--server) = %q, token ok %v, %v", url, token == testToken, err)
+	if url, cred, err := (session.Flags{Stdio: true, Server: "wss://agent.example.com/base/"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/base/codex" || cred.Token != testToken {
+		t.Fatalf("Endpoint(--server) = %q, token ok %v, %v", url, cred.Token == testToken, err)
 	}
 	t.Setenv("COMLINK_TOKEN", "")
-	if url, token, err := (session.Flags{Stdio: true, Server: "ws://127.0.0.1:1", TokenFile: writeTokenFile(t, 0o600)}).Endpoint(logger); err != nil || url != "ws://127.0.0.1:1/codex" || token != testToken {
-		t.Fatalf("Endpoint(--server --token-file) = %q, token ok %v, %v", url, token == testToken, err)
+	if url, cred, err := (session.Flags{Stdio: true, Server: "ws://127.0.0.1:1", TokenFile: writeTokenFile(t, 0o600)}).Endpoint(logger); err != nil || url != "ws://127.0.0.1:1/codex" || cred.Token != testToken {
+		t.Fatalf("Endpoint(--server --token-file) = %q, token ok %v, %v", url, cred.Token == testToken, err)
 	}
 	if _, _, err := (session.Flags{Stdio: true, Server: "https://agent.example.com"}).Endpoint(logger); err == nil || err.Error() != `server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]` {
 		t.Fatalf("Endpoint(https) = %v", err)
@@ -1479,8 +1496,8 @@ func TestSessionFlagsEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sess.Close() }()
-	if url, token, err := (session.Flags{Stdio: true, Name: "agent-a"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/x/codex" || token != testToken {
-		t.Fatalf("Endpoint(--name) = %q, token ok %v, %v", url, token == testToken, err)
+	if url, cred, err := (session.Flags{Stdio: true, Name: "agent-a"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/x/codex" || cred.Token != testToken {
+		t.Fatalf("Endpoint(--name) = %q, token ok %v, %v", url, cred.Token == testToken, err)
 	}
 	var notUp *session.NotUpError
 	if _, _, err := (session.Flags{Stdio: true, Name: "agent-b"}).Endpoint(logger); !errors.As(err, &notUp) {

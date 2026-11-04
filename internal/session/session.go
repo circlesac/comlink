@@ -8,8 +8,9 @@
 //
 //	run/NAME.json   the record: name, server, the /codex endpoint and the pid
 //	run/NAME.token          the bearer token, mode 0600 (never in the record)
-//	run/NAME.token-command  instead of the token: the command that prints one,
-//	                        run for each connection, mode 0600
+//	run/NAME.token-command  instead of the token: the command that prints one
+//	                        with the working directory and PATH it was given
+//	                        with (JSON), run for each connection, mode 0600
 //	run/NAME.lock   held with flock by the session process for its lifetime
 //	ssh/NAME.conf   the ~/.ssh/config Host block for the Codex app
 //
@@ -112,6 +113,13 @@ func (e *upError) Error() string {
 	return fmt.Sprintf("session %q is already up (pid %d)", e.name, e.pid)
 }
 
+// tokenCommand is the run/NAME.token-command file.
+type tokenCommand struct {
+	Command string `json:"command"`
+	Dir     string `json:"dir"`
+	Path    string `json:"path"`
+}
+
 // Session is a registered name, held by the session process until Close.
 type Session struct {
 	Record
@@ -174,7 +182,11 @@ func (s *Store) Start(name, server string, cred upstream.Credential, sshConfig s
 func (sess *Session) write(cred upstream.Credential, sshConfig string) error {
 	s, name := sess.store, sess.Name
 	if cred.Command != "" {
-		if err := writeFile(s.commandPath(name), []byte(cred.Command), 0o600); err != nil {
+		b, err := json.Marshal(tokenCommand{Command: cred.Command, Dir: cred.Dir, Path: cred.Path})
+		if err != nil {
+			return err
+		}
+		if err := writeFile(s.commandPath(name), b, 0o600); err != nil {
 			return fmt.Errorf("write token command file: %w", err)
 		}
 	} else if err := writeFile(s.tokenPath(name), []byte(cred.Token), 0o600); err != nil {
@@ -270,7 +282,11 @@ func (s *Store) Load(name string) (Record, upstream.Credential, error) {
 	}
 	command, err := os.ReadFile(s.commandPath(name))
 	if err == nil {
-		return r, upstream.Credential{Command: string(command)}, nil
+		var tc tokenCommand
+		if err := json.Unmarshal(command, &tc); err != nil || tc.Command == "" {
+			return Record{}, upstream.Credential{}, fmt.Errorf("read token command file: not a token command")
+		}
+		return r, upstream.Credential{Command: tc.Command, Dir: tc.Dir, Path: tc.Path}, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
 		return Record{}, upstream.Credential{}, fmt.Errorf("read token command file: %w", err)

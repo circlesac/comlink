@@ -2,9 +2,11 @@ package test
 
 import (
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/circlesac/comlink/internal/upstream"
 )
@@ -83,7 +85,8 @@ func TestCredentialBearer(t *testing.T) {
 func TestLoadCredential(t *testing.T) {
 	logger := log.New(&lockedBuffer{}, "", 0)
 	t.Setenv("COMLINK_TOKEN", testToken)
-	if cred, err := upstream.LoadCredential("", "exit 1", logger); err != nil || cred != (upstream.Credential{Command: "exit 1"}) {
+	wd, _ := os.Getwd()
+	if cred, err := upstream.LoadCredential("", "exit 1", logger); err != nil || cred != (upstream.Credential{Command: "exit 1", Dir: wd, Path: os.Getenv("PATH")}) {
 		t.Fatalf("LoadCredential(command) = %+v, %v", cred, err)
 	}
 	if cred, err := upstream.LoadCredential("", "", logger); err != nil || cred != (upstream.Credential{Token: testToken}) {
@@ -92,5 +95,41 @@ func TestLoadCredential(t *testing.T) {
 	file := writeTokenFile(t, 0o600)
 	if _, err := upstream.LoadCredential(file, "x", logger); err == nil || err.Error() != "--token-file and --token-command are exclusive" {
 		t.Fatalf("LoadCredential(file, command) error %v", err)
+	}
+}
+
+// TestCredentialBearerTimeoutKillsTheGroup: a token command that outlives
+// TokenCommandTimeout is an error about the timeout, and Bearer returns
+// shortly after it even when a grandchild still holds the command's stdout,
+// because the whole process group is killed.
+func TestCredentialBearerTimeoutKillsTheGroup(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+	token, err := (upstream.Credential{Command: "sleep 600 & sleep 600; echo late"}).Bearer()
+	if err == nil || err.Error() != "token command timed out after 30s" || token != "" {
+		t.Fatalf("Bearer of a slow command = %q, %v", token, err)
+	}
+	if took := time.Since(start); took > upstream.TokenCommandTimeout+10*time.Second {
+		t.Fatalf("Bearer took %s, want about %s", took, upstream.TokenCommandTimeout)
+	}
+}
+
+// TestCredentialBearerPinsDirAndPath: the command runs in Dir with PATH set
+// to Path, whatever the caller's working directory and PATH are, so a
+// session's ProxyCommand runs it as the terminal that started the session.
+func TestCredentialBearerPinsDirAndPath(t *testing.T) {
+	dir, bin := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "example-token-helper"), []byte("#!/bin/sh\nprintf %s "+testToken+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "/usr/bin:/bin")
+	if got, err := (upstream.Credential{Command: "pwd", Dir: dir}).Bearer(); err != nil || got != mustEvalSymlinks(t, dir) && got != dir {
+		t.Fatalf("Bearer(pwd) in %s = %q, %v", dir, got, err)
+	}
+	if _, err := (upstream.Credential{Command: "example-token-helper"}).Bearer(); err == nil {
+		t.Fatal("helper found without its PATH")
+	}
+	if got, err := (upstream.Credential{Command: "example-token-helper", Path: bin + ":/usr/bin:/bin"}).Bearer(); err != nil || got != testToken {
+		t.Fatalf("Bearer with the pinned PATH = %q, %v", got, err)
 	}
 }

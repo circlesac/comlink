@@ -7,19 +7,22 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"time"
 )
 
 // Credential is where an upstream's bearer token comes from: Token as
 // given, or the standard output of Command, run each time a token is needed
-// so a short-lived token is fresh for every connection. Neither set means
-// no Authorization header.
+// so a short-lived token is fresh for every connection. Dir and Path are the
+// working directory and PATH the command was given with, so it runs the same
+// from a session's ProxyCommand (started by the Codex app's ssh, with the
+// app's environment) as in the terminal that started the session. Neither
+// Token nor Command set means no Authorization header.
 type Credential struct {
 	Token   string
 	Command string
+	Dir     string
+	Path    string
 }
 
 // TokenCommandTimeout bounds one run of a token command.
@@ -29,36 +32,44 @@ const TokenCommandTimeout = 30 * time.Second
 const tokenOutputLimit = 64 << 10
 
 // LoadCredential returns the credential of --token-file and
-// --token-command: the command when it is given (it is not run here), else
-// the token LoadToken reads from file or $COMLINK_TOKEN. The two flags are
-// exclusive.
+// --token-command: the command when it is given (it is not run here) with
+// the current working directory and PATH, else the token LoadToken reads
+// from file or $COMLINK_TOKEN. The two flags are exclusive.
 func LoadCredential(file, command string, logger *log.Logger) (Credential, error) {
 	if command != "" {
 		if file != "" {
 			return Credential{}, errors.New("--token-file and --token-command are exclusive")
 		}
-		return Credential{Command: command}, nil
+		dir, err := os.Getwd()
+		if err != nil {
+			return Credential{}, fmt.Errorf("working directory for --token-command: %w", err)
+		}
+		return Credential{Command: command, Dir: dir, Path: os.Getenv("PATH")}, nil
 	}
 	token, err := LoadToken(file, logger)
 	return Credential{Token: token}, err
 }
 
 // Bearer returns the token to send: Token, or the trimmed stdout of Command
-// run through the shell (sh -c; cmd /C on Windows) with no stdin, the
-// caller's environment and its stderr passed through. A command that fails,
-// times out, prints nothing or prints more than one line is an error, so a
-// broken helper never dials without a token. Errors never carry the output.
+// run through the shell (sh -c; cmd /C on Windows) in Dir with PATH set to
+// Path, no stdin, the rest of the caller's environment and its stderr passed
+// through. On a timeout the command's whole process group is killed. A
+// command that fails, times out, prints nothing or prints more than one line
+// is an error, so a broken helper never dials without a token. Errors never
+// carry the output.
 func (c Credential) Bearer() (string, error) {
 	if c.Command == "" {
 		return c.Token, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), TokenCommandTimeout)
 	defer cancel()
-	shell, flag := "/bin/sh", "-c"
-	if runtime.GOOS == "windows" {
-		shell, flag = "cmd", "/C"
+	cmd := shellCommand(ctx, c.Command)
+	// A grandchild that keeps stdout open would otherwise hold Run past the timeout.
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Dir = c.Dir
+	if c.Path != "" {
+		cmd.Env = append(withoutPath(os.Environ()), "PATH="+c.Path)
 	}
-	cmd := exec.CommandContext(ctx, shell, flag, c.Command)
 	var out limitedBuffer
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
@@ -80,6 +91,17 @@ func (c Credential) Bearer() (string, error) {
 		return "", errors.New("token command printed more than one line")
 	}
 	return token, nil
+}
+
+// withoutPath is env without its PATH entries.
+func withoutPath(env []string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "PATH=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // limitedBuffer keeps at most tokenOutputLimit bytes and remembers whether
