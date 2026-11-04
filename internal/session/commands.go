@@ -22,15 +22,20 @@ type Flags struct {
 	Name          string
 	Server        string
 	TokenFile     string
+	TokenCommand  string
 	ReportVersion string
 }
 
 // Check rejects the combinations `comlink codex` refuses. Without Stdio,
 // Server is required, Name is optional (Up derives it from Server) and
 // ReportVersion is refused; with it, exactly one of Name and Server is
-// required, and TokenFile goes only with Server, because a session's token
-// comes from the session.
+// required, and TokenFile and TokenCommand go only with Server, because a
+// session's token comes from the session. TokenFile and TokenCommand are
+// exclusive.
 func (f Flags) Check() error {
+	if f.TokenFile != "" && f.TokenCommand != "" {
+		return errors.New("--token-file and --token-command are exclusive")
+	}
 	if !f.Stdio {
 		if f.ReportVersion != "" {
 			return errors.New("--report-version goes with --stdio")
@@ -47,6 +52,8 @@ func (f Flags) Check() error {
 		return errors.New("--stdio takes --name or --server, not both")
 	case f.Name != "" && f.TokenFile != "":
 		return errors.New("--token-file goes with --server; a session's token comes from 'comlink codex --name NAME'")
+	case f.Name != "" && f.TokenCommand != "":
+		return errors.New("--token-command goes with --server; a session's token comes from 'comlink codex --name NAME'")
 	}
 	return nil
 }
@@ -55,26 +62,28 @@ func (f Flags) Check() error {
 // `comlink codex` (list), which kong lets inherit them.
 func (f Flags) CheckUnset(sub string) error {
 	if f != (Flags{}) {
-		return fmt.Errorf("'comlink codex %s' takes no flags; --stdio, --name, --server, --token-file and --report-version go with 'comlink codex' itself", sub)
+		return fmt.Errorf("'comlink codex %s' takes no flags; --stdio, --name, --server, --token-file, --token-command and --report-version go with 'comlink codex' itself", sub)
 	}
 	return nil
 }
 
-// Endpoint returns the Codex endpoint and token that `comlink codex --stdio`
-// relays to: the running session Name's, or <Server>/codex with the token
-// from TokenFile or $COMLINK_TOKEN (warnings go to logger). The state
+// Endpoint returns the Codex endpoint and credential that `comlink codex
+// --stdio` relays to: the running session Name's, or <Server>/codex with the
+// credential of TokenCommand, TokenFile or $COMLINK_TOKEN (warnings go to
+// logger). A token command is not run here: the relay runs it when it dials,
+// so the app's probe and setup commands never wait on it. The state
 // directory is opened only for Name.
-func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) {
+func (f Flags) Endpoint(logger *log.Logger) (endpoint string, cred upstream.Credential, err error) {
 	if f.Name == "" {
 		if endpoint, err = upstream.Endpoint(f.Server, "codex"); err != nil {
-			return "", "", err
+			return "", upstream.Credential{}, err
 		}
-		token, err = upstream.LoadToken(f.TokenFile, logger)
-		return endpoint, token, err
+		cred, err = upstream.LoadCredential(f.TokenFile, f.TokenCommand, logger)
+		return endpoint, cred, err
 	}
 	store, err := Open()
 	if err != nil {
-		return "", "", err
+		return "", upstream.Credential{}, err
 	}
 	return store.Resolve(f.Name)
 }
@@ -101,7 +110,7 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint, token string, err error) 
 // stdout, and holds the session until ctx is done. It
 // then removes the session's files and returns nil. When the Include line
 // cannot be added no session file is written.
-func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig string, stdout, stderr io.Writer) error {
+func (s *Store) Up(ctx context.Context, name, server string, cred upstream.Credential, exe, sshConfig string, stdout, stderr io.Writer) error {
 	if _, err := upstream.Endpoint(server, "codex"); err != nil {
 		return err
 	}
@@ -145,7 +154,7 @@ func (s *Store) Up(ctx context.Context, name, server, token, exe, sshConfig stri
 			}
 			included = true
 		}
-		sess, err := s.Start(name, server, token, block)
+		sess, err := s.Start(name, server, cred, block)
 		var up *upError
 		if derived && errors.As(err, &up) {
 			skipped = append(skipped, name+" is already up")
@@ -200,14 +209,15 @@ func defaultName(server string) (name, why string) {
 	return "comlink", why
 }
 
-// Resolve returns the Codex endpoint and the token of the session called
-// name. A name that is not up is a *NotUpError.
-func (s *Store) Resolve(name string) (endpoint, token string, err error) {
-	record, token, err := s.Load(name)
+// Resolve returns the Codex endpoint and the credential of the session
+// called name; its token command, if any, is not run. A name that is not up
+// is a *NotUpError.
+func (s *Store) Resolve(name string) (endpoint string, cred upstream.Credential, err error) {
+	record, cred, err := s.Load(name)
 	if err != nil {
-		return "", "", err
+		return "", upstream.Credential{}, err
 	}
-	return record.Codex, token, nil
+	return record.Codex, cred, nil
 }
 
 // PrintList prints one line per session that is up (name, pid and server

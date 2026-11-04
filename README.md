@@ -27,16 +27,17 @@ bridges stdio to the remote agent's WebSocket and ends with the client (see
   clients are the second, through `comlink acp`.
 - Commands are matched against what the client actually sends; nothing is
   ever executed. An unrecognised command is logged to stderr and exits 127.
-- The upstream token is a secret: it is read from a file or the environment
-  and never printed, logged or placed in an error.
+- The upstream token is a secret: it is read from a file, the environment or
+  the output of a token command, and never printed, logged or placed in an
+  error.
 
 ## Commands
 
 ```
-comlink codex --server URL [--name NAME] [--token-file PATH]
-comlink codex --stdio (--name NAME | --server URL [--token-file PATH]) [--report-version V]
+comlink codex --server URL [--name NAME] [--token-file PATH | --token-command CMD]
+comlink codex --stdio (--name NAME | --server URL [--token-file PATH | --token-command CMD]) [--report-version V]
 comlink codex list
-comlink acp --server URL [--token-file PATH]
+comlink acp --server URL [--token-file PATH | --token-command CMD]
 ```
 
 Commands are grouped by client. `comlink codex --server URL [--name NAME]`
@@ -48,7 +49,8 @@ session's `ProxyCommand` and you normally never run it yourself (see
 checked when it runs: without `--stdio`, `--server` is required, `--name`
 is optional (the session picks a free name and says which) and
 `--report-version` is refused; with it, exactly one of
-`--name` and `--server`, and `--token-file` only with `--server`.
+`--name` and `--server`, and `--token-file` or `--token-command` only with
+`--server`.
 `comlink codex list` prints the names that are up and does not take the
 flags of `comlink codex`. There is no setup command: a session adds the one
 line to `~/.ssh/config` that lets the Codex app find every session when it
@@ -226,11 +228,37 @@ digits, `-`, `_` and `.` that does not start with `-`; it is the ssh alias
 (which `ssh` would take for an option if it started with `-`) and part of
 the file names, so anything else is refused. The server URL is printed
 without its userinfo, query or fragment, here and in `comlink codex list`,
-in case they hold a secret. The token comes from `--token-file`, else
-`$COMLINK_TOKEN`, else the server is dialled without an `Authorization`
-header; a token file that group or others can read is used with a
-one-line warning naming the file. Check an alias by hand with
+in case they hold a secret. The token comes from `--token-file`, or from
+`--token-command`, else `$COMLINK_TOKEN`, else the server is dialled without
+an `Authorization` header; a token file that group or others can read is
+used with a one-line warning naming the file. Check an alias by hand with
 `ssh example-agent codex --version`.
+
+### Token commands
+
+`--token-command CMD` (exclusive with `--token-file`) is for short-lived
+tokens, such as an OAuth access token a login CLI keeps fresh. CMD runs
+through `sh -c` (`cmd /C` on Windows, with the command line passed as is)
+with no stdin and its stderr passed through, and its trimmed stdout is the
+token. It runs in the working directory and with the `PATH` that comlink was
+started with; a Codex session records both with the command, so the
+ProxyCommand that the Codex app's `ssh` starts, which has the app's
+environment rather than your shell's, runs it the same way. It runs each
+time comlink dials: once when `comlink acp` starts; for a Codex session once
+when the session starts (so a broken command fails there, after the name and
+server are checked) and again each time the app opens its app-server
+session, never for the app's probe, version and setup commands, which do not
+reach the server. A session therefore stores the command rather than a
+token. A command that exits non-zero, runs longer than 30 seconds (its whole
+process group is then killed), prints nothing, prints more than one line or
+more than 64 KiB is an error: comlink does not dial, and the error never
+carries the command's output. `comlink acp` and the session start exit 1;
+in the Codex app the app-server session fails with one log line, as for an
+upstream that cannot be reached:
+
+```sh
+comlink codex --server wss://agent.example.com --token-command 'example-cli auth token'
+```
 
 ### How the Codex app connects
 
@@ -248,7 +276,7 @@ closes the connection, so each connection the app opens starts its own.
 `--stdio --name NAME` reads the session's server and token. When NAME is
 not up it exits non-zero at once with one stderr line, `session "NAME" is
 not up: run 'comlink codex --name NAME --server URL' first`, which ssh
-shows. `--stdio --server URL [--token-file PATH]` takes the place of
+shows. `--stdio --server URL [--token-file PATH | --token-command CMD]` takes the place of
 `--name` for a server that is not registered as a session (with a
 hand-written `ProxyCommand`); it dials `<server>/codex`.
 
@@ -263,12 +291,15 @@ unset and the home directory cannot be determined:
 ```
 run/NAME.json    the record: name, server, the /codex endpoint, pid (mode 0600)
 run/NAME.token   the token, and nothing else (mode 0600; never in the record or the ssh config)
+run/NAME.token-command
+                 instead of NAME.token with --token-command: the command with the working
+                 directory and PATH it runs with (JSON), run for each app-server session (mode 0600)
 run/NAME.lock    held with flock by the session process for its lifetime
 ssh/NAME.conf    the Host block above (mode 0600)
 host_ed25519     the host key comlink codex --stdio pins (see below)
 ```
 
-The record, the token file and the ssh config file are each written to a
+The record, the token (or token command) file and the ssh config file are each written to a
 temporary file in the same directory (whose name matches neither `*.json`
 nor `*.conf`) and renamed into place, so ssh, the Codex app and `codex
 --stdio --name` never read a half-written file.
@@ -312,9 +343,9 @@ nothing else to set up (no session, no host key, no ssh config). `--server`
 is joined like the Codex session's: `wss://h/x` and `wss://h/x/` both dial
 `wss://h/x/acp`.
 
-The token rules are the same as for a Codex session: `--token-file`, else
-`$COMLINK_TOKEN`, else no `Authorization` header, with a warning for a token
-file others can read. comlink does not parse the messages: each stdin line
+The token rules are the same as for a Codex session: `--token-file` or
+`--token-command`, else `$COMLINK_TOKEN`, else no `Authorization` header,
+with a warning for a token file others can read. comlink does not parse the messages: each stdin line
 goes to the upstream as one text frame and each text frame comes back as one
 stdout line. A binary frame, or a text frame that contains a newline (`\n`
 or `\r`, which the client would read as several lines), is not written; comlink
@@ -397,9 +428,13 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   redacted log line, exit 1), a binary frame or a text frame holding `\n` or
   `\r` (1003, nothing of it on stdout), an oversized line
   (1009), a failed stdout write (1001); and the built binary run as an
-  agent subprocess with the token from a file or `$COMLINK_TOKEN`, dialling
+  agent subprocess with the token from a file, `$COMLINK_TOKEN` or
+  `--token-command`, dialling
   `<server>/acp` for bases with and without a path prefix or trailing slash
   and writing nothing under the home or state directory.
+- `relay_test.go` also runs a failing token command only for the relay: the
+  version and codex probes still answer, the proxy exits 1 with one log line
+  and the upstream is not dialled.
 - `openssh_test.go`: when an `ssh` binary is on `PATH`, the version probe
   (also with `--report-version`), a refusal and the proxy relay through
   real OpenSSH with the built binary as its `ProxyCommand` (`codex --stdio
@@ -414,6 +449,8 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   query, the name rule (no leading `-`), the state directory from `XDG_STATE_HOME` or the
   home directory, `Start`/`Load`/`List`/`Close` with the file modes, no
   temporary file left beside them and the token kept out of the record, a
+  token command stored instead of a token and run by every `Resolve` (a
+  failing one failing it), a
   refused second start (without a pid when the live session's record is
   missing or unreadable), `Load` reporting a held name without its token
   file as not up, a failed write undone, stale records (lock not
@@ -457,7 +494,12 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   is up and warning an explicit `comlink-x`; and an explicit name that is
   configured and up refused without the warning.
 - `token_test.go`: the token from a file or `$COMLINK_TOKEN`, trimmed, the
-  permission warning naming the path and a missing file.
+  permission warning naming the path and a missing file; a token command's
+  trimmed stdout with the caller's environment and no stdin, run in the
+  pinned working directory and `PATH`, its failure, empty, multi-line and
+  oversized output as errors without the output, a timeout that returns
+  although a background child holds stdout, and `--token-file` and
+  `--token-command` being exclusive.
 - `up_test.go`: the built binary with a temporary `HOME` and
   `XDG_STATE_HOME`. `codex --name NAME --server URL` writes the record, token and ssh config with private modes, nothing else
   and no token outside the token file, prints the alias and that it
@@ -483,15 +525,18 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   through real OpenSSH with a config that Includes the session directory, answering
   the version probe and relaying the app-server session to `<server>/codex`
   with the session's token, then failing with the not-up line once the
-  session has stopped; sessions without `--name` named after their
+  session has stopped; a session with `--token-command` storing the command,
+  running it at start and for every app-server session, also with connections
+  whose `PATH` lacks the helper, and a broken command
+  stopping the session before it registers; sessions without `--name` named after their
   server's host (uppercase, with a port and a path): `padawan`, then
   `padawan-2` and `padawan-3` saying why, all listed, `padawan` again once
   it stopped, and `comlink` for an IP address; three names up at once, with and without a path
   prefix or trailing slash, each reaching its own server through OpenSSH;
   and the refused arguments (bad name, one starting with `-`, or server, a session without
   `--server`, `--report-version` without `--stdio`, both or
-  neither of `--name` and `--server` with `--stdio`, `--token-file` with
-  `--stdio --name`, the flags of `codex` given to `list`, and the removed
+  neither of `--name` and `--server` with `--stdio`, `--token-file` or
+  `--token-command` with `--stdio --name`, the flags of `codex` given to `list`, and the removed
   `proxy`, `up` and `ssh-include` subcommands of `codex`, top-level `up`,
   `list` and `ssh-include`, `--upstream` and `acp --name`).
 

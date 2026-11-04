@@ -8,15 +8,17 @@ import (
 	"log"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/circlesac/comlink/internal/upstream"
 )
 
 // Route answers the Codex app's exec requests and relays its app-server
 // session to Upstream.
 type Route struct {
-	Upstream      string      // WebSocket endpoint that receives the agent session
-	Token         string      // bearer token for Upstream; empty sends no Authorization header
-	ReportVersion string      // version answered to codex --version
-	Logger        *log.Logger // diagnostics; never given the token
+	Upstream      string              // WebSocket endpoint that receives the agent session
+	Credential    upstream.Credential // Upstream's bearer token, resolved when the relay dials; none sends no Authorization header
+	ReportVersion string              // version answered to codex --version
+	Logger        *log.Logger         // diagnostics; never given the token
 }
 
 // Exec answers one exec request on ch and returns the exit status.

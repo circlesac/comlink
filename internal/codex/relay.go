@@ -41,7 +41,15 @@ func (r *Route) relay(ch ssh.Channel) int {
 		return 1
 	}
 	client.SetReadLimit(upstream.ReadLimit)
-	up, err := upstream.Dial(r.Upstream, r.Token)
+	// Only the relay needs the token, so a token command runs here, once per
+	// app-server session, and never for the app's probe and setup commands.
+	token, err := r.Credential.Bearer()
+	if err != nil {
+		r.Logger.Printf("upstream token: %v", err)
+		_ = client.Close(websocket.StatusInternalError, "upstream unavailable")
+		return 1
+	}
+	up, err := upstream.Dial(r.Upstream, token)
 	if err != nil {
 		// err names the upstream without its query or userinfo and never the header.
 		r.Logger.Printf("upstream connect failed: %v", err)

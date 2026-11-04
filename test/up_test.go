@@ -641,6 +641,17 @@ func sshConfigFor(t *testing.T, state string) string {
 	return path
 }
 
+// withPath is env with PATH set to path.
+func withPath(env []string, path string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "PATH=") {
+			out = append(out, kv)
+		}
+	}
+	return append(out, "PATH="+path)
+}
+
 // sshByName runs the real ssh client against alias through the included
 // session config, with the remote forward the Codex app asks for.
 func sshByName(env []string, config, alias, command string) *exec.Cmd {
@@ -750,6 +761,62 @@ func TestUpCodexStdioByName(t *testing.T) {
 	if paths, _ := server.seen(); len(paths) != 1 {
 		t.Fatalf("the server was dialled after stop: %v", paths)
 	}
+}
+
+// TestUpCodexStdioByNameRunsTokenCommand: a session started with
+// --token-command stores the command (with the session's PATH and working
+// directory) instead of a token and runs it once at start and again for
+// every connection the Codex app opens, sending its output as the bearer
+// token, also when those connections run with another PATH.
+func TestUpCodexStdioByNameRunsTokenCommand(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("ssh not on PATH")
+	}
+	bin := buildComlink(t)
+	env, _, state := sessionEnv(t)
+	server := newServerUpstream(t)
+	config := sshConfigFor(t, state)
+	// The helper is only on the session's PATH; the connections run with a
+	// PATH without it, as the Codex app's ssh does, and still find it.
+	helperDir := t.TempDir()
+	counter := filepath.Join(t.TempDir(), "runs")
+	script := "#!/bin/sh\necho run >> " + quote(counter) + "\nprintf %s " + testToken + "\n"
+	if err := os.WriteFile(filepath.Join(helperDir, "example-token-helper"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := withPath(env, helperDir+":"+os.Getenv("PATH"))
+	env = withPath(env, os.Getenv("PATH"))
+	up := startUp(t, bin, sessionPath, "agent-a", wsURLOf(server.Server), "--token-command", "example-token-helper")
+	if run, _ := sessionDirs(t, state); strings.Join(run, " ") != "agent-a.json agent-a.lock agent-a.token-command" {
+		t.Fatalf("run holds %v, want the token command file and no token file", run)
+	}
+	runs := func() int {
+		b, _ := os.ReadFile(counter)
+		return strings.Count(string(b), "run")
+	}
+	if n := runs(); n != 1 {
+		t.Fatalf("token command ran %d times at start, want 1", n)
+	}
+	codexRelayByName(t, env, config, "agent-a")
+	codexRelayByName(t, env, config, "agent-a")
+	if paths, auths := server.seen(); len(paths) != 2 || auths[0] != "Bearer "+testToken || auths[1] != "Bearer "+testToken {
+		t.Fatalf("server saw paths %v with Authorization %q", paths, auths)
+	}
+	if n := runs(); n != 3 {
+		t.Fatalf("token command ran %d times, want once at start and once per connection", n)
+	}
+	up.stop(t, syscall.SIGTERM)
+	absent(t, filepath.Join(state, "comlink", "run", "agent-a.token-command"))
+	if strings.Contains(up.stderr.String(), testToken) {
+		t.Fatal("stderr contains the token")
+	}
+
+	// A broken command stops the session before anything is registered.
+	stdout, stderr, code := runBinary(t, bin, env, "", "codex", "--name", "agent-b", "--server", "wss://agent.example.com", "--token-command", "exit 5")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "token command failed: exit status 5") {
+		t.Fatalf("broken token command: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	absent(t, filepath.Join(state, "comlink", "run", "agent-b.json"))
 }
 
 // TestUpSeveralNames: names up at once each route to their own server
@@ -967,7 +1034,7 @@ func TestUpRejectsBadArguments(t *testing.T) {
 		{[]string{"codex", "--stdio", "--name", "two words"}, `comlink: error: invalid name "two words": use only letters, digits, '-', '_' and '.', not starting with '-'`},
 		{[]string{"codex", "--stdio", "--server", "https://agent.example.com"}, `comlink: error: server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
 		{[]string{"codex", "--stdio", "--upstream", "ws://127.0.0.1:1"}, "comlink: error: unknown flag --upstream"},
-		{[]string{"codex", "list", "--name", "a"}, "comlink: error: 'comlink codex list' takes no flags; --stdio, --name, --server, --token-file and --report-version go with 'comlink codex' itself"},
+		{[]string{"codex", "list", "--name", "a"}, "comlink: error: 'comlink codex list' takes no flags; --stdio, --name, --server, --token-file, --token-command and --report-version go with 'comlink codex' itself"},
 		{[]string{"codex", "ssh-include"}, "comlink: error: unexpected argument ssh-include"},
 		{[]string{"codex", "proxy", "--name", "a"}, "comlink: error: unexpected argument proxy"},
 		{[]string{"codex", "up", "--name", "a", "--server", "ws://127.0.0.1:1"}, "comlink: error: unexpected argument up"},

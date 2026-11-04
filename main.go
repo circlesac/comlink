@@ -47,20 +47,22 @@ type codexCmd struct {
 	Name          string `group:"codex" placeholder:"NAME" help:"Session name: the SSH alias the Codex app connects to. Defaults to the first label of the server's host (wss://padawan.example.com gives padawan; comlink for an IP address or localhost), followed by -2, -3, ... when that name is up or already has ssh configuration. With --stdio, the running session to reach."`
 	Server        string `group:"codex" placeholder:"URL" help:"comlink server base URL (ws:// or wss://); the Codex app reaches <server>/codex."`
 	TokenFile     string `group:"codex" type:"path" placeholder:"PATH" help:"File whose trimmed contents are the server's bearer token. Falls back to $COMLINK_TOKEN. Not with --stdio --name: a session's token comes from the session."`
+	TokenCommand  string `group:"codex" placeholder:"COMMAND" help:"Shell command whose trimmed stdout is the server's bearer token, run for every connection (a session stores the command, not a token). Exclusive with --token-file. Not with --stdio --name."`
 	ReportVersion string `group:"codex" placeholder:"VERSION" help:"With --stdio: Codex version reported to 'codex --version' (default 0.165.0)."`
 
 	List codexListCmd `cmd:"" name:"list" help:"Print the Codex sessions that are up."`
 }
 
 func (c *codexCmd) flags() session.Flags {
-	return session.Flags{Stdio: c.Stdio, Name: c.Name, Server: c.Server, TokenFile: c.TokenFile, ReportVersion: c.ReportVersion}
+	return session.Flags{Stdio: c.Stdio, Name: c.Name, Server: c.Server, TokenFile: c.TokenFile, TokenCommand: c.TokenCommand, ReportVersion: c.ReportVersion}
 }
 
 type codexListCmd struct{}
 
 type acpCmd struct {
-	Server    string `required:"" placeholder:"URL" help:"comlink server base URL (ws:// or wss://); dials <server>/acp."`
-	TokenFile string `type:"path" placeholder:"PATH" help:"File whose trimmed contents are the server's bearer token. Falls back to $COMLINK_TOKEN."`
+	Server       string `required:"" placeholder:"URL" help:"comlink server base URL (ws:// or wss://); dials <server>/acp."`
+	TokenFile    string `type:"path" placeholder:"PATH" help:"File whose trimmed contents are the server's bearer token. Falls back to $COMLINK_TOKEN."`
+	TokenCommand string `placeholder:"COMMAND" help:"Shell command whose trimmed stdout is the server's bearer token, run when the bridge connects. Exclusive with --token-file."`
 }
 
 func main() {
@@ -104,9 +106,17 @@ func (c *codexCmd) Run(kctx *kong.Context) error {
 	if c.Stdio {
 		return c.serve()
 	}
-	token, err := upstream.LoadToken(c.TokenFile, log.New(os.Stderr, "comlink: ", 0))
+	cred, err := upstream.LoadCredential(c.TokenFile, c.TokenCommand, log.New(os.Stderr, "comlink: ", 0))
 	if err != nil {
 		return err
+	}
+	// Run a token command once now, so a broken one fails here rather than
+	// at the Codex app's first connection; its token is not kept. Not for
+	// arguments Up refuses anyway, so a usage error never waits on it.
+	if _, err := upstream.Endpoint(c.Server, "codex"); err == nil && (c.Name == "" || session.ValidName(c.Name)) {
+		if _, err := cred.Bearer(); err != nil {
+			return err
+		}
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -125,14 +135,14 @@ func (c *codexCmd) Run(kctx *kong.Context) error {
 	// removes the files.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
-	return store.Up(ctx, c.Name, c.Server, token, exe, sshConfig, os.Stdout, os.Stderr)
+	return store.Up(ctx, c.Name, c.Server, cred, exe, sshConfig, os.Stdout, os.Stderr)
 }
 
 // serve is --stdio: one SSH connection on stdin/stdout, relayed to the
 // session's or the server's Codex endpoint.
 func (c *codexCmd) serve() error {
 	logger := log.New(os.Stderr, "comlink: ", 0)
-	url, token, err := c.flags().Endpoint(logger)
+	url, cred, err := c.flags().Endpoint(logger)
 	if err != nil {
 		return err
 	}
@@ -150,7 +160,7 @@ func (c *codexCmd) serve() error {
 	}
 	return sshd.Serve(&sshd.StdioConn{In: os.Stdin, Out: os.Stdout}, signer, &codex.Route{
 		Upstream:      url,
-		Token:         token,
+		Credential:    cred,
 		ReportVersion: reportVersion,
 		Logger:        logger,
 	})
@@ -173,7 +183,11 @@ func (c *acpCmd) Run() error {
 	if err != nil {
 		return err
 	}
-	token, err := upstream.LoadToken(c.TokenFile, logger)
+	cred, err := upstream.LoadCredential(c.TokenFile, c.TokenCommand, logger)
+	if err != nil {
+		return err
+	}
+	token, err := cred.Bearer()
 	if err != nil {
 		return err
 	}

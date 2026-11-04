@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/circlesac/comlink/internal/codex"
 	"github.com/circlesac/comlink/internal/sshd"
+	comlinkup "github.com/circlesac/comlink/internal/upstream"
 )
 
 // proxySession starts the captured proxy command on a session, consumes the
@@ -70,7 +73,7 @@ func (c eofOKCloser) Close() error {
 
 func TestProxyRelaysMessagesToUpstreamWithToken(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, _ := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
+	client, _ := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: comlinkup.Credential{Token: testToken}})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -136,7 +139,7 @@ func TestProxyWithoutTokenSendsNoAuthorization(t *testing.T) {
 
 func TestProxyWithWrongTokenExitsOne(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: "wrong-token"})
+	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: comlinkup.Credential{Token: "wrong-token"}})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -154,6 +157,42 @@ func TestProxyWithWrongTokenExitsOne(t *testing.T) {
 	}
 	if strings.Contains(logBuf.String(), "wrong-token") {
 		t.Fatalf("server log %q contains the token", logBuf.String())
+	}
+}
+
+// TestProxyTokenCommandRunsOnlyForTheRelay: the token command runs when the
+// relay dials, not for the app's probe and version commands, so a failing
+// helper leaves them answering; the proxy then exits 1 with one log line
+// naming the failure, never the output, and the upstream is not dialled.
+func TestProxyTokenCommandRunsOnlyForTheRelay(t *testing.T) {
+	upstream := newEchoUpstream(t)
+	counter := filepath.Join(t.TempDir(), "runs")
+	failing := comlinkup.Credential{Command: "echo run >> " + counter + "; printf %s " + testToken + "; exit 3"}
+	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: failing, ReportVersion: "0.165.0"})
+	if out, _, status := run(t, client, readFixture(t, "codex-app-version.txt")); status != 0 || out != "codex-cli 0.165.0\n" {
+		t.Fatalf("version probe with a failing helper: status %d stdout %q", status, out)
+	}
+	if _, _, status := run(t, client, readFixture(t, "codex-app-probe.txt")); status != 0 {
+		t.Fatalf("codex probe with a failing helper: status %d", status)
+	}
+	if _, err := os.Stat(counter); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the token command ran for a probe (%v)", err)
+	}
+	sess, conn := proxySession(t, client)
+	ws := dialOverConn(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, _, err := ws.Read(ctx); websocket.CloseStatus(err) != websocket.StatusInternalError {
+		t.Fatalf("read err = %v, want close status %d", err, websocket.StatusInternalError)
+	}
+	if got := exitStatus(t, sess.Wait()); got != 1 {
+		t.Fatalf("exit status = %d, want 1", got)
+	}
+	if want := "comlink: upstream token: token command failed: exit status 3\n"; logBuf.String() != want {
+		t.Fatalf("server log %q, want %q", logBuf.String(), want)
+	}
+	if len(upstream.seenAuths()) != 0 {
+		t.Fatal("the upstream was dialled without a token")
 	}
 }
 
@@ -196,7 +235,7 @@ func TestProxyUpstreamURLIsRedactedInLog(t *testing.T) {
 
 func TestProxyWithoutHTTPUpgradeExitsOne(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
+	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: comlinkup.Credential{Token: testToken}})
 	sess, conn := proxySession(t, client)
 
 	// The client sends EOF before any request.
@@ -216,7 +255,7 @@ func TestProxyWithoutHTTPUpgradeExitsOne(t *testing.T) {
 
 func TestProxyRejectsPlainHTTPRequest(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
+	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: comlinkup.Credential{Token: testToken}})
 	sess, conn := proxySession(t, client)
 
 	if _, err := io.WriteString(conn, "GET /rpc HTTP/1.1\r\nHost: codex-app-server\r\n\r\n"); err != nil {
@@ -338,7 +377,7 @@ func TestProxyUpstreamDroppingExitsOne(t *testing.T) {
 // went away (1001), not that something failed.
 func TestProxyClientDroppingExitsOne(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
+	client, logBuf := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: comlinkup.Credential{Token: testToken}})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 	defer func() { _ = ws.CloseNow() }()
@@ -370,7 +409,7 @@ func TestProxyClientDroppingExitsOne(t *testing.T) {
 // status is a real failure, so the upstream gets 1011 and the command exits 1.
 func TestProxyClientFailureIsPassedOn(t *testing.T) {
 	upstream := newEchoUpstream(t)
-	client, _ := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Token: testToken})
+	client, _ := startCodex(t, codex.Route{Upstream: upstream.wsURL(), Credential: comlinkup.Credential{Token: testToken}})
 	sess, conn := proxySession(t, client)
 	ws := dialOverConn(t, conn)
 
@@ -419,7 +458,7 @@ func TestProxyBlockedWriteEndsWhenClientConnectionCloses(t *testing.T) {
 	var logBuf lockedBuffer
 	route := &codex.Route{
 		Upstream:      upstream.wsURL(),
-		Token:         testToken,
+		Credential:    comlinkup.Credential{Token: testToken},
 		ReportVersion: "0.165.0",
 		Logger:        log.New(&logBuf, "comlink: ", 0),
 	}
