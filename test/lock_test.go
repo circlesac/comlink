@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/circlesac/comlink/internal/session"
+	"github.com/circlesac/comlink/internal/upstream"
 )
 
 // TestSessionLockLooks: a session holds its lock exclusively and a look at
@@ -42,7 +43,7 @@ func TestSessionLockLooks(t *testing.T) {
 	}
 	absent(t, record, token, conf)
 
-	sess, err := store.Start("held", "wss://agent.example.com", testToken, "x")
+	sess, err := store.Start("held", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +54,7 @@ func TestSessionLockLooks(t *testing.T) {
 	if live, _, err := store.List(); err != nil || len(live) != 1 || live[0].Name != "held" {
 		t.Fatalf("List with a held name = %+v, %v", live, err)
 	}
-	if _, err := store.Start("held", "wss://other.example.com", "", "y"); err == nil || err.Error() != `session "held" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
+	if _, err := store.Start("held", "wss://other.example.com", upstream.Credential{}, "y"); err == nil || err.Error() != `session "held" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
 		t.Fatalf("Start of a held name: %v", err)
 	}
 }

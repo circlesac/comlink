@@ -605,6 +605,7 @@ func TestBinaryACPServer(t *testing.T) {
 		{base + "/", nil, "/acp"},
 		{base + "/tenant/x", nil, "/tenant/x/acp"},
 		{base + "/tenant/x/", []string{"--token-file", tokenFile}, "/tenant/x/acp"},
+		{base, []string{"--token-command", "printf %s " + testToken}, "/acp"},
 	} {
 		runEnv := env
 		if tc.args == nil {
@@ -620,5 +621,10 @@ func TestBinaryACPServer(t *testing.T) {
 		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
 			t.Errorf("%s holds %v (%v) after acp sessions", dir, entries, err)
 		}
+	}
+	// --token-file and --token-command are exclusive, as for comlink codex.
+	tokenCommandFile := writeTokenFile(t, 0o600)
+	if stdout, stderr, code := runBinary(t, bin, env, "", "acp", "--server", base, "--token-file", tokenCommandFile, "--token-command", "true"); code != 1 || stdout != "" || stderr != "comlink: error: --token-file and --token-command are exclusive\n" {
+		t.Errorf("acp with both token flags: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 }

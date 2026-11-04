@@ -7,11 +7,13 @@
 // default ~/.local/state/comlink):
 //
 //	run/NAME.json   the record: name, server, the /codex endpoint and the pid
-//	run/NAME.token  the bearer token, mode 0600 (never in the record)
+//	run/NAME.token          the bearer token, mode 0600 (never in the record)
+//	run/NAME.token-command  instead of the token: the command that prints one,
+//	                        run for each connection, mode 0600
 //	run/NAME.lock   held with flock by the session process for its lifetime
 //	ssh/NAME.conf   the ~/.ssh/config Host block for the Codex app
 //
-// The record, the token file and the ssh config file are each written to a
+// The record, the token (or token command) file and the ssh config file are each written to a
 // temporary file in the same directory and renamed into place, so ssh, the
 // Codex app and `codex --stdio --name` never read a half-written file.
 //
@@ -73,8 +75,11 @@ func (s *Store) SSHDir() string { return filepath.Join(s.Dir, "ssh") }
 func (s *Store) runDir() string             { return filepath.Join(s.Dir, "run") }
 func (s *Store) recordPath(n string) string { return filepath.Join(s.runDir(), n+".json") }
 func (s *Store) tokenPath(n string) string  { return filepath.Join(s.runDir(), n+".token") }
-func (s *Store) lockPath(n string) string   { return filepath.Join(s.runDir(), n+".lock") }
-func (s *Store) confPath(n string) string   { return filepath.Join(s.SSHDir(), n+".conf") }
+func (s *Store) commandPath(n string) string {
+	return filepath.Join(s.runDir(), n+".token-command")
+}
+func (s *Store) lockPath(n string) string { return filepath.Join(s.runDir(), n+".lock") }
+func (s *Store) confPath(n string) string { return filepath.Join(s.SSHDir(), n+".conf") }
 
 // ValidName reports whether name is a non-empty run of letters, digits,
 // '-', '_' and '.' that does not start with '-': it is a file name here and
@@ -115,11 +120,12 @@ type Session struct {
 	lock     *os.File
 }
 
-// Start registers name with server and token, writes sshConfig as the
+// Start registers name with server and credential cred (its token, or its
+// token command, which is stored rather than run), writes sshConfig as the
 // name's ssh config file, and returns the session, which stays up until
 // Close. It fails when name is already up. A stale record (its session
 // process is gone) is removed and replaced, and returned as Replaced.
-func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
+func (s *Store) Start(name, server string, cred upstream.Credential, sshConfig string) (*Session, error) {
 	if !ValidName(name) {
 		return nil, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
 	}
@@ -156,18 +162,22 @@ func (s *Store) Start(name, server, token, sshConfig string) (*Session, error) {
 		sess.Replaced = &old
 	}
 	s.removeFiles(name)
-	if err := sess.write(token, sshConfig); err != nil {
+	if err := sess.write(cred, sshConfig); err != nil {
 		_ = sess.Close()
 		return nil, err
 	}
 	return sess, nil
 }
 
-// write creates the token file, the ssh config file and the record, each
-// renamed into place whole.
-func (sess *Session) write(token, sshConfig string) error {
+// write creates the token file (or, for a token command, the token command
+// file), the ssh config file and the record, each renamed into place whole.
+func (sess *Session) write(cred upstream.Credential, sshConfig string) error {
 	s, name := sess.store, sess.Name
-	if err := writeFile(s.tokenPath(name), []byte(token), 0o600); err != nil {
+	if cred.Command != "" {
+		if err := writeFile(s.commandPath(name), []byte(cred.Command), 0o600); err != nil {
+			return fmt.Errorf("write token command file: %w", err)
+		}
+	} else if err := writeFile(s.tokenPath(name), []byte(cred.Token), 0o600); err != nil {
 		return fmt.Errorf("write token file: %w", err)
 	}
 	if err := writeFile(s.confPath(name), []byte(sshConfig), 0o600); err != nil {
@@ -223,6 +233,7 @@ func (sess *Session) Close() error {
 func (s *Store) removeFiles(name string) {
 	_ = os.Remove(s.recordPath(name))
 	_ = os.Remove(s.tokenPath(name))
+	_ = os.Remove(s.commandPath(name))
 	_ = os.Remove(s.confPath(name))
 }
 
@@ -239,34 +250,41 @@ func (s *Store) read(name string) (Record, error) {
 	return r, nil
 }
 
-// Load returns the record and the token of name when it is up, and a
-// *NotUpError when it has no record or token file (as inside Close) or its
-// session process is gone. It does
-// not remove a stale record; List and Start do.
-func (s *Store) Load(name string) (Record, string, error) {
+// Load returns the record and the credential of name when it is up (a
+// token command is returned, not run), and a *NotUpError when it has no
+// record or token file (as inside Close) or its session process is gone. It
+// does not remove a stale record; List and Start do.
+func (s *Store) Load(name string) (Record, upstream.Credential, error) {
 	if !ValidName(name) {
-		return Record{}, "", fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
+		return Record{}, upstream.Credential{}, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
 	}
 	r, err := s.read(name)
 	if errors.Is(err, fs.ErrNotExist) {
-		return Record{}, "", &NotUpError{Name: name}
+		return Record{}, upstream.Credential{}, &NotUpError{Name: name}
 	}
 	if err != nil {
-		return Record{}, "", err
+		return Record{}, upstream.Credential{}, err
 	}
 	if !held(s.lockPath(name), r.PID) {
-		return Record{}, "", &NotUpError{Name: name}
+		return Record{}, upstream.Credential{}, &NotUpError{Name: name}
+	}
+	command, err := os.ReadFile(s.commandPath(name))
+	if err == nil {
+		return r, upstream.Credential{Command: string(command)}, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return Record{}, upstream.Credential{}, fmt.Errorf("read token command file: %w", err)
 	}
 	token, err := os.ReadFile(s.tokenPath(name))
 	if errors.Is(err, fs.ErrNotExist) {
 		// Close removes the files before it releases the lock, so a session
 		// that is ending can be held without its token.
-		return Record{}, "", &NotUpError{Name: name}
+		return Record{}, upstream.Credential{}, &NotUpError{Name: name}
 	}
 	if err != nil {
-		return Record{}, "", fmt.Errorf("read token file: %w", err)
+		return Record{}, upstream.Credential{}, fmt.Errorf("read token file: %w", err)
 	}
-	return r, strings.TrimSpace(string(token)), nil
+	return r, upstream.Credential{Token: strings.TrimSpace(string(token))}, nil
 }
 
 // List returns the records that are up, sorted by name, and removes and

@@ -45,3 +45,52 @@ func TestUpstreamLoadToken(t *testing.T) {
 		t.Fatalf("LoadToken(missing) = %q, %v", token, err)
 	}
 }
+
+// TestCredentialBearer: a token is returned as given; a token command's
+// stdout is trimmed and returned, with the caller's environment and no
+// stdin; a command that fails, prints nothing, prints two lines or prints
+// too much is an error that never carries its output.
+func TestCredentialBearer(t *testing.T) {
+	if token, err := (upstream.Credential{Token: testToken}).Bearer(); err != nil || token != testToken {
+		t.Fatalf("Bearer of a token = %q, %v", token, err)
+	}
+	if token, err := (upstream.Credential{}).Bearer(); err != nil || token != "" {
+		t.Fatalf("Bearer of nothing = %q, %v", token, err)
+	}
+	t.Setenv("COMLINK_TEST_SECRET", testToken)
+	if token, err := (upstream.Credential{Command: `printf '  %s\n' "$COMLINK_TEST_SECRET"`}).Bearer(); err != nil || token != testToken {
+		t.Fatalf("Bearer of a command = %q, %v", token, err)
+	}
+	for _, tc := range []struct{ command, want string }{
+		{"printf %s " + testToken + "; exit 3", "token command failed: exit status 3"},
+		{"true", "token command printed no token"},
+		{"cat", "token command printed no token"}, // stdin is empty, not the caller's
+		{`printf 'a\nb'`, "token command printed more than one line"},
+		{"head -c 70000 /dev/zero | tr '\\0' a", "token command printed more than 65536 bytes"},
+	} {
+		token, err := (upstream.Credential{Command: tc.command}).Bearer()
+		if err == nil || err.Error() != tc.want || token != "" {
+			t.Errorf("Bearer(%q) = %q, %v, want error %q", tc.command, token, err, tc.want)
+		}
+		if err != nil && strings.Contains(err.Error(), testToken) {
+			t.Errorf("Bearer(%q) error carries the output", tc.command)
+		}
+	}
+}
+
+// TestLoadCredential: --token-command is taken as is (not run), and is
+// exclusive with --token-file; otherwise the token comes from LoadToken.
+func TestLoadCredential(t *testing.T) {
+	logger := log.New(&lockedBuffer{}, "", 0)
+	t.Setenv("COMLINK_TOKEN", testToken)
+	if cred, err := upstream.LoadCredential("", "exit 1", logger); err != nil || cred != (upstream.Credential{Command: "exit 1"}) {
+		t.Fatalf("LoadCredential(command) = %+v, %v", cred, err)
+	}
+	if cred, err := upstream.LoadCredential("", "", logger); err != nil || cred != (upstream.Credential{Token: testToken}) {
+		t.Fatalf("LoadCredential(env) = %+v, %v", cred, err)
+	}
+	file := writeTokenFile(t, 0o600)
+	if _, err := upstream.LoadCredential(file, "x", logger); err == nil || err.Error() != "--token-file and --token-command are exclusive" {
+		t.Fatalf("LoadCredential(file, command) error %v", err)
+	}
+}
