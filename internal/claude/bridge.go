@@ -28,9 +28,9 @@ import (
 
 // methods is what the bridge serves, announced in server.capabilities so the
 // app asks for nothing else.
-var methods = []string{"server.ping", "server.capabilities", "server.shutdown", "files.list", "files.stat", "files.read", "files.realpath", "git.info", "process.spawn", "process.stdin", "process.kill", "process.killAndWait", "process.reattach", "process.resize", "plugins.prune"}
+var methods = []string{"server.ping", "server.capabilities", "server.shutdown", "files.list", "files.stat", "files.read", "files.realpath", "files.extract_tar", "git.info", "process.spawn", "process.stdin", "process.kill", "process.killAndWait", "process.reattach", "process.resize", "plugins.prune"}
 
-var features = []string{"process.stdin.offset", "server.line_end", "server.instance_id", "files.list.includeDotNames"}
+var features = []string{"process.stdin.offset", "server.line_end", "server.instance_id", "files.list.includeDotNames", "files.extract_tar.execBit"}
 
 type request struct {
 	ID     json.RawMessage `json:"id"`
@@ -280,6 +280,8 @@ func (b *bridge) handle(req *request) (any, *rpcError) {
 	r := b.route
 	var p struct {
 		Path            string            `json:"path"`
+		ArchivePath     string            `json:"archivePath"`
+		DestDir         string            `json:"destDir"`
 		MaxBytes        int               `json:"maxBytes"`
 		IncludeDotNames bool              `json:"includeDotNames"`
 		ID              string            `json:"id"`
@@ -337,6 +339,17 @@ func (b *bridge) handle(req *request) (any, *rpcError) {
 		return map[string]any{"entries": entries}, nil
 	case "files.realpath":
 		return map[string]any{"path": clean(p.Path)}, nil
+	case "files.extract_tar":
+		// The app uploads a plugin as a tar over SFTP, then has it unpacked
+		// into the plugin directory, which it marks with .synced.
+		if p.ArchivePath == "" || p.DestDir == "" {
+			return nil, &rpcError{-32602, "archivePath and destDir are required"}
+		}
+		if err := r.fs.extractTar(p.ArchivePath, p.DestDir); err != nil {
+			return map[string]any{"success": false, "error": err.Error()}, nil
+		}
+		r.fs.put(clean(p.DestDir)+"/.synced", nil, 0o600)
+		return map[string]any{"success": true}, nil
 	case "git.info":
 		return map[string]any{"isRepo": false, "repoSlug": "", "defaultBranch": ""}, nil
 	case "plugins.prune":

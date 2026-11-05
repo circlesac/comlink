@@ -38,8 +38,16 @@ type redirs struct {
 // run interprets line and returns its exit status. exec is true when the
 // line ended in an `exec` builtin.
 func (s *shell) run(line string) int {
-	status := 0
-	for _, seg := range splitLine(line) {
+	status, _ := s.exec(splitLine(line))
+	return status
+}
+
+// exec runs segments in order, honouring `&&` and `||` and the `for ... do
+// ... done` and `if ... then ... else ... fi` constructs the app's scripts
+// use. stop is true when an exec or exit builtin ended the script.
+func (s *shell) exec(segs []segment) (status int, stop bool) {
+	for i := 0; i < len(segs); i++ {
+		seg := segs[i]
 		switch seg.op {
 		case "&&":
 			if status != 0 {
@@ -50,14 +58,114 @@ func (s *shell) run(line string) int {
 				continue
 			}
 		}
-		var stop bool
-		status, stop = s.command(seg.text)
+		switch {
+		case strings.HasPrefix(seg.text, "for "):
+			body, end := block(segs, i, "for ", "done")
+			status, stop = s.forLoop(seg.text, body)
+			i = end
+		case strings.HasPrefix(seg.text, "if "):
+			body, end := block(segs, i, "if ", "fi")
+			status, stop = s.ifThen(seg.text, body)
+			i = end
+		default:
+			status, stop = s.command(seg.text)
+		}
 		s.status = status
 		if stop {
-			return status
+			return status, true
 		}
 	}
-	return status
+	return status, false
+}
+
+// block returns the segments between the construct starting at segs[start]
+// (a `for` or `if`) and its closing keyword, nesting counted, and the index
+// of that keyword (the last segment when it is missing).
+func block(segs []segment, start int, open, closing string) (body []segment, end int) {
+	depth := 0
+	for i := start + 1; i < len(segs); i++ {
+		t := segs[i].text
+		switch {
+		case strings.HasPrefix(t, open):
+			depth++
+		case t == closing:
+			if depth == 0 {
+				return segs[start+1 : i], i
+			}
+			depth--
+		}
+	}
+	return segs[start+1:], len(segs) - 1
+}
+
+// forLoop runs `for VAR in WORDS` (head) over body, whose first segment
+// starts with `do`.
+func (s *shell) forLoop(head string, body []segment) (status int, stop bool) {
+	w, _ := s.words(strings.TrimPrefix(head, "for "))
+	if len(w) < 2 || w[1] != "in" {
+		return 2, false
+	}
+	body = stripKeyword(body, "do")
+	if s.vars == nil {
+		s.vars = map[string]string{}
+	}
+	for _, item := range w[2:] {
+		s.vars[w[0]] = item
+		if status, stop = s.exec(body); stop {
+			return status, true
+		}
+	}
+	return status, false
+}
+
+// ifThen runs the condition of `if COND` (head) and then the `then` part of
+// body, or its `else` part.
+func (s *shell) ifThen(head string, body []segment) (status int, stop bool) {
+	cond, stop := s.exec(splitLine(strings.TrimPrefix(head, "if ")))
+	if stop {
+		return cond, true
+	}
+	var thenPart, elsePart []segment
+	depth := 0
+	part := &thenPart
+	for _, seg := range body {
+		switch {
+		case strings.HasPrefix(seg.text, "if "):
+			depth++
+		case seg.text == "fi":
+			depth--
+		case depth == 0 && (seg.text == "else" || strings.HasPrefix(seg.text, "else ")):
+			part = &elsePart
+			if seg.text != "else" {
+				*part = append(*part, segment{text: strings.TrimPrefix(seg.text, "else ")})
+			}
+			continue
+		}
+		*part = append(*part, seg)
+	}
+	if cond == 0 {
+		return s.exec(stripKeyword(thenPart, "then"))
+	}
+	if len(elsePart) == 0 {
+		return 0, false
+	}
+	return s.exec(elsePart)
+}
+
+// stripKeyword removes the keyword that opens the first segment of body
+// (`do`, `then`), alone or before a command.
+func stripKeyword(body []segment, keyword string) []segment {
+	if len(body) == 0 {
+		return body
+	}
+	out := append([]segment(nil), body...)
+	switch {
+	case out[0].text == keyword:
+		out = out[1:]
+	case strings.HasPrefix(out[0].text, keyword+" "):
+		out[0].text = strings.TrimPrefix(out[0].text, keyword+" ")
+	}
+	return out
 }
 
 // segment is one simple command of a line and the operator before it.
@@ -224,6 +332,30 @@ func (s *shell) expand(t string) (string, int) {
 	if len(t) < 2 {
 		return "$", 1
 	}
+	if strings.HasPrefix(t, "$((") {
+		// Arithmetic: integers, variables and + - * / are enough for i=$((i+1)).
+		end := strings.Index(t, "))")
+		if end < 0 {
+			return "$", 1
+		}
+		return strconv.Itoa(s.arith(t[3:end])), end + 2
+	}
+	if t[1] == '(' {
+		// Command substitution: nothing runs here, so it is empty.
+		depth := 0
+		for i := 1; i < len(t); i++ {
+			switch t[i] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					return "", i + 1
+				}
+			}
+		}
+		return "$", 1
+	}
 	if t[1] == '{' {
 		end := strings.IndexByte(t, '}')
 		if end < 0 {
@@ -248,6 +380,29 @@ func (s *shell) expand(t string) (string, int) {
 		return "$", 1
 	}
 	return s.lookup(m), 1 + len(m)
+}
+
+// arith evaluates a small arithmetic expression: terms of integers and
+// variables joined by + and -, each term a product of * and /.
+func (s *shell) arith(expr string) int {
+	total := 0
+	for _, term := range strings.FieldsFunc(strings.ReplaceAll(expr, "-", "+-"), func(r rune) bool { return r == '+' }) {
+		sign, product := 1, 1
+		for _, f := range strings.Split(strings.TrimSpace(term), "*") {
+			f = strings.TrimSpace(f)
+			if strings.HasPrefix(f, "-") {
+				sign = -sign
+				f = f[1:]
+			}
+			n, err := strconv.Atoi(f)
+			if err != nil {
+				n, _ = strconv.Atoi(s.lookup(f))
+			}
+			product *= n
+		}
+		total += sign * product
+	}
+	return total
 }
 
 func (s *shell) lookup(name string) string {
@@ -331,7 +486,13 @@ func (s *shell) command(text string) (status int, stop bool) {
 			return sub.run(args[1]), false
 		}
 		return 127, false
-	case "true", ":":
+	case "true", ":", "set":
+		return 0, false
+	case "printf":
+		if len(args) == 0 {
+			return 1, false
+		}
+		_, _ = io.WriteString(s.out, shellPrintf(args[0], args[1:]))
 		return 0, false
 	case "false":
 		return 1, false
@@ -453,6 +614,46 @@ func (s *shell) command(text string) (status int, stop bool) {
 	return 127, false
 }
 
+// shellPrintf formats args with format the way printf does for %s, %d,
+// %% and the escapes \n, \t and \\; the format is reused while arguments
+// remain.
+func shellPrintf(format string, args []string) string {
+	var b strings.Builder
+	for {
+		for i := 0; i < len(format); i++ {
+			c := format[i]
+			switch {
+			case c == '\\' && i+1 < len(format):
+				i++
+				switch format[i] {
+				case 'n':
+					b.WriteByte('\n')
+				case 't':
+					b.WriteByte('\t')
+				default:
+					b.WriteByte(format[i])
+				}
+			case c == '%' && i+1 < len(format):
+				i++
+				switch format[i] {
+				case '%':
+					b.WriteByte('%')
+				default:
+					if len(args) > 0 {
+						b.WriteString(args[0])
+						args = args[1:]
+					}
+				}
+			default:
+				b.WriteByte(c)
+			}
+		}
+		if len(args) == 0 || !strings.Contains(format, "%") {
+			return b.String()
+		}
+	}
+}
+
 func isNumber(w string) bool {
 	_, err := strconv.Atoi(w)
 	return err == nil
@@ -507,7 +708,7 @@ func (s *shell) test(args []string) int {
 			return boolStatus(ok && n.dir)
 		case "-s":
 			return boolStatus(ok && n.size > 0)
-		case "-e":
+		case "-e", "-r", "-w":
 			return boolStatus(ok)
 		}
 	case len(args) == 3 && args[1] == "=":

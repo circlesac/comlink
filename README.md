@@ -95,8 +95,8 @@ Press Ctrl-C to stop.
 In the Claude app, add `example-agent` as an SSH connection and open a new
 session on it. Every chat becomes one ACP session on `<server>/acp`. The
 app shows an empty home directory (`/home/comlink`) in its folder picker:
-there are no files, no git and no plugins there; what the agent can do is
-decided by the endpoint. A Claude and a Codex session on the same server
+there are no files and no git there, and a plugin the app syncs goes
+nowhere; what the agent can do is decided by the endpoint. A Claude and a Codex session on the same server
 coexist under two names (`example-agent`, `example-agent-2`), and
 `comlink claude list` shows the Claude ones.
 

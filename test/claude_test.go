@@ -1,6 +1,7 @@
 package test
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -829,6 +830,55 @@ func TestClaudeServesSFTPOnTheVirtualTree(t *testing.T) {
 	if prune.Kept != 1 || prune.Root == "" {
 		t.Fatalf("plugins.prune: %+v", prune)
 	}
+	// A plugin arrives as a tar over SFTP and is unpacked by files.extract_tar.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	for _, e := range []struct {
+		name string
+		mode int64
+		body string
+	}{{"plugin.json", 0o644, `{"name":"example"}`}, {"bin/run", 0o755, "#!/bin/sh\n"}, {".synced", 0o644, "x"}} {
+		_ = tw.WriteHeader(&tar.Header{Name: e.name, Mode: e.mode, Size: int64(len(e.body)), Typeflag: tar.TypeReg})
+		_, _ = tw.Write([]byte(e.body))
+	}
+	_ = tw.Close()
+	archive := "/home/comlink/.claude/remote/plugins/02b2e3e9/abc.tar"
+	typ, payload = c.request(3, sftpString(archive), binary.BigEndian.AppendUint32(nil, 2|8|16), binary.BigEndian.AppendUint32(nil, 0))
+	if typ != 102 {
+		t.Fatalf("OPEN archive: type %d", typ)
+	}
+	handle = payload
+	if typ, payload := c.request(6, handle, binary.BigEndian.AppendUint64(nil, 0), sftpString(tarBuf.String())); c.status(typ, payload) != 0 {
+		t.Fatal("WRITE archive failed")
+	}
+	c.request(4, handle)
+	var extracted struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	_ = json.Unmarshal(b.call("files.extract_tar", map[string]any{"archivePath": archive, "destDir": "/home/comlink/.claude/remote/plugins/02b2e3e9/abc"}), &extracted)
+	if !extracted.Success {
+		t.Fatalf("extract_tar: %+v", extracted)
+	}
+	_ = json.Unmarshal(b.call("files.read", map[string]any{"path": "/home/comlink/.claude/remote/plugins/02b2e3e9/abc/plugin.json"}), &read)
+	if !read.Exists || read.Content != `{"name":"example"}` {
+		t.Fatalf("extracted file: %+v", read)
+	}
+	_ = json.Unmarshal(b.call("files.stat", map[string]any{"path": "/home/comlink/.claude/remote/plugins/02b2e3e9/abc/bin/run"}), &stat)
+	if !stat.Exists || stat.Mode != "-rwx------" {
+		t.Fatalf("extracted executable: %+v", stat)
+	}
+	_ = json.Unmarshal(b.call("files.stat", map[string]any{"path": "/home/comlink/.claude/remote/plugins/02b2e3e9/abc/.synced"}), &stat)
+	if !stat.Exists || stat.Size != 0 {
+		t.Fatalf(".synced marker (the archive's own copy is skipped): %+v", stat)
+	}
+	_ = json.Unmarshal(b.call("files.extract_tar", map[string]any{"archivePath": archive + ".missing", "destDir": "/home/comlink/x"}), &extracted)
+	if extracted.Success || !strings.Contains(extracted.Error, "archive not found") {
+		t.Fatalf("extract_tar of a missing archive: %+v", extracted)
+	}
+	if msg := b.callErr("files.extract_tar", map[string]any{"archivePath": archive}); msg != "archivePath and destDir are required" {
+		t.Fatalf("extract_tar without destDir: %q", msg)
+	}
 	if msg := b.callErr("git.worktree_create", map[string]any{}); !strings.HasPrefix(msg, "method not found") {
 		t.Fatalf("unknown method: %q", msg)
 	}
@@ -1070,6 +1120,10 @@ func TestClaudeAnswersShellSpawns(t *testing.T) {
 		{"subagent listing", []string{"-c", `ls -1 '/home/comlink/.claude/projects/-home-comlink'/'1111'/subagents/agent-*.jsonl 2>/dev/null; s=$?; (exit $s); echo "__claude_sh${__claude_unset:-_ran}:$?"`}, "__claude_sh_ran:1\n", 0},
 		{"transcript read", []string{"-c", `LC_ALL=C sh -c 'wc -c < "$1" && head -c 65536 "$1"' sh '` + transcript + `'`}, "", 1},
 		{"head of an empty file", []string{"-c", `head -c 3 '/home/comlink/.claude/remote/srv/` + claudeHelper + `/server' && echo ok`}, "ok\n", 0},
+		{"transcript glob loop", []string{"-c", `for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/'1111'.jsonl; do [ -f "$f" ] && printf "%s\n" "$f"; done`}, "", 1},
+		{"subagent origin loop", []string{"-c", `i=0; for f in '/home/comlink/.claude/projects/x/a.jsonl' '/home/comlink/.claude/projects/x/b.jsonl'; do printf '__ORIGIN__%s:' "$i"; [ -f "$f" ] && LC_ALL=C head -c 4096 "$f" 2>/dev/null | LC_ALL=C tr -d '\r\n'; echo; i=$((i+1)); done`}, "__ORIGIN__0:\n__ORIGIN__1:\n", 0},
+		{"pid probe loop", []string{"-c", `for p in 4242 4243; do if [ -r /proc/$p/stat ]; then s=$(cat /proc/$p/stat 2>/dev/null); echo "$p $s EOR"; else set -- $(ps -o pgid= -p $p 2>/dev/null); [ -n "$1" ] && echo "$p $1 EOR"; fi; done`}, "", 1},
+		{"if then else", []string{"-c", `if test -d /home/comlink; then echo yes; else echo no; fi; if test -d /nowhere; then echo yes; else echo no; fi`}, "yes\nno\n", 0},
 		{"workflow find", []string{"-c", `LC_ALL=C QUOTING_STYLE=literal find '/home/comlink/.claude/projects/x/subagents/workflows' -type f -name 'agent-*.jsonl' -exec ls -ln {} + 2>/dev/null`}, "", 1},
 	}
 	for i, tc := range cases {
@@ -1091,6 +1145,13 @@ func TestClaudeAnswersShellSpawns(t *testing.T) {
 		}
 		if string(out) != tc.stdout {
 			t.Errorf("%s: stdout %q, want %q", tc.name, out, tc.stdout)
+		}
+	}
+	// The loops produced no stderr: the records read so far hold stdout and
+	// exits only.
+	for _, rec := range b.records {
+		if rec.Stream == "stderr" {
+			t.Fatalf("unexpected stderr record %+v", rec)
 		}
 	}
 	b.call("process.spawn", map[string]any{"id": "other", "command": "/usr/bin/python3", "args": []string{"-c", "1"}})

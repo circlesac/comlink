@@ -1,6 +1,10 @@
 package claude
 
 import (
+	"archive/tar"
+	"bytes"
+	"errors"
+	"io"
 	"path"
 	"sort"
 	"strings"
@@ -224,4 +228,52 @@ func (fs *vfs) glob(pattern string) []string {
 		}
 	}
 	return out
+}
+
+// extractTar unpacks the tar archive at archivePath into destDir: regular
+// files with their executable bit, directories, nothing else. An archive
+// whose bytes were not kept (over fileCap) or an entry that leaves destDir
+// is an error. A top-level .synced in the archive is skipped: only the
+// helper writes that marker.
+func (fs *vfs) extractTar(archivePath, destDir string) error {
+	n, ok := fs.stat(archivePath)
+	if !ok || n.dir {
+		return errors.New("archive not found: " + clean(archivePath))
+	}
+	if n.data == nil && n.size > 0 {
+		return errors.New("archive too large to unpack")
+	}
+	destDir = clean(destDir)
+	if destDir == "/" {
+		return errors.New("destDir must be an absolute, non-root path")
+	}
+	tr := tar.NewReader(bytes.NewReader(n.data))
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return errors.New("read archive: " + err.Error())
+		}
+		rel := path.Clean("/" + h.Name)
+		if rel == "/" || rel == "/.synced" || strings.HasPrefix(rel, "/.synced/") {
+			continue
+		}
+		target := destDir + rel
+		switch h.Typeflag {
+		case tar.TypeDir:
+			fs.mkdirAll(target)
+		case tar.TypeReg:
+			data, err := io.ReadAll(io.LimitReader(tr, fileCap+1))
+			if err != nil {
+				return errors.New("read archive: " + err.Error())
+			}
+			mode := uint32(0o600)
+			if h.Mode&0o100 != 0 {
+				mode = 0o700
+			}
+			fs.put(target, data, mode)
+		}
+	}
 }
