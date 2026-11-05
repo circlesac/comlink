@@ -150,7 +150,7 @@ func writeStaleSession(t *testing.T, dir, name string) {
 			t.Fatal(err)
 		}
 	}
-	b, _ := json.Marshal(session.Record{Name: name, Server: "ws://stale.example.com", Codex: "ws://stale.example.com/codex", PID: deadPID(t)})
+	b, _ := json.Marshal(session.Record{Name: name, Server: "ws://stale.example.com", Client: session.Codex, Endpoint: "ws://stale.example.com/codex", PID: deadPID(t)})
 	for path, content := range map[string]string{record: string(b), token: "stale-token", lock: "", conf: "Host stale\n"} {
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -171,7 +171,7 @@ func TestSessionTokenCommand(t *testing.T) {
 	counter := filepath.Join(dir, "runs")
 	helper := "echo run >> " + counter + "; printf 'tok-%s' \"$(wc -l < " + counter + " | tr -d ' ')\""
 
-	sess, err := store.Start("agent-a", "wss://agent.example.com", upstream.Credential{Command: helper, Dir: dir, Path: "/usr/bin:/bin"}, "x")
+	sess, err := store.Start(session.Codex, "agent-a", "wss://agent.example.com", upstream.Credential{Command: helper, Dir: dir, Path: "/usr/bin:/bin"}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,11 +180,11 @@ func TestSessionTokenCommand(t *testing.T) {
 		t.Fatalf("token command file %q (%v)", b, err)
 	}
 	pinned := upstream.Credential{Command: helper, Dir: dir, Path: "/usr/bin:/bin"}
-	if _, cred, err := store.Load("agent-a"); err != nil || cred != pinned {
+	if _, cred, err := store.Load(session.Codex, "agent-a"); err != nil || cred != pinned {
 		t.Fatalf("Load = %+v, %v", cred, err)
 	}
 	// Resolve hands over the command unrun; each Bearer runs it again.
-	endpoint, cred, err := store.Resolve("agent-a")
+	endpoint, cred, err := store.Resolve(session.Codex, "agent-a")
 	if err != nil || endpoint != "wss://agent.example.com/codex" || cred != pinned {
 		t.Fatalf("Resolve = %q, %+v, %v", endpoint, cred, err)
 	}
@@ -199,12 +199,12 @@ func TestSessionTokenCommand(t *testing.T) {
 	}
 	absent(t, command)
 
-	failing, err := store.Start("agent-b", "wss://agent.example.com", upstream.Credential{Command: "exit 4"}, "x")
+	failing, err := store.Start(session.Codex, "agent-b", "wss://agent.example.com", upstream.Credential{Command: "exit 4"}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = failing.Close() }()
-	if _, cred, err := store.Resolve("agent-b"); err != nil || cred.Command != "exit 4" {
+	if _, cred, err := store.Resolve(session.Codex, "agent-b"); err != nil || cred.Command != "exit 4" {
 		t.Fatalf("Resolve with a failing command = %+v, %v", cred, err)
 	} else if got, err := cred.Bearer(); err == nil || err.Error() != "token command failed: exit status 4" || got != "" {
 		t.Fatalf("Bearer of a failing command = %q, %v", got, err)
@@ -213,7 +213,7 @@ func TestSessionTokenCommand(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "comlink", "run", "agent-b.token-command"), []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.Load("agent-b"); err == nil || err.Error() != "read token command file: not a token command" {
+	if _, _, err := store.Load(session.Codex, "agent-b"); err == nil || err.Error() != "read token command file: not a token command" {
 		t.Fatalf("Load of a bad token command file = %v", err)
 	}
 }
@@ -228,14 +228,14 @@ func TestSessionStore(t *testing.T) {
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
 	record, token, lock, conf := sessionFiles(dir, "agent-a")
 
-	sess, err := store.Start("agent-a", "wss://agent.example.com/base/", upstream.Credential{Token: testToken}, "Host agent-a\n  ProxyCommand x\n")
+	sess, err := store.Start(session.Codex, "agent-a", "wss://agent.example.com/base/", upstream.Credential{Token: testToken}, "Host agent-a\n  ProxyCommand x\n")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if sess.Replaced != nil {
 		t.Fatalf("Replaced = %+v on a fresh name", sess.Replaced)
 	}
-	want := session.Record{Name: "agent-a", Server: "wss://agent.example.com/base/", Codex: "wss://agent.example.com/base/codex", PID: os.Getpid()}
+	want := session.Record{Name: "agent-a", Server: "wss://agent.example.com/base/", Client: session.Codex, Endpoint: "wss://agent.example.com/base/codex", PID: os.Getpid()}
 	if sess.Record != want {
 		t.Fatalf("session record %+v, want %+v", sess.Record, want)
 	}
@@ -263,11 +263,11 @@ func TestSessionStore(t *testing.T) {
 		t.Fatalf("run holds %v and ssh holds %v, want only the session's files", run, ssh)
 	}
 
-	got, gotCred, err := store.Load("agent-a")
+	got, gotCred, err := store.Load(session.Codex, "agent-a")
 	if err != nil || got != want || gotCred != (upstream.Credential{Token: testToken}) {
 		t.Fatalf("Load = %+v, token ok %v, %v", got, gotCred.Token == testToken, err)
 	}
-	if _, err := store.Start("agent-a", "wss://other.example.com", upstream.Credential{}, ""); err == nil || err.Error() != `session "agent-a" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
+	if _, err := store.Start(session.Codex, "agent-a", "wss://other.example.com", upstream.Credential{}, ""); err == nil || err.Error() != `session "agent-a" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
 		t.Fatalf("second Start: %v", err)
 	}
 	if got := readRecord(t, record); got != want {
@@ -283,7 +283,7 @@ func TestSessionStore(t *testing.T) {
 	}
 	absent(t, record, token, lock, conf)
 	var notUp *session.NotUpError
-	if _, _, err := store.Load("agent-a"); !errors.As(err, &notUp) || notUp.Name != "agent-a" {
+	if _, _, err := store.Load(session.Codex, "agent-a"); !errors.As(err, &notUp) || notUp.Name != "agent-a" {
 		t.Fatalf("Load after Close: %v", err)
 	}
 	if want := `session "agent-a" is not up: run 'comlink codex --name agent-a --server URL' first`; notUp.Error() != want {
@@ -292,16 +292,16 @@ func TestSessionStore(t *testing.T) {
 	if live, stale, err := store.List(); err != nil || len(live)+len(stale) != 0 {
 		t.Fatalf("List after Close = %+v, %+v, %v", live, stale, err)
 	}
-	if _, _, err := store.Load("never"); !errors.As(err, &notUp) {
+	if _, _, err := store.Load(session.Codex, "never"); !errors.As(err, &notUp) {
 		t.Fatalf("Load of an unknown name: %v", err)
 	}
 
 	// A second session with the same name can start once the first is closed.
-	again, err := store.Start("agent-a", "ws://127.0.0.1:1", upstream.Credential{}, "x")
+	again, err := store.Start(session.Codex, "agent-a", "ws://127.0.0.1:1", upstream.Credential{}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, gotCred, err := store.Load("agent-a"); err != nil || gotCred != (upstream.Credential{}) {
+	if _, gotCred, err := store.Load(session.Codex, "agent-a"); err != nil || gotCred != (upstream.Credential{}) {
 		t.Fatalf("Load without a token = %+v, %v", gotCred, err)
 	}
 	if err := again.Close(); err != nil {
@@ -319,7 +319,7 @@ func TestSessionStoreUpWithoutRecord(t *testing.T) {
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
 	record, token, lock, conf := sessionFiles(dir, "agent-a")
 
-	sess, err := store.Start("agent-a", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
+	sess, err := store.Start(session.Codex, "agent-a", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +335,7 @@ func TestSessionStoreUpWithoutRecord(t *testing.T) {
 		if err := tc.record(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.Start("agent-a", "wss://other.example.com", upstream.Credential{}, "y"); err == nil || err.Error() != `session "agent-a" is already up` {
+		if _, err := store.Start(session.Codex, "agent-a", "wss://other.example.com", upstream.Credential{}, "y"); err == nil || err.Error() != `session "agent-a" is already up` {
 			t.Fatalf("Start with the record %s: %v", tc.what, err)
 		}
 		for _, path := range []string{token, lock, conf} {
@@ -347,7 +347,7 @@ func TestSessionStoreUpWithoutRecord(t *testing.T) {
 
 	// Close removes the files before it releases the lock: a session that
 	// is held but has lost its token file is not up for Load either.
-	b, _ := json.Marshal(session.Record{Name: "agent-a", Server: "wss://agent.example.com", Codex: "wss://agent.example.com/codex", PID: os.Getpid()})
+	b, _ := json.Marshal(session.Record{Name: "agent-a", Server: "wss://agent.example.com", Client: session.Codex, Endpoint: "wss://agent.example.com/codex", PID: os.Getpid()})
 	if err := os.WriteFile(record, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -355,10 +355,10 @@ func TestSessionStoreUpWithoutRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	var notUp *session.NotUpError
-	if _, _, err := store.Load("agent-a"); !errors.As(err, &notUp) || notUp.Name != "agent-a" {
+	if _, _, err := store.Load(session.Codex, "agent-a"); !errors.As(err, &notUp) || notUp.Name != "agent-a" {
 		t.Fatalf("Load of a held name without its token file: %v", err)
 	}
-	if _, _, err := store.Resolve("agent-a"); !errors.As(err, &notUp) {
+	if _, _, err := store.Resolve(session.Codex, "agent-a"); !errors.As(err, &notUp) {
 		t.Fatalf("Resolve of a held name without its token file: %v", err)
 	}
 }
@@ -375,7 +375,7 @@ func TestSessionStoreRefusesBadInput(t *testing.T) {
 		{"agent", "https://agent.example.com", `server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]`},
 		{"agent", "ws://[::1", "server URL: missing ']' in host"},
 	} {
-		sess, err := store.Start(tc.name, tc.server, upstream.Credential{Token: testToken}, "x")
+		sess, err := store.Start(session.Codex, tc.name, tc.server, upstream.Credential{Token: testToken}, "x")
 		if err == nil || err.Error() != tc.want {
 			t.Errorf("Start(%q, %q) = %v, %v; want %q", tc.name, tc.server, sess, err, tc.want)
 		}
@@ -383,7 +383,7 @@ func TestSessionStoreRefusesBadInput(t *testing.T) {
 	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
 		t.Fatalf("state directory holds %v (%v) after refused starts", entries, err)
 	}
-	if _, _, err := store.Load("two words"); err == nil || !strings.HasPrefix(err.Error(), "invalid name") {
+	if _, _, err := store.Load(session.Codex, "two words"); err == nil || !strings.HasPrefix(err.Error(), "invalid name") {
 		t.Fatalf("Load of an invalid name: %v", err)
 	}
 
@@ -398,7 +398,7 @@ func TestSessionStoreRefusesBadInput(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(ssh, 0o700) })
-		if sess, err := store.Start("agent", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x"); err == nil || !strings.HasPrefix(err.Error(), "write ssh config: ") {
+		if sess, err := store.Start(session.Codex, "agent", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x"); err == nil || !strings.HasPrefix(err.Error(), "write ssh config: ") {
 			t.Fatalf("Start with a read-only ssh directory = %v, %v", sess, err)
 		}
 		record, token, lock, conf := sessionFiles(dir, "agent")
@@ -409,7 +409,7 @@ func TestSessionStoreRefusesBadInput(t *testing.T) {
 		if err := os.Chmod(ssh, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		sess, err := store.Start("agent", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
+		sess, err := store.Start(session.Codex, "agent", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
 		if err != nil {
 			t.Fatalf("Start after the failure: %v", err)
 		}
@@ -438,7 +438,7 @@ func TestSessionStaleRecords(t *testing.T) {
 	}
 
 	var notUp *session.NotUpError
-	if _, _, err := store.Load("gone"); !errors.As(err, &notUp) {
+	if _, _, err := store.Load(session.Codex, "gone"); !errors.As(err, &notUp) {
 		t.Fatalf("Load of a stale name: %v", err)
 	}
 	if _, err := os.Stat(record); err != nil {
@@ -461,7 +461,7 @@ func TestSessionStaleRecords(t *testing.T) {
 
 	writeStaleSession(t, dir, "replaced")
 	stalePID := readRecord(t, filepath.Join(run, "replaced.json")).PID
-	sess, err := store.Start("replaced", "wss://new.example.com", upstream.Credential{Token: testToken}, "Host replaced\n")
+	sess, err := store.Start(session.Codex, "replaced", "wss://new.example.com", upstream.Credential{Token: testToken}, "Host replaced\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,7 +519,7 @@ func upOnce(store *session.Store, sshConfig string) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stderr bytes.Buffer
-	err := store.Up(ctx, "agent-a", "wss://agent.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, io.Discard, &stderr)
+	err := store.Up(ctx, session.Codex, "agent-a", "wss://agent.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, io.Discard, &stderr)
 	return stderr.String(), err
 }
 
@@ -877,7 +877,7 @@ func TestSessionUp(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
-			err := store.Up(ctx, name, "wss://agent.example.com/base", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, outW, &errBuf)
+			err := store.Up(ctx, session.Codex, name, "wss://agent.example.com/base", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, outW, &errBuf)
 			_ = outW.Close()
 			done <- err
 		}()
@@ -923,7 +923,7 @@ func TestSessionUp(t *testing.T) {
 	if wantBlock := configBlock(t, "agent-a", "/opt/comlink", "codex", "--stdio", "--name", "agent-a"); string(block) != wantBlock {
 		t.Fatalf("ssh config:\n%s\nwant:\n%s", block, wantBlock)
 	}
-	if got := readRecord(t, record); got.Codex != "wss://agent.example.com/base/codex" || got.PID != os.Getpid() {
+	if got := readRecord(t, record); got.Endpoint != "wss://agent.example.com/base/codex" || got.PID != os.Getpid() {
 		t.Fatalf("record %+v", got)
 	}
 	if err := stop(); err != nil {
@@ -947,19 +947,19 @@ func TestSessionUp(t *testing.T) {
 	// Refusals: a bad alias or server before anything is written (not even
 	// the Include line), and a name that is up.
 	untouched := filepath.Join(dir, "untouched", "config")
-	if err := store.Up(context.Background(), "agent\nHost *", "wss://agent.example.com", upstream.Credential{}, "/opt/comlink", untouched, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "invalid alias ") {
+	if err := store.Up(context.Background(), session.Codex, "agent\nHost *", "wss://agent.example.com", upstream.Credential{}, "/opt/comlink", untouched, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "invalid alias ") {
 		t.Fatalf("Up with a bad alias: %v", err)
 	}
-	if err := store.Up(context.Background(), "agent-c", "https://agent.example.com", upstream.Credential{}, "/opt/comlink", untouched, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
+	if err := store.Up(context.Background(), session.Codex, "agent-c", "https://agent.example.com", upstream.Credential{}, "/opt/comlink", untouched, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
 		t.Fatalf("Up with a bad server: %v", err)
 	}
 	absent(t, untouched)
-	held, err := store.Start("agent-b", "wss://agent.example.com", upstream.Credential{}, "x")
+	held, err := store.Start(session.Codex, "agent-b", "wss://agent.example.com", upstream.Credential{}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = held.Close() }()
-	if err := store.Up(context.Background(), "agent-b", "wss://agent.example.com", upstream.Credential{}, "/opt/comlink", sshConfig, io.Discard, io.Discard); err == nil || err.Error() != `session "agent-b" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
+	if err := store.Up(context.Background(), session.Codex, "agent-b", "wss://agent.example.com", upstream.Credential{}, "/opt/comlink", sshConfig, io.Discard, io.Discard); err == nil || err.Error() != `session "agent-b" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
 		t.Fatalf("Up on a name that is up: %v", err)
 	}
 }
@@ -994,7 +994,7 @@ func TestSessionUpDefaultName(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		var stdout bytes.Buffer
-		if err := store.Up(ctx, "", tc.server, upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
+		if err := store.Up(ctx, session.Codex, "", tc.server, upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
 			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
 		}
 		want := tc.name + " is up (pid " + pid + ")\n" +
@@ -1011,7 +1011,7 @@ func TestSessionUpDefaultName(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var stdout bytes.Buffer
-	if err := store.Up(ctx, "Agent-X", "wss://padawan.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
+	if err := store.Up(ctx, session.Codex, "Agent-X", "wss://padawan.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(stdout.String(), "Agent-X is up (pid ") || strings.Contains(stdout.String(), "name:") {
@@ -1020,7 +1020,7 @@ func TestSessionUpDefaultName(t *testing.T) {
 
 	// Names that are up are skipped, for a label and for comlink alike.
 	for _, name := range []string{"padawan", "padawan-2", "comlink"} {
-		sess, err := store.Start(name, "wss://padawan.example.com", upstream.Credential{Token: testToken}, "x")
+		sess, err := store.Start(session.Codex, name, "wss://padawan.example.com", upstream.Credential{Token: testToken}, "x")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1031,7 +1031,7 @@ func TestSessionUpDefaultName(t *testing.T) {
 		{"ws://127.0.0.1:8787", "comlink-2", "comlink-2 (the server host 127.0.0.1 is an IP address, comlink is already up; --name sets another)"},
 	} {
 		stdout.Reset()
-		if err := store.Up(ctx, "", tc.server, upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
+		if err := store.Up(ctx, session.Codex, "", tc.server, upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, &stdout, io.Discard); err != nil {
 			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
 		}
 		if want := tc.name + " is up (pid " + pid + ")\n  name:       " + tc.line + "\n"; !strings.HasPrefix(stdout.String(), want) {
@@ -1042,7 +1042,7 @@ func TestSessionUpDefaultName(t *testing.T) {
 	// A bad server is still reported as one, and nothing is written.
 	untouched := t.TempDir()
 	refusedStore := &session.Store{Dir: filepath.Join(untouched, "comlink")}
-	if err := refusedStore.Up(context.Background(), "", "https://padawan.example.com", upstream.Credential{}, "/opt/comlink", filepath.Join(untouched, "config"), io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
+	if err := refusedStore.Up(context.Background(), session.Codex, "", "https://padawan.example.com", upstream.Credential{}, "/opt/comlink", filepath.Join(untouched, "config"), io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "server URL ") {
 		t.Fatalf("Up with a bad server and no name: %v", err)
 	}
 	if entries, err := os.ReadDir(untouched); err != nil || len(entries) != 0 {
@@ -1135,7 +1135,7 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			var stdout, stderr bytes.Buffer
-			err := store.Up(ctx, "", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr)
+			err := store.Up(ctx, session.Codex, "", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr)
 			switch tc.want {
 			case refuse:
 				if want := `"devbox" and "devbox-2" both have ssh configuration, so a pattern in it likely matches every devbox-N; pass --name NAME`; err == nil || err.Error() != want {
@@ -1167,7 +1167,7 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 
 			stdout.Reset()
 			stderr.Reset()
-			if err := store.Up(ctx, "devbox", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
+			if err := store.Up(ctx, session.Codex, "devbox", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
 				t.Fatalf("Up --name devbox: %v", err)
 			}
 			want := ""
@@ -1204,7 +1204,7 @@ func TestSessionUpExistingSSHHost(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		var stdout, stderr bytes.Buffer
-		if err := store.Up(ctx, "", tc.server, upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
+		if err := store.Up(ctx, session.Codex, "", tc.server, upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
 			t.Fatalf("Up(%q) without a name: %v", tc.server, err)
 		}
 		if stderr.Len() != 0 || !strings.HasPrefix(stdout.String(), tc.name+" is up (pid ") {
@@ -1235,7 +1235,7 @@ func TestSessionUpExplicitNameCase(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		var stdout, stderr bytes.Buffer
-		if err := store.Up(ctx, "Agent-X", "wss://agent.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
+		if err := store.Up(ctx, session.Codex, "Agent-X", "wss://agent.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
 			t.Fatalf("Host %s: Up --name Agent-X: %v", tc.pattern, err)
 		}
 		want := ""
@@ -1274,7 +1274,7 @@ func TestSessionUpComlinkHostPattern(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.up != "" {
-				sess, err := store.Start(tc.up, "ws://127.0.0.1:8787", upstream.Credential{Token: testToken}, "x")
+				sess, err := store.Start(session.Codex, tc.up, "ws://127.0.0.1:8787", upstream.Credential{Token: testToken}, "x")
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1283,7 +1283,7 @@ func TestSessionUpComlinkHostPattern(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 			var stdout, stderr bytes.Buffer
-			err := store.Up(ctx, "", "ws://127.0.0.1:8787", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr)
+			err := store.Up(ctx, session.Codex, "", "ws://127.0.0.1:8787", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr)
 			if tc.err != "" {
 				if err == nil || err.Error() != tc.err || stdout.Len() != 0 || stderr.Len() != 0 {
 					t.Fatalf("Up = %v, printed %q and %q; want %q", err, stdout.String(), stderr.String(), tc.err)
@@ -1300,7 +1300,7 @@ func TestSessionUpComlinkHostPattern(t *testing.T) {
 			}
 
 			stdout.Reset()
-			if err := store.Up(ctx, "comlink-x", "ws://127.0.0.1:8787", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
+			if err := store.Up(ctx, session.Codex, "comlink-x", "ws://127.0.0.1:8787", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr); err != nil {
 				t.Fatalf("Up --name comlink-x: %v", err)
 			}
 			if want := `comlink: warning: "comlink-x" already has ssh configuration (the Host line at ` + config + `:2 matches it); this session's Host block takes precedence while it runs` + "\n"; stderr.String() != want {
@@ -1324,13 +1324,13 @@ func TestSessionUpConfiguredNameThatIsUp(t *testing.T) {
 	if err := os.WriteFile(config, []byte("Include "+filepath.Join(store.SSHDir(), "*.conf")+"\nHost devbox\n  User someone\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sess, err := store.Start("devbox", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "x")
+	sess, err := store.Start(session.Codex, "devbox", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sess.Close() }()
 	var stdout, stderr bytes.Buffer
-	err = store.Up(context.Background(), "devbox", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr)
+	err = store.Up(context.Background(), session.Codex, "devbox", "wss://devbox.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", config, &stdout, &stderr)
 	if want := fmt.Sprintf("session %q is already up (pid %d)", "devbox", os.Getpid()); err == nil || err.Error() != want {
 		t.Fatalf("Up --name devbox = %v, want %q", err, want)
 	}
@@ -1346,16 +1346,16 @@ func TestSessionResolveAndPrintList(t *testing.T) {
 	dir := t.TempDir()
 	store := &session.Store{Dir: filepath.Join(dir, "comlink")}
 	var stdout, stderr bytes.Buffer
-	if err := store.PrintList(&stdout, &stderr); err != nil || stdout.Len() != 0 || stderr.String() != "comlink: no sessions are up\n" {
+	if err := store.PrintList(session.Codex, &stdout, &stderr); err != nil || stdout.Len() != 0 || stderr.String() != "comlink: no codex sessions are up\n" {
 		t.Fatalf("PrintList with nothing up: %v, stdout %q, stderr %q", err, stdout.String(), stderr.String())
 	}
 
-	b, err := store.Start("agent-b", "wss://b.example.com/x/", upstream.Credential{Token: testToken}, "x")
+	b, err := store.Start(session.Codex, "agent-b", "wss://b.example.com/x/", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = b.Close() }()
-	a, err := store.Start("agent-a", "wss://a.example.com", upstream.Credential{Token: testToken}, "x")
+	a, err := store.Start(session.Codex, "agent-a", "wss://a.example.com", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1367,18 +1367,18 @@ func TestSessionResolveAndPrintList(t *testing.T) {
 		{"agent-a", "wss://a.example.com/codex"},
 		{"agent-b", "wss://b.example.com/x/codex"},
 	} {
-		if url, cred, err := store.Resolve(tc.name); err != nil || url != tc.want || cred.Token != testToken {
+		if url, cred, err := store.Resolve(session.Codex, tc.name); err != nil || url != tc.want || cred.Token != testToken {
 			t.Errorf("Resolve(%q) = %q, token ok %v, %v; want %q", tc.name, url, cred.Token == testToken, err, tc.want)
 		}
 	}
 	var notUp *session.NotUpError
-	if _, _, err := store.Resolve("agent-c"); !errors.As(err, &notUp) {
+	if _, _, err := store.Resolve(session.Codex, "agent-c"); !errors.As(err, &notUp) {
 		t.Fatalf("Resolve of a stale name: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	if err := store.PrintList(&stdout, &stderr); err != nil {
+	if err := store.PrintList(session.Codex, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	pid := strconv.Itoa(os.Getpid())
@@ -1398,7 +1398,7 @@ func TestSessionResolveAndPrintList(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(run, 0o700) })
-		if err := store.PrintList(io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "read "+run+": ") {
+		if err := store.PrintList(session.Codex, io.Discard, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "read "+run+": ") {
 			t.Fatalf("PrintList on an unreadable run directory: %v", err)
 		}
 		if err := os.Chmod(run, 0o700); err != nil {
@@ -1416,24 +1416,24 @@ func TestSessionFlagsCheck(t *testing.T) {
 		flags session.Flags
 		want  string
 	}{
-		{session.Flags{Name: "a", Server: "wss://h"}, ""},
-		{session.Flags{Name: "a", Server: "wss://h", TokenFile: "/t"}, ""},
-		{session.Flags{}, "missing flags: --server=URL"},
-		{session.Flags{Name: "a"}, "missing flags: --server=URL"},
-		{session.Flags{TokenFile: "/t"}, "missing flags: --server=URL"},
-		{session.Flags{Server: "wss://h"}, ""},
-		{session.Flags{Server: "wss://h", TokenFile: "/t"}, ""},
-		{session.Flags{Name: "a", Server: "wss://h", ReportVersion: "1"}, "--report-version goes with --stdio"},
-		{session.Flags{Stdio: true, Name: "a"}, ""},
-		{session.Flags{Stdio: true, Name: "a", ReportVersion: "1"}, ""},
-		{session.Flags{Stdio: true, Server: "wss://h", TokenFile: "/t", ReportVersion: "1"}, ""},
-		{session.Flags{Stdio: true}, "--stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
-		{session.Flags{Stdio: true, TokenFile: "/t"}, "--stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
-		{session.Flags{Stdio: true, Name: "a", Server: "wss://h"}, "--stdio takes --name or --server, not both"},
-		{session.Flags{Stdio: true, Name: "a", TokenFile: "/t"}, "--token-file goes with --server; a session's token comes from 'comlink codex --name NAME'"},
-		{session.Flags{Stdio: true, Name: "a", TokenCommand: "x"}, "--token-command goes with --server; a session's token comes from 'comlink codex --name NAME'"},
-		{session.Flags{Server: "wss://h", TokenFile: "/t", TokenCommand: "x"}, "--token-file and --token-command are exclusive"},
-		{session.Flags{Stdio: true, Server: "wss://h", TokenFile: "/t", TokenCommand: "x"}, "--token-file and --token-command are exclusive"},
+		{session.Flags{Client: session.Codex, Name: "a", Server: "wss://h"}, ""},
+		{session.Flags{Client: session.Codex, Name: "a", Server: "wss://h", TokenFile: "/t"}, ""},
+		{session.Flags{Client: session.Codex}, "missing flags: --server=URL"},
+		{session.Flags{Client: session.Codex, Name: "a"}, "missing flags: --server=URL"},
+		{session.Flags{Client: session.Codex, TokenFile: "/t"}, "missing flags: --server=URL"},
+		{session.Flags{Client: session.Codex, Server: "wss://h"}, ""},
+		{session.Flags{Client: session.Codex, Server: "wss://h", TokenFile: "/t"}, ""},
+		{session.Flags{Client: session.Codex, Name: "a", Server: "wss://h", ReportVersion: "1"}, "--report-version goes with --stdio"},
+		{session.Flags{Client: session.Codex, Stdio: true, Name: "a"}, ""},
+		{session.Flags{Client: session.Codex, Stdio: true, Name: "a", ReportVersion: "1"}, ""},
+		{session.Flags{Client: session.Codex, Stdio: true, Server: "wss://h", TokenFile: "/t", ReportVersion: "1"}, ""},
+		{session.Flags{Client: session.Codex, Stdio: true}, "--stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
+		{session.Flags{Client: session.Codex, Stdio: true, TokenFile: "/t"}, "--stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL"},
+		{session.Flags{Client: session.Codex, Stdio: true, Name: "a", Server: "wss://h"}, "--stdio takes --name or --server, not both"},
+		{session.Flags{Client: session.Codex, Stdio: true, Name: "a", TokenFile: "/t"}, "--token-file goes with --server; a session's token comes from 'comlink codex --name NAME'"},
+		{session.Flags{Client: session.Codex, Stdio: true, Name: "a", TokenCommand: "x"}, "--token-command goes with --server; a session's token comes from 'comlink codex --name NAME'"},
+		{session.Flags{Client: session.Codex, Server: "wss://h", TokenFile: "/t", TokenCommand: "x"}, "--token-file and --token-command are exclusive"},
+		{session.Flags{Client: session.Codex, Stdio: true, Server: "wss://h", TokenFile: "/t", TokenCommand: "x"}, "--token-file and --token-command are exclusive"},
 	} {
 		got := ""
 		if err := tc.flags.Check(); err != nil {
@@ -1444,11 +1444,11 @@ func TestSessionFlagsCheck(t *testing.T) {
 		}
 	}
 
-	if err := (session.Flags{}).CheckUnset("list"); err != nil {
+	if err := (session.Flags{Client: session.Codex}).CheckUnset("list"); err != nil {
 		t.Fatalf("CheckUnset with nothing set: %v", err)
 	}
 	want := "'comlink codex list' takes no flags; --stdio, --name, --server, --token-file, --token-command and --report-version go with 'comlink codex' itself"
-	for _, f := range []session.Flags{{Stdio: true}, {Name: "a"}, {Server: "wss://h"}, {TokenFile: "/t"}, {ReportVersion: "1"}} {
+	for _, f := range []session.Flags{{Client: session.Codex, Stdio: true}, {Client: session.Codex, Name: "a"}, {Client: session.Codex, Server: "wss://h"}, {Client: session.Codex, TokenFile: "/t"}, {Client: session.Codex, ReportVersion: "1"}} {
 		if err := f.CheckUnset("list"); err == nil || err.Error() != want {
 			t.Errorf("CheckUnset(%+v) = %v, want %q", f, err, want)
 		}
@@ -1465,20 +1465,20 @@ func TestSessionFlagsEndpoint(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("HOME", "")
 	t.Setenv("COMLINK_TOKEN", testToken)
-	if url, cred, err := (session.Flags{Stdio: true, Server: "wss://agent.example.com/base/"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/base/codex" || cred.Token != testToken {
+	if url, cred, err := (session.Flags{Client: session.Codex, Stdio: true, Server: "wss://agent.example.com/base/"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/base/codex" || cred.Token != testToken {
 		t.Fatalf("Endpoint(--server) = %q, token ok %v, %v", url, cred.Token == testToken, err)
 	}
 	t.Setenv("COMLINK_TOKEN", "")
-	if url, cred, err := (session.Flags{Stdio: true, Server: "ws://127.0.0.1:1", TokenFile: writeTokenFile(t, 0o600)}).Endpoint(logger); err != nil || url != "ws://127.0.0.1:1/codex" || cred.Token != testToken {
+	if url, cred, err := (session.Flags{Client: session.Codex, Stdio: true, Server: "ws://127.0.0.1:1", TokenFile: writeTokenFile(t, 0o600)}).Endpoint(logger); err != nil || url != "ws://127.0.0.1:1/codex" || cred.Token != testToken {
 		t.Fatalf("Endpoint(--server --token-file) = %q, token ok %v, %v", url, cred.Token == testToken, err)
 	}
-	if _, _, err := (session.Flags{Stdio: true, Server: "https://agent.example.com"}).Endpoint(logger); err == nil || err.Error() != `server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]` {
+	if _, _, err := (session.Flags{Client: session.Codex, Stdio: true, Server: "https://agent.example.com"}).Endpoint(logger); err == nil || err.Error() != `server URL "https://agent.example.com": want ws://host[/prefix] or wss://host[/prefix]` {
 		t.Fatalf("Endpoint(https) = %v", err)
 	}
-	if _, _, err := (session.Flags{Stdio: true, Server: "ws://127.0.0.1:1", TokenFile: filepath.Join(t.TempDir(), "absent")}).Endpoint(logger); err == nil || !strings.HasPrefix(err.Error(), "read token file: ") {
+	if _, _, err := (session.Flags{Client: session.Codex, Stdio: true, Server: "ws://127.0.0.1:1", TokenFile: filepath.Join(t.TempDir(), "absent")}).Endpoint(logger); err == nil || !strings.HasPrefix(err.Error(), "read token file: ") {
 		t.Fatalf("Endpoint with a missing token file = %v", err)
 	}
-	if _, _, err := (session.Flags{Stdio: true, Name: "agent-a"}).Endpoint(logger); err == nil || !strings.HasPrefix(err.Error(), "locate state directory: ") {
+	if _, _, err := (session.Flags{Client: session.Codex, Stdio: true, Name: "agent-a"}).Endpoint(logger); err == nil || !strings.HasPrefix(err.Error(), "locate state directory: ") {
 		t.Fatalf("Endpoint(--name) without a state directory = %v", err)
 	}
 	if logBuf.Len() != 0 {
@@ -1491,16 +1491,119 @@ func TestSessionFlagsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess, err := store.Start("agent-a", "wss://agent.example.com/x", upstream.Credential{Token: testToken}, "x")
+	sess, err := store.Start(session.Codex, "agent-a", "wss://agent.example.com/x", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sess.Close() }()
-	if url, cred, err := (session.Flags{Stdio: true, Name: "agent-a"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/x/codex" || cred.Token != testToken {
+	if url, cred, err := (session.Flags{Client: session.Codex, Stdio: true, Name: "agent-a"}).Endpoint(logger); err != nil || url != "wss://agent.example.com/x/codex" || cred.Token != testToken {
 		t.Fatalf("Endpoint(--name) = %q, token ok %v, %v", url, cred.Token == testToken, err)
 	}
 	var notUp *session.NotUpError
-	if _, _, err := (session.Flags{Stdio: true, Name: "agent-b"}).Endpoint(logger); !errors.As(err, &notUp) {
+	if _, _, err := (session.Flags{Client: session.Codex, Stdio: true, Name: "agent-b"}).Endpoint(logger); !errors.As(err, &notUp) {
 		t.Fatalf("Endpoint(--name) of a name that is not up = %v", err)
+	}
+}
+
+// TestSessionClients covers the Claude client: its session is relayed to
+// <server>/acp through `comlink claude --stdio`, its name is resolved only
+// as a Claude session, and each client lists its own sessions.
+func TestSessionClients(t *testing.T) {
+	state := t.TempDir()
+	store := &session.Store{Dir: filepath.Join(state, "comlink")}
+	sshConfig := filepath.Join(t.TempDir(), "config")
+	// up runs a session until stop and returns its ready lines.
+	up := func(client session.Client) (ready string, stop func() error) {
+		t.Helper()
+		outR, outW := io.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			err := store.Up(ctx, client, "", "wss://padawan.example.com", upstream.Credential{Token: testToken}, "/opt/comlink", sshConfig, outW, io.Discard)
+			_ = outW.Close()
+			done <- err
+		}()
+		sc := bufio.NewScanner(outR)
+		for sc.Scan() {
+			ready += sc.Text() + "\n"
+			if sc.Text() == "Press Ctrl-C to stop." {
+				break
+			}
+		}
+		if !strings.HasSuffix(ready, "Press Ctrl-C to stop.\n") {
+			cancel()
+			t.Fatalf("Up ended before it was ready: %v\nstdout %q", <-done, ready)
+		}
+		return ready, func() error {
+			cancel()
+			_, _ = io.ReadAll(outR)
+			return <-done
+		}
+	}
+	ready, stop := up(session.Claude)
+	record, _, _, conf := sessionFiles(state, "padawan")
+	got := readRecord(t, record)
+	if got.Client != session.Claude || got.Endpoint != "wss://padawan.example.com/acp" || got.Server != "wss://padawan.example.com" {
+		t.Fatalf("record %+v", got)
+	}
+	block, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(block), "ProxyCommand /opt/comlink claude --stdio --name padawan\n") {
+		t.Fatalf("ssh config:\n%s", block)
+	}
+	if !strings.Contains(ready, "  Claude app: SSH connection \"padawan\" (ssh padawan)\n") {
+		t.Fatalf("stdout:\n%s", ready)
+	}
+	if endpoint, cred, err := store.Resolve(session.Claude, "padawan"); err != nil || endpoint != "wss://padawan.example.com/acp" || cred.Token != testToken {
+		t.Fatalf("Resolve as claude: %q, %v", endpoint, err)
+	}
+	if _, _, err := store.Resolve(session.Codex, "padawan"); err == nil || err.Error() != `session "padawan" is a claude session, not a codex one` {
+		t.Fatalf("Resolve as codex: %v", err)
+	}
+	// A Codex session for the same server takes the next name.
+	codexReady, stopCodex := up(session.Codex)
+	if !strings.HasPrefix(codexReady, "padawan-2 is up") || !strings.Contains(codexReady, "  Codex app:  SSH connection \"padawan-2\"") {
+		t.Fatalf("codex stdout:\n%s", codexReady)
+	}
+	codexRecord, _, _, _ := sessionFiles(state, "padawan-2")
+	if got := readRecord(t, codexRecord); got.Client != session.Codex || got.Endpoint != "wss://padawan.example.com/codex" {
+		t.Fatalf("codex record %+v", got)
+	}
+	var list, errs bytes.Buffer
+	if err := store.PrintList(session.Claude, &list, &errs); err != nil || list.String() != "padawan\tup\tpid "+strconv.Itoa(os.Getpid())+"\twss://padawan.example.com\n" || errs.Len() != 0 {
+		t.Fatalf("claude list: %q, %q, %v", list.String(), errs.String(), err)
+	}
+	list.Reset()
+	if err := store.PrintList(session.Codex, &list, &errs); err != nil || list.String() != "padawan-2\tup\tpid "+strconv.Itoa(os.Getpid())+"\twss://padawan.example.com\n" {
+		t.Fatalf("codex list: %q, %v", list.String(), err)
+	}
+	if err := stopCodex(); err != nil {
+		t.Fatal(err)
+	}
+	list.Reset()
+	errs.Reset()
+	if err := store.PrintList(session.Codex, &list, &errs); err != nil || list.Len() != 0 || errs.String() != "comlink: no codex sessions are up\n" {
+		t.Fatalf("codex list after close: %q, %q, %v", list.String(), errs.String(), err)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	var notUp *session.NotUpError
+	if _, _, err := store.Resolve(session.Claude, "padawan"); !errors.As(err, &notUp) || err.Error() != `session "padawan" is not up: run 'comlink claude --name padawan --server URL' first` {
+		t.Fatalf("Resolve after close: %v", err)
+	}
+	// The flag checks name the client.
+	f := session.Flags{Client: session.Claude, Stdio: true}
+	if err := f.Check(); err == nil || err.Error() != "--stdio needs --name NAME (a session from 'comlink claude --name NAME') or --server URL" {
+		t.Fatalf("Check: %v", err)
+	}
+	f = session.Flags{Client: session.Claude, Name: "a"}
+	if err := f.CheckUnset("list"); err == nil || err.Error() != "'comlink claude list' takes no flags; --stdio, --name, --server, --token-file and --token-command go with 'comlink claude' itself" {
+		t.Fatalf("CheckUnset: %v", err)
+	}
+	if err := (session.Flags{Client: session.Claude}).CheckUnset("list"); err != nil {
+		t.Fatalf("CheckUnset with nothing set: %v", err)
 	}
 }

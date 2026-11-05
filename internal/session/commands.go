@@ -14,10 +14,11 @@ import (
 	"github.com/circlesac/comlink/internal/upstream"
 )
 
-// Flags are the flags of `comlink codex`: without Stdio the session,
-// with it one SSH connection on stdin/stdout. Which of them go together is
-// more than kong can express, so Check says.
+// Flags are the flags of `comlink <client>` (codex or claude): without
+// Stdio the session, with it one SSH connection on stdin/stdout. Which of
+// them go together is more than kong can express, so Check says.
 type Flags struct {
+	Client        Client
 	Stdio         bool
 	Name          string
 	Server        string
@@ -26,7 +27,7 @@ type Flags struct {
 	ReportVersion string
 }
 
-// Check rejects the combinations `comlink codex` refuses. Without Stdio,
+// Check rejects the combinations `comlink <client>` refuses. Without Stdio,
 // Server is required, Name is optional (Up derives it from Server) and
 // ReportVersion is refused; with it, exactly one of Name and Server is
 // required, and TokenFile and TokenCommand go only with Server, because a
@@ -47,35 +48,39 @@ func (f Flags) Check() error {
 	}
 	switch {
 	case f.Name == "" && f.Server == "":
-		return errors.New("--stdio needs --name NAME (a session from 'comlink codex --name NAME') or --server URL")
+		return fmt.Errorf("--stdio needs --name NAME (a session from 'comlink %s --name NAME') or --server URL", f.Client)
 	case f.Name != "" && f.Server != "":
 		return errors.New("--stdio takes --name or --server, not both")
 	case f.Name != "" && f.TokenFile != "":
-		return errors.New("--token-file goes with --server; a session's token comes from 'comlink codex --name NAME'")
+		return fmt.Errorf("--token-file goes with --server; a session's token comes from 'comlink %s --name NAME'", f.Client)
 	case f.Name != "" && f.TokenCommand != "":
-		return errors.New("--token-command goes with --server; a session's token comes from 'comlink codex --name NAME'")
+		return fmt.Errorf("--token-command goes with --server; a session's token comes from 'comlink %s --name NAME'", f.Client)
 	}
 	return nil
 }
 
 // CheckUnset rejects any of the flags given to the subcommand sub of
-// `comlink codex` (list), which kong lets inherit them.
+// `comlink <client>` (list), which kong lets inherit them.
 func (f Flags) CheckUnset(sub string) error {
-	if f != (Flags{}) {
-		return fmt.Errorf("'comlink codex %s' takes no flags; --stdio, --name, --server, --token-file, --token-command and --report-version go with 'comlink codex' itself", sub)
+	if f != (Flags{Client: f.Client}) {
+		flags := "--stdio, --name, --server, --token-file and --token-command"
+		if f.Client == Codex {
+			flags = "--stdio, --name, --server, --token-file, --token-command and --report-version"
+		}
+		return fmt.Errorf("'comlink %s %s' takes no flags; %s go with 'comlink %s' itself", f.Client, sub, flags, f.Client)
 	}
 	return nil
 }
 
-// Endpoint returns the Codex endpoint and credential that `comlink codex
-// --stdio` relays to: the running session Name's, or <Server>/codex with the
-// credential of TokenCommand, TokenFile or $COMLINK_TOKEN (warnings go to
-// logger). A token command is not run here: the relay runs it when it dials,
-// so the app's probe and setup commands never wait on it. The state
-// directory is opened only for Name.
+// Endpoint returns the endpoint and credential that `comlink <client>
+// --stdio` relays to: the running session Name's, or <Server>/<protocol>
+// with the credential of TokenCommand, TokenFile or $COMLINK_TOKEN
+// (warnings go to logger). A token command is not run here: the relay runs
+// it when it dials, so the app's probe and setup commands never wait on
+// it. The state directory is opened only for Name.
 func (f Flags) Endpoint(logger *log.Logger) (endpoint string, cred upstream.Credential, err error) {
 	if f.Name == "" {
-		if endpoint, err = upstream.Endpoint(f.Server, "codex"); err != nil {
+		if endpoint, err = upstream.Endpoint(f.Server, f.Client.Protocol()); err != nil {
 			return "", upstream.Credential{}, err
 		}
 		cred, err = upstream.LoadCredential(f.TokenFile, f.TokenCommand, logger)
@@ -85,10 +90,10 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint string, cred upstream.Cred
 	if err != nil {
 		return "", upstream.Credential{}, err
 	}
-	return store.Resolve(f.Name)
+	return store.Resolve(f.Client, f.Name)
 }
 
-// Up is `comlink codex --server URL [--name NAME]`. An explicit name is
+// Up is `comlink <client> --server URL [--name NAME]`. An explicit name is
 // used as is: Start refuses it when it is up, and when the ssh config at
 // sshConfig already applies to it (a Host line of the user's matches it,
 // see sshConfigured) Up warns on stderr once the session is up. Without a
@@ -105,13 +110,13 @@ func (f Flags) Endpoint(logger *log.Logger) (endpoint string, cred upstream.Cred
 // on stderr; the line stays after the session), so when that candidate is
 // up and the next two are configured the line is there by the time Up
 // refuses. Up then registers name with server and token, writes the ssh
-// config block whose ProxyCommand runs `<exe> codex --stdio --name NAME`,
+// config block whose ProxyCommand runs `<exe> <client> --stdio --name NAME`,
 // prints the alias and the server (redacted; the record keeps it whole) on
 // stdout, and holds the session until ctx is done. It
 // then removes the session's files and returns nil. When the Include line
 // cannot be added no session file is written.
-func (s *Store) Up(ctx context.Context, name, server string, cred upstream.Credential, exe, sshConfig string, stdout, stderr io.Writer) error {
-	if _, err := upstream.Endpoint(server, "codex"); err != nil {
+func (s *Store) Up(ctx context.Context, client Client, name, server string, cred upstream.Credential, exe, sshConfig string, stdout, stderr io.Writer) error {
+	if _, err := upstream.Endpoint(server, client.Protocol()); err != nil {
 		return err
 	}
 	derived := name == ""
@@ -131,7 +136,7 @@ func (s *Store) Up(ctx context.Context, name, server string, cred upstream.Crede
 		if n > 1 {
 			name = fmt.Sprintf("%s-%d", base, n)
 		}
-		block, err := sshd.ConfigBlock(name, []string{exe, "codex", "--stdio", "--name", name})
+		block, err := sshd.ConfigBlock(name, []string{exe, string(client), "--stdio", "--name", name})
 		if err != nil {
 			return err
 		}
@@ -154,7 +159,7 @@ func (s *Store) Up(ctx context.Context, name, server string, cred upstream.Crede
 			}
 			included = true
 		}
-		sess, err := s.Start(name, server, cred, block)
+		sess, err := s.Start(client, name, server, cred, block)
 		var up *upError
 		if derived && errors.As(err, &up) {
 			skipped = append(skipped, name+" is already up")
@@ -177,7 +182,7 @@ func (s *Store) Up(ctx context.Context, name, server string, cred upstream.Crede
 			_, _ = fmt.Fprintf(stdout, "  name:       %s (%s; --name sets another)\n", sess.Name, strings.Join(skipped, ", "))
 		}
 		_, _ = fmt.Fprintf(stdout, "  server:     %s\n", upstream.Redact(sess.Server))
-		_, _ = fmt.Fprintf(stdout, "  Codex app:  SSH connection %q (ssh %s)\n", sess.Name, sess.Name)
+		_, _ = fmt.Fprintf(stdout, "  %-11s SSH connection %q (ssh %s)\n", client.App()+":", sess.Name, sess.Name)
 		_, _ = fmt.Fprintln(stdout, "Press Ctrl-C to stop.")
 		<-ctx.Done()
 		return sess.Close()
@@ -209,21 +214,22 @@ func defaultName(server string) (name, why string) {
 	return "comlink", why
 }
 
-// Resolve returns the Codex endpoint and the credential of the session
+// Resolve returns the endpoint and the credential of client's session
 // called name; its token command, if any, is not run. A name that is not up
-// is a *NotUpError.
-func (s *Store) Resolve(name string) (endpoint string, cred upstream.Credential, err error) {
-	record, cred, err := s.Load(name)
+// is a *NotUpError; another client's session is an error too.
+func (s *Store) Resolve(client Client, name string) (endpoint string, cred upstream.Credential, err error) {
+	record, cred, err := s.Load(client, name)
 	if err != nil {
 		return "", upstream.Credential{}, err
 	}
-	return record.Codex, cred, nil
+	return record.Endpoint, cred, nil
 }
 
-// PrintList prints one line per session that is up (name, pid and server
-// without its userinfo or query; never the token) on stdout, reports removed stale records on stderr and
-// says on stderr when nothing is up.
-func (s *Store) PrintList(stdout, stderr io.Writer) error {
+// PrintList prints one line per session of client that is up (name, pid
+// and server without its userinfo or query; never the token) on stdout,
+// reports removed stale records of any client on stderr and says on stderr
+// when none of client's sessions is up.
+func (s *Store) PrintList(client Client, stdout, stderr io.Writer) error {
 	live, stale, err := s.List()
 	if err != nil {
 		return err
@@ -231,12 +237,16 @@ func (s *Store) PrintList(stdout, stderr io.Writer) error {
 	for _, r := range stale {
 		_, _ = fmt.Fprintf(stderr, "comlink: removed stale session %q (pid %d is gone)\n", r.Name, r.PID)
 	}
-	if len(live) == 0 {
-		_, _ = fmt.Fprintln(stderr, "comlink: no sessions are up")
-		return nil
-	}
+	n := 0
 	for _, r := range live {
+		if r.Client != client {
+			continue
+		}
+		n++
 		_, _ = fmt.Fprintf(stdout, "%s\tup\tpid %d\t%s\n", r.Name, r.PID, upstream.Redact(r.Server))
+	}
+	if n == 0 {
+		_, _ = fmt.Fprintf(stderr, "comlink: no %s sessions are up\n", client)
 	}
 	return nil
 }

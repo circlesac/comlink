@@ -34,7 +34,7 @@ func TestSessionLockLooks(t *testing.T) {
 	}
 
 	var notUp *session.NotUpError
-	if r, _, err := store.Load("gone"); !errors.As(err, &notUp) {
+	if r, _, err := store.Load(session.Codex, "gone"); !errors.As(err, &notUp) {
 		t.Fatalf("Load of a stale name during a look = %+v, %v; want not up", r, err)
 	}
 	live, stale, err := store.List()
@@ -43,18 +43,18 @@ func TestSessionLockLooks(t *testing.T) {
 	}
 	absent(t, record, token, conf)
 
-	sess, err := store.Start("held", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
+	sess, err := store.Start(session.Codex, "held", "wss://agent.example.com", upstream.Credential{Token: testToken}, "x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = sess.Close() }()
-	if _, _, err := store.Load("held"); err != nil {
+	if _, _, err := store.Load(session.Codex, "held"); err != nil {
 		t.Fatalf("Load of a held name: %v", err)
 	}
 	if live, _, err := store.List(); err != nil || len(live) != 1 || live[0].Name != "held" {
 		t.Fatalf("List with a held name = %+v, %v", live, err)
 	}
-	if _, err := store.Start("held", "wss://other.example.com", upstream.Credential{}, "y"); err == nil || err.Error() != `session "held" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
+	if _, err := store.Start(session.Codex, "held", "wss://other.example.com", upstream.Credential{}, "y"); err == nil || err.Error() != `session "held" is already up (pid `+strconv.Itoa(os.Getpid())+`)` {
 		t.Fatalf("Start of a held name: %v", err)
 	}
 }

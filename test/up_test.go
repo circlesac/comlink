@@ -255,7 +255,7 @@ func TestUpRegistersUntilStopped(t *testing.T) {
 	added := "comlink: created " + filepath.Join(home, ".ssh", "config") + " with \"" + line + "\"\n"
 
 	got := readRecord(t, record)
-	if want := (session.Record{Name: "agent-a", Server: "wss://agent.example.com/base/", Codex: "wss://agent.example.com/base/codex", PID: up.cmd.Process.Pid}); got != want {
+	if want := (session.Record{Name: "agent-a", Server: "wss://agent.example.com/base/", Client: session.Codex, Endpoint: "wss://agent.example.com/base/codex", PID: up.cmd.Process.Pid}); got != want {
 		t.Fatalf("record %+v, want %+v", got, want)
 	}
 	if b, _ := os.ReadFile(record); strings.Contains(string(b), `"acp"`) {
@@ -416,7 +416,7 @@ func TestListShowsLiveSessions(t *testing.T) {
 	bin := buildComlink(t)
 	env, _, state := sessionEnv(t)
 	stdout, stderr, code := runBinary(t, bin, env, "", "codex", "list")
-	if code != 0 || stdout != "" || stderr != "comlink: no sessions are up\n" {
+	if code != 0 || stdout != "" || stderr != "comlink: no codex sessions are up\n" {
 		t.Fatalf("list with nothing up: exit %d, stdout %q, stderr %q", code, stdout, stderr)
 	}
 
@@ -847,7 +847,7 @@ func TestUpSeveralNames(t *testing.T) {
 	}
 	for _, name := range []string{"agent-a", "agent-b", "agent-c"} {
 		got := readRecord(t, filepath.Join(state, "comlink", "run", name+".json"))
-		if got.Server != bases[name] || got.Codex != wantCodex[name] {
+		if got.Server != bases[name] || got.Endpoint != wantCodex[name] {
 			t.Errorf("%s record %+v, want codex %q", name, got, wantCodex[name])
 		}
 		codexRelayByName(t, env, config, name)
@@ -883,7 +883,7 @@ func TestUpDefaultName(t *testing.T) {
 		t.Fatalf("stdout:\n%s\nwant:\n%s", up.ready, want)
 	}
 	record, _, _, conf := sessionFiles(state, "padawan")
-	if got := readRecord(t, record); got.Name != "padawan" || got.Codex != server+"/codex" {
+	if got := readRecord(t, record); got.Name != "padawan" || got.Endpoint != server+"/codex" {
 		t.Fatalf("record %+v", got)
 	}
 	if b, err := os.ReadFile(conf); err != nil || !strings.HasPrefix(string(b), "Host padawan\n") || !strings.Contains(string(b), " codex --stdio --name padawan\n") {

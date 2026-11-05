@@ -1,16 +1,18 @@
 # comlink
 
 Front door that relays coding-agent clients to WebSocket agent endpoints:
-over SSH for the Codex desktop app, over stdio for ACP clients.
+over SSH for the Codex and Claude desktop apps, over stdio for ACP clients.
 
-A client that only knows how to reach a remote machine over SSH (today the
-Codex desktop app's SSH connections) runs `ssh <alias>`. The alias's
-`ProxyCommand` starts `comlink codex --stdio`, which speaks the server side of
-SSH on its own stdin/stdout, answers the few shell commands the client sends and relays
+A client that only knows how to reach a remote machine over SSH (the Codex
+desktop app's SSH connections, the Claude desktop app's SSH sessions) runs
+`ssh <alias>`. The alias's `ProxyCommand` starts `comlink codex --stdio` or
+`comlink claude --stdio`, which speaks the server side of SSH on its own
+stdin/stdout, answers the shell commands the client sends and relays
 the agent session to a WebSocket endpoint. There is no sshd, no shell and no
-listening port. The Codex app finds hosts through `~/.ssh/config`, so
-`comlink codex --server URL` registers a host named after the server (or
-`--name NAME`) for as long as it runs (see [Codex app](#codex-app)). ACP clients launch their
+listening port. Both apps find hosts through `~/.ssh/config`, so
+`comlink codex --server URL` and `comlink claude --server URL` register a
+host named after the server (or `--name NAME`) for as long as they run (see
+[Codex app](#codex-app) and [Claude app](#claude-app)). ACP clients launch their
 agent as a local subprocess when they need it, so they need no
 registration: their agent command is `comlink acp --server URL`, which
 bridges stdio to the remote agent's WebSocket and ends with the client (see
@@ -22,11 +24,16 @@ bridges stdio to the remote agent's WebSocket and ends with the client (see
 - comlink does not implement any agent protocol. It recognises the command
   that opens an agent session and moves WebSocket messages between the SSH
   channel (or, for ACP, stdio) and the upstream endpoint. The protocol lives
-  in the endpoint.
+  in the endpoint. The Claude app is the one client that has no WebSocket
+  mode at all: it uploads a helper to the SSH host and spawns Claude Code
+  through it, so the Claude route stands in for both and turns each chat
+  into an ACP session on the endpoint (see [Claude app](#claude-app)).
 - Each supported client is a route. The Codex app is the first route; ACP
-  clients are the second, through `comlink acp`.
+  clients are the second, through `comlink acp`; the Claude app is the third.
 - Commands are matched against what the client actually sends; nothing is
   ever executed. An unrecognised command is logged to stderr and exits 127.
+  The Claude route answers the app's probe from a virtual home directory
+  that exists only for the connection.
 - The upstream token is a secret: it is read from a file, the environment or
   the output of a token command, and never printed, logged or placed in an
   error.
@@ -37,6 +44,9 @@ bridges stdio to the remote agent's WebSocket and ends with the client (see
 comlink codex --server URL [--name NAME] [--token-file PATH | --token-command CMD]
 comlink codex --stdio (--name NAME | --server URL [--token-file PATH | --token-command CMD]) [--report-version V]
 comlink codex list
+comlink claude --server URL [--name NAME] [--token-file PATH | --token-command CMD]
+comlink claude --stdio (--name NAME | --server URL [--token-file PATH | --token-command CMD])
+comlink claude list
 comlink acp --server URL [--token-file PATH | --token-command CMD]
 ```
 
@@ -54,12 +64,16 @@ is optional (the session picks a free name and says which) and
 `comlink codex list` prints the names that are up and does not take the
 flags of `comlink codex`. There is no setup command: a session adds the one
 line to `~/.ssh/config` that lets the Codex app find every session when it
-is missing.
+is missing. `comlink claude` is the same command group for the Claude
+desktop app, without `--report-version` (see [Claude app](#claude-app)); a
+name is one session's, whichever app's, and `list` prints only its own
+app's.
 `comlink acp` is the agent command of an ACP client (see
 [ACP clients](#acp-clients)). `--server` is always a comlink server's base
-URL: the Codex commands use `<server>/codex` and `comlink acp` uses
-`<server>/acp`. `comlink --help`, `comlink codex --help` and `--help` on
-each command print their usage; `comlink --version` prints the version.
+URL: the Codex commands use `<server>/codex`, and `comlink claude` and
+`comlink acp` use `<server>/acp`. `comlink --help`, `comlink codex --help`,
+`comlink claude --help` and `--help` on each command print their usage;
+`comlink --version` prints the version.
 
 ## Layout
 
@@ -67,10 +81,11 @@ each command print their usage; `comlink --version` prints the version.
 main.go                CLI declaration and wiring
 internal/sshd/         SSH server, client-agnostic: host key, global and session requests; hands exec to a route; renders an ssh config block around a given ProxyCommand
 internal/codex/        Codex app route: command matching and the WebSocket relay
+internal/claude/       Claude app route: the probe and setup commands answered from a virtual home (shell.go, vfs.go), the sftp subsystem on it (sftp.go), the helper's JSON-RPC bridge and process table (bridge.go), and the stand-in Claude Code that turns stream-json into an ACP session (cli.go, acp.go)
 internal/acp/          ACP stdio bridge: stdin lines to text frames and text frames to stdout lines
-internal/session/      Codex sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the static ~/.ssh/config scan of a session name, picking a free name without --name, the flag checks of comlink codex, and the up / list / resolve / --stdio endpoint bodies behind main.go
+internal/session/      Codex and Claude sessions: the record, token and ssh config files under the state directory (each renamed into place whole), liveness by file lock, adding the ~/.ssh/config Include at session start, the static ~/.ssh/config scan of a session name, picking a free name without --name, the flag checks of comlink codex and comlink claude, and the up / list / resolve / --stdio endpoint bodies behind main.go
 internal/upstream/     the <server>/codex and <server>/acp endpoints of a base URL; upstream WebSocket dial with the bearer token, the read limit and URL redaction for errors and printed output; token loading from a file or $COMLINK_TOKEN
-test/                  all tests, black-box through the exported API and the built binary; testdata/ holds the captured Codex commands
+test/                  all tests, black-box through the exported API and the built binary; testdata/ holds the captured Codex and Claude app commands
 ```
 
 ## Install
@@ -325,6 +340,90 @@ with a real host called `<alias>`. `--report-version` (with `--stdio`) sets
 the Codex version reported to `codex --version` (default `0.165.0`); the app
 refuses versions below its minimum.
 
+## Claude app
+
+The Claude desktop app's Code tab opens sessions on SSH hosts from
+`~/.ssh/config`, the way the Codex app does, but it expects a real machine
+there: it uploads its own helper (`claude-ssh`) over SFTP, talks JSON-RPC
+to that helper over an exec channel, and has the helper download and spawn
+Claude Code, whose stream-json it then drives. comlink plays the machine,
+the helper and Claude Code, with no file written anywhere, and runs each
+chat as an ACP session on `<server>/acp`. Start a session and leave it
+running, as for the Codex app:
+
+```sh
+comlink claude --server wss://example-agent.example.com \
+  --token-file ~/.config/comlink/token
+```
+
+```
+example-agent is up (pid 4242)
+  name:       example-agent, the first label of the server's host (--name sets another)
+  server:     wss://example-agent.example.com
+  Claude app: SSH connection "example-agent" (ssh example-agent)
+Press Ctrl-C to stop.
+```
+
+Then pick `example-agent` as the SSH host of a new session in the app. The
+name rules, the `name:` line, `--name`, the token flags, the state
+directory and `comlink claude list` are those of [Codex app](#codex-app),
+with `claude` for `codex` and `<server>/acp` for `<server>/codex`; one name
+is one session, whichever app's, so a Claude and a Codex session on the
+same server get `example-agent` and `example-agent-2`. An app that is
+configured for an API gateway (its managed `claudeGateway` settings) also
+needs the alias in its `sshHostAllowlist`, and refuses remote sessions
+while the gateway is on localhost; that is the app's rule, not comlink's.
+
+### How the Claude app connects
+
+`ssh example-agent` runs the block's `ProxyCommand`, `comlink claude
+--stdio --name example-agent`, which serves that one SSH connection. The
+app keeps the connection as an ssh control master and opens channels on it:
+
+- The sftp subsystem, which comlink serves on a virtual home directory
+  (`/home/comlink`) that lives for the connection: the app's `lstat` of the
+  home and its parents, the `~/.claude/remote` tree it expects after its own
+  setup, the token file it writes, uploads (kept by size, the bytes
+  dropped), renames, removes and reads.
+- The probe, one exec of a long shell line (`echo __PRBG__; test "$HOME" =
+  ...; printenv HOME; uname -sm; id -u; ...; "$HOME/.claude/remote/srv/<hash>/server"
+  --version; ...; exec ... --bridge`). comlink interprets the line itself, a
+  builtin at a time, against the virtual home and reports what the app
+  wants to see: its home, `Linux x86_64`, uid 1000, the helper version the
+  app asked about (the hash is taken from the command line) and an
+  installed CLI, so the probe ends by starting the bridge on the same
+  channel and the app never uploads or installs anything. A stale
+  `$HOME` check fails with the app's own exit 93, as on a real host. When
+  the app does install (`--install`, `--stop`, `--serve`), those are
+  answered too.
+- The bridge, newline-delimited JSON-RPC on the exec channel, which comlink
+  serves for the methods it announces in `server.capabilities`: `server.*`,
+  `files.read/stat/list/realpath` on the virtual home, `git.info` (never a
+  repository), `plugins.prune`, and the `process.*` family. Every line
+  carries the helper's `end` marker, so the app can reattach to a process
+  after a lost connection and get its output again from a sequence number.
+- `process.spawn` of Claude Code is where the chat starts: comlink starts a
+  virtual process that answers the app's control requests (`initialize`,
+  permission mode, usage, MCP status, UI attach and render, ...) with empty
+  but well-formed replies and, for each user message, dials `<server>/acp`
+  once with the session's token, opens one ACP session for the chat, sends
+  the message as the prompt and renders the agent's updates as stream-json:
+  message chunks as text deltas, thought chunks as thinking, a tool call as
+  a `tool_use` block and its completion as a `tool_result`, and an upstream
+  permission request as the app's own permission prompt (allow picks the
+  agent's allow option, deny its reject option). The app's interrupt
+  cancels the prompt. `process.spawn` of the shell commands the app runs to
+  read transcripts is answered as a host without transcripts would answer
+  it, so the app shows the chat from its own stream.
+
+What is not there: no files beyond the virtual home (the app's folder
+picker shows an empty home), no git, no plugins or skills on the agent side
+beyond what the endpoint provides, no transcript history across app
+restarts beyond what the app keeps itself, and no reattach once the
+`comlink claude --stdio` process is gone (each connection the app opens
+starts its own). The endpoint decides what the agent can do; comlink only
+relays the chat and the permission answers.
+
 ## ACP clients
 
 An ACP client such as Zed starts its agent as a local subprocess when it
@@ -357,7 +456,7 @@ client closes stdin, comlink closes the upstream with status 1000 and exits
 otherwise. An upstream that cannot be reached or refuses the token is one
 stderr line naming the URL without its query or userinfo, and exit 1.
 
-## Refreshing the Codex fixtures
+## Refreshing the fixtures
 
 `test/testdata/codex-app-proxy.txt` is the exec string the Codex app
 sends to open the app-server proxy, captured from a real client.
@@ -380,6 +479,16 @@ the app can reach over SSH with a real sshd:
    (`codex-app-unknown.txt` is always regenerated this way). Then update the
    contract in `AGENTS.md`.
 
+`test/testdata/claude-app-probe.txt`, `claude-app-bridge.txt`,
+`claude-app-install.txt` and `claude-app-serve.txt` are the exec strings
+the Claude desktop app sends on a connection to a host it has set up
+before (the probe that ends in `--bridge`, the plain bridge exec, the
+install step and the stop-and-serve step), captured the same way with the
+home directory replaced by comlink's virtual home, `/home/comlink`. The
+helper's RPC shapes and the stream-json the app sends to Claude Code were
+captured from the bridge channel of the same recording; `AGENTS.md` lists
+them.
+
 ## Tests
 
 ```sh
@@ -393,8 +502,8 @@ go tool cover -func=coverage.out | tail -1
 All tests live in `test/`, one package with a file per subject, and use only
 the exported API or the built binary: `internal/` has no tests and nothing
 is exported for testing. Most tests run an SSH client against `sshd.Serve`
-with the Codex route and look at what the client sees: stdout bytes, stderr,
-the exit status and the route's log. Tests that need the binary build it
+with the Codex or Claude route and look at what the client sees: stdout
+bytes, stderr, the exit status and the route's log. Tests that need the binary build it
 once per run (`buildComlink`) and run it with a temporary `HOME` and
 `XDG_STATE_HOME`.
 
@@ -410,9 +519,19 @@ once per run (`buildComlink`) and run it with a temporary `HOME` and
   (1001 to the upstream when the client goes away without a close frame),
   and a write blocked on a client that stopped reading being released when
   the client's connection closes.
+- `claude_test.go`: the Claude route. The captured probe answered up to
+  the bridge taking over the channel, the install and serve steps, the
+  sftp subsystem on the virtual home (the app's operations, uploads,
+  renames, what the bridge then sees), a chat as an ACP session against a
+  scripted upstream (control requests, lifecycle lines, text and thinking
+  deltas, a tool call with its permission prompt and result, the result
+  line, a second turn, interrupt, reattach from a second bridge, kill),
+  upstream and token failures reported in the result, and the shell
+  commands the app spawns.
 - `sshd_test.go`: the server with a stand-in route. The exec handoff,
   one exec per session, malformed requests, the port-forward replies, the
-  refused shell, pty, subsystem and channel types, and `StdioConn`.
+  refused shell, pty, subsystem and channel types, a route that serves a
+  subsystem, and `StdioConn`.
 - `config_test.go`: the ssh config block for a given `ProxyCommand`
   argument list, its shell quoting, that `sh` splits the `ProxyCommand` line
   back into the original arguments, the accepted and refused aliases, and

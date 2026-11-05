@@ -19,6 +19,15 @@ type Route interface {
 	Exec(ch ssh.Channel, command string) (status int)
 }
 
+// SubsystemRoute is a Route that also serves subsystem requests (the Claude
+// app opens sftp). Subsystem returns the handler for name, which serves the
+// channel and returns the exit status, or false to refuse name. A Route
+// without it refuses every subsystem.
+type SubsystemRoute interface {
+	Route
+	Subsystem(name string) (handler func(ssh.Channel) int, ok bool)
+}
+
 // Serve speaks the server side of SSH on conn for one connection and returns
 // when the client disconnects. No client authentication is performed: the
 // transport is the user's own ProxyCommand process, not a network listener.
@@ -81,12 +90,23 @@ func handleGlobalRequests(reqs <-chan *ssh.Request) {
 	}
 }
 
-// handleSession answers the requests on one session channel. Only exec is
-// served; shell, pty, subsystem and agent forwarding are refused.
+// handleSession answers the requests on one session channel. One exec, or
+// one subsystem the route serves, is run per channel; shell, pty and agent
+// forwarding are refused.
 func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, route Route) {
 	defer func() { _ = ch.Close() }()
 	done := make(chan struct{})
 	ran := false
+	start := func(run func() int) {
+		ran = true
+		go func() {
+			defer close(done)
+			status := run()
+			_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(status)}))
+			_ = ch.CloseWrite()
+			_ = ch.Close()
+		}()
+	}
 	for req := range reqs {
 		switch req.Type {
 		case "env":
@@ -97,17 +117,24 @@ func handleSession(ch ssh.Channel, reqs <-chan *ssh.Request, route Route) {
 				_ = req.Reply(false, nil)
 				continue
 			}
-			ran = true
 			_ = req.Reply(true, nil)
-			go func() {
-				defer close(done)
-				status := route.Exec(ch, payload.Command)
-				_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{uint32(status)}))
-				_ = ch.CloseWrite()
-				_ = ch.Close()
-			}()
+			start(func() int { return route.Exec(ch, payload.Command) })
+		case "subsystem":
+			var payload struct{ Name string }
+			sub, ok := route.(SubsystemRoute)
+			if err := ssh.Unmarshal(req.Payload, &payload); err != nil || ran || !ok {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			handler, ok := sub.Subsystem(payload.Name)
+			if !ok {
+				_ = req.Reply(false, nil)
+				continue
+			}
+			_ = req.Reply(true, nil)
+			start(func() int { return handler(ch) })
 		default:
-			// shell, pty-req, subsystem (including sftp), auth-agent-req@openssh.com, ...
+			// shell, pty-req, subsystem a route does not serve, auth-agent-req@openssh.com, ...
 			if req.WantReply {
 				_ = req.Reply(false, nil)
 			}
