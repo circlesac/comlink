@@ -291,3 +291,55 @@ func writeTokenFile(t *testing.T, mode os.FileMode) string {
 	}
 	return path
 }
+
+// TestOpenSSHClaudeProbe runs the Claude app's probe through the real ssh
+// client with `comlink claude --stdio --server` as its ProxyCommand: the
+// probe's markers come back, then the bridge answers a request on the same
+// channel, and the sftp subsystem opens.
+func TestOpenSSHClaudeProbe(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("ssh not on PATH")
+	}
+	bin := buildComlink(t)
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proxy := quote(bin) + " claude --stdio --server ws://127.0.0.1:1 --token-file " + quote(tokenFile)
+	stateHome := t.TempDir()
+	sshArgs := func(extra ...string) []string {
+		return append([]string{"-F", "/dev/null", "-o", "ProxyCommand=" + proxy, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}, extra...)
+	}
+
+	cmd := exec.Command("ssh", sshArgs("comlink@example-agent", "--", readFixture(t, "claude-app-probe.txt"))...)
+	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+stateHome)
+	cmd.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":"reattach-0","method":"server.capabilities","auth":"x"}` + "\n")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ssh: %v\nstdout: %s\nstderr: %s", err, out, stderr.String())
+	}
+	for _, want := range []string{"__PRBG__\n", "\n/home/comlink\n", "\nclaude-ssh b3081b512da230f24d74a2082a678246a89685ee (built ", "__PRBEND__\n{\"id\":\"reattach-0\",\"jsonrpc\":\"2.0\",\"result\":{", "\"version\":\"b3081b512da230f24d74a2082a678246a89685ee\"}", "\"end\":{\"at\":0,\"len\":"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("stdout lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(string(out), "__NOEXEC__") || strings.Contains(stderr.String(), testToken) {
+		t.Fatalf("stdout %q stderr %q", out, stderr.String())
+	}
+
+	// The sftp subsystem: INIT is answered with VERSION 3.
+	cmd = exec.Command("ssh", sshArgs("-s", "comlink@example-agent", "sftp")...)
+	cmd.Env = append(os.Environ(), "XDG_STATE_HOME="+stateHome)
+	cmd.Stdin = bytes.NewReader([]byte{0, 0, 0, 5, 1, 0, 0, 0, 3})
+	stderr.Reset()
+	cmd.Stderr = &stderr
+	out, err = cmd.Output()
+	if err != nil {
+		t.Fatalf("ssh -s sftp: %v\nstderr: %s", err, stderr.String())
+	}
+	if len(out) < 9 || out[4] != 2 || out[8] != 3 {
+		t.Fatalf("sftp VERSION reply %x", out)
+	}
+}

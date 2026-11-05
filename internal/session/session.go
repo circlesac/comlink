@@ -1,12 +1,12 @@
-// Package session is the registry of the Codex app's named sessions.
-// `comlink codex --server URL [--name NAME]` registers NAME (by default the
-// first label of the server's host) for as long as it runs;
-// `comlink codex --stdio --name NAME`, which ssh runs for the alias, looks NAME
-// up to find the server, and `comlink codex list` shows what is up.
-// Everything lives under the state directory ($XDG_STATE_HOME/comlink,
-// default ~/.local/state/comlink):
+// Package session is the registry of the named sessions of the SSH
+// clients (the Codex app and the Claude app). `comlink <client> --server
+// URL [--name NAME]` registers NAME (by default the first label of the
+// server's host) for as long as it runs; `comlink <client> --stdio --name
+// NAME`, which ssh runs for the alias, looks NAME up to find the server,
+// and `comlink <client> list` shows what is up. Everything lives under the
+// state directory ($XDG_STATE_HOME/comlink, default ~/.local/state/comlink):
 //
-//	run/NAME.json   the record: name, server, the /codex endpoint and the pid
+//	run/NAME.json   the record: name, client, server, the endpoint and the pid
 //	run/NAME.token          the bearer token, mode 0600 (never in the record)
 //	run/NAME.token-command  instead of the token: the command that prints one
 //	                        with the working directory and PATH it was given
@@ -16,7 +16,7 @@
 //
 // The record, the token (or token command) file and the ssh config file are each written to a
 // temporary file in the same directory and renamed into place, so ssh, the
-// Codex app and `codex --stdio --name` never read a half-written file.
+// app and `--stdio --name` never read a half-written file.
 //
 // A session is up while its lock is held: the lock is released by the
 // kernel when the session process ends, however it ends, so a record whose
@@ -37,19 +37,49 @@ import (
 	"github.com/circlesac/comlink/internal/upstream"
 )
 
-// Record is what `comlink codex` registers for a name.
-type Record struct {
-	Name   string `json:"name"`
-	Server string `json:"server"` // base URL; the token is never here
-	Codex  string `json:"codex"`  // <server>/codex, the Codex app-server endpoint
-	PID    int    `json:"pid"`
+// Client is an SSH client comlink registers sessions for: the name of its
+// command group, `comlink <client>`.
+type Client string
+
+const (
+	Codex  Client = "codex"  // the Codex desktop app, relayed to <server>/codex
+	Claude Client = "claude" // the Claude desktop app, relayed to <server>/acp
+)
+
+// Protocol is the endpoint under the server's base URL the client's
+// sessions are relayed to.
+func (c Client) Protocol() string {
+	if c == Claude {
+		return "acp"
+	}
+	return string(c)
 }
 
-// NotUpError is returned when a name has no live session.
-type NotUpError struct{ Name string }
+// App is how the client is named in printed output.
+func (c Client) App() string {
+	if c == Claude {
+		return "Claude app"
+	}
+	return "Codex app"
+}
+
+// Record is what `comlink <client>` registers for a name.
+type Record struct {
+	Name     string `json:"name"`
+	Client   Client `json:"client"`
+	Server   string `json:"server"`   // base URL; the token is never here
+	Endpoint string `json:"endpoint"` // <server>/codex or <server>/acp, what the client's sessions are relayed to
+	PID      int    `json:"pid"`
+}
+
+// NotUpError is returned when a name has no live session of the client.
+type NotUpError struct {
+	Name   string
+	Client Client
+}
 
 func (e *NotUpError) Error() string {
-	return fmt.Sprintf("session %q is not up: run 'comlink codex --name %s --server URL' first", e.Name, e.Name)
+	return fmt.Sprintf("session %q is not up: run 'comlink %s --name %s --server URL' first", e.Name, e.Client, e.Name)
 }
 
 // Store is the registry under one state directory.
@@ -128,16 +158,17 @@ type Session struct {
 	lock     *os.File
 }
 
-// Start registers name with server and credential cred (its token, or its
-// token command, which is stored rather than run), writes sshConfig as the
-// name's ssh config file, and returns the session, which stays up until
-// Close. It fails when name is already up. A stale record (its session
-// process is gone) is removed and replaced, and returned as Replaced.
-func (s *Store) Start(name, server string, cred upstream.Credential, sshConfig string) (*Session, error) {
+// Start registers name for client with server and credential cred (its
+// token, or its token command, which is stored rather than run), writes
+// sshConfig as the name's ssh config file, and returns the session, which
+// stays up until Close. It fails when name is already up, whichever
+// client's. A stale record (its session process is gone) is removed and
+// replaced, and returned as Replaced.
+func (s *Store) Start(client Client, name, server string, cred upstream.Credential, sshConfig string) (*Session, error) {
 	if !ValidName(name) {
 		return nil, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
 	}
-	codex, err := upstream.Endpoint(server, "codex")
+	endpoint, err := upstream.Endpoint(server, client.Protocol())
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +192,7 @@ func (s *Store) Start(name, server string, cred upstream.Credential, sshConfig s
 		return nil, err
 	}
 	sess := &Session{
-		Record: Record{Name: name, Server: server, Codex: codex, PID: os.Getpid()},
+		Record: Record{Name: name, Client: client, Server: server, Endpoint: endpoint, PID: os.Getpid()},
 		store:  s,
 		lock:   lock,
 	}
@@ -262,23 +293,27 @@ func (s *Store) read(name string) (Record, error) {
 	return r, nil
 }
 
-// Load returns the record and the credential of name when it is up (a
-// token command is returned, not run), and a *NotUpError when it has no
-// record or token file (as inside Close) or its session process is gone. It
-// does not remove a stale record; List and Start do.
-func (s *Store) Load(name string) (Record, upstream.Credential, error) {
+// Load returns the record and the credential of name when it is up as a
+// session of client (a token command is returned, not run), and a
+// *NotUpError when it has no record or token file (as inside Close), its
+// session process is gone or it is another client's session. It does not
+// remove a stale record; List and Start do.
+func (s *Store) Load(client Client, name string) (Record, upstream.Credential, error) {
 	if !ValidName(name) {
 		return Record{}, upstream.Credential{}, fmt.Errorf("invalid name %q: use only letters, digits, '-', '_' and '.', not starting with '-'", name)
 	}
 	r, err := s.read(name)
 	if errors.Is(err, fs.ErrNotExist) {
-		return Record{}, upstream.Credential{}, &NotUpError{Name: name}
+		return Record{}, upstream.Credential{}, &NotUpError{Name: name, Client: client}
 	}
 	if err != nil {
 		return Record{}, upstream.Credential{}, err
 	}
 	if !held(s.lockPath(name), r.PID) {
-		return Record{}, upstream.Credential{}, &NotUpError{Name: name}
+		return Record{}, upstream.Credential{}, &NotUpError{Name: name, Client: client}
+	}
+	if r.Client != client {
+		return Record{}, upstream.Credential{}, fmt.Errorf("session %q is a %s session, not a %s one", name, r.Client, client)
 	}
 	command, err := os.ReadFile(s.commandPath(name))
 	if err == nil {
@@ -295,7 +330,7 @@ func (s *Store) Load(name string) (Record, upstream.Credential, error) {
 	if errors.Is(err, fs.ErrNotExist) {
 		// Close removes the files before it releases the lock, so a session
 		// that is ending can be held without its token.
-		return Record{}, upstream.Credential{}, &NotUpError{Name: name}
+		return Record{}, upstream.Credential{}, &NotUpError{Name: name, Client: client}
 	}
 	if err != nil {
 		return Record{}, upstream.Credential{}, fmt.Errorf("read token file: %w", err)

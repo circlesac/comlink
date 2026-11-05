@@ -259,3 +259,75 @@ func TestStdioConn(t *testing.T) {
 		t.Fatalf("close without closers: %v", err)
 	}
 }
+
+// subsystemRoute is a fakeRoute that also serves the "echo" subsystem,
+// which writes "sub:<name>" and exits 7.
+type subsystemRoute struct {
+	fakeRoute
+}
+
+func (r *subsystemRoute) Subsystem(name string) (func(ssh.Channel) int, bool) {
+	if name != "echo" {
+		return nil, false
+	}
+	return func(ch ssh.Channel) int {
+		_, _ = io.WriteString(ch, "sub:"+name)
+		return 7
+	}, true
+}
+
+func TestServeHandsSubsystemToRoute(t *testing.T) {
+	route := &subsystemRoute{fakeRoute{block: make(chan struct{})}}
+	client := startServer(t, route)
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ssh client does not start a session for a subsystem, so its
+	// output is read from the channel until the handler closes it.
+	stdout, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.RequestSubsystem("echo"); err != nil {
+		t.Fatalf("echo subsystem: %v", err)
+	}
+	out, err := io.ReadAll(stdout)
+	if err != nil || string(out) != "sub:echo" {
+		t.Fatalf("stdout %q, %v", out, err)
+	}
+	_ = sess.Close()
+
+	// A name the route does not serve is refused, as is a second request on
+	// a session that ran one, and the exec in that order.
+	sess, err = client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.RequestSubsystem("sftp"); err == nil {
+		t.Fatal("sftp subsystem request was accepted")
+	}
+	_ = sess.Close()
+
+	sess, err = client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sess.Close() }()
+	if err := sess.Start("first"); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := sess.SendRequest("subsystem", true, ssh.Marshal(struct{ Name string }{"echo"}))
+	if err != nil || ok {
+		t.Fatalf("subsystem after exec: ok=%v err=%v, want refused", ok, err)
+	}
+	ok, err = sess.SendRequest("subsystem", true, []byte{0, 0, 0, 9, 'x'})
+	if err != nil || ok {
+		t.Fatalf("malformed subsystem: ok=%v err=%v, want refused", ok, err)
+	}
+	close(route.block)
+	if got := exitStatus(t, sess.Wait()); got != 0 {
+		t.Fatalf("exit status = %d", got)
+	}
+}
