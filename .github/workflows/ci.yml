@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # To rerun the checks on main by hand, for example after a runner change.
+  workflow_dispatch:
 
 permissions:
   contents: read
