@@ -968,8 +968,15 @@ func TestClaudeChatIsAnACPSession(t *testing.T) {
 	b.stdin_("proc-1", strings.Join(lines, "\n")+"\n")
 	for i := range lines {
 		m := cli.expect("control_response", "")
-		if r := m["response"].(map[string]any); r["request_id"] != fmt.Sprintf("c%d", i) || r["subtype"] != "success" {
+		r := m["response"].(map[string]any)
+		if r["request_id"] != fmt.Sprintf("c%d", i) || r["subtype"] != "success" {
 			t.Fatalf("control response %d: %v", i, m)
+		}
+		// The app reads parentSettingsIncluded as "the policy I sent is in force".
+		if i == 1 {
+			if state := r["response"].(map[string]any)["state"].(map[string]any); state["parentSettingsIncluded"] != true {
+				t.Fatalf("list_permission_rules state %v", state)
+			}
 		}
 	}
 	// A user message runs a prompt.

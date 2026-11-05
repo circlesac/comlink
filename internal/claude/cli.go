@@ -161,7 +161,7 @@ func (c *cli) control(requestID string, raw json.RawMessage) {
 			"hooks_applied":           false,
 		})
 	case "list_permission_rules":
-		c.respond(requestID, map[string]any{"state": map[string]any{"rules": []any{}, "workspaceDirectories": []string{c.cwd}, "originalCwd": c.cwd, "managedOnly": false, "parentSettingsIncluded": false}})
+		c.respond(requestID, map[string]any{"state": map[string]any{"rules": []any{}, "workspaceDirectories": []string{c.cwd}, "originalCwd": c.cwd, "managedOnly": false, "parentSettingsIncluded": true}})
 	case "get_usage":
 		c.respond(requestID, map[string]any{"session": map[string]any{"total_cost_usd": 0, "total_api_duration_ms": 0, "total_duration_ms": 0, "total_lines_added": 0, "total_lines_removed": 0, "model_usage": map[string]any{}}, "subscription_type": nil, "rate_limits_available": false, "rate_limits": nil, "behaviors": nil})
 	case "mcp_status":
