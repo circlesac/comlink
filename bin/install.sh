@@ -19,8 +19,11 @@ case "$OS-$ARCH" in
 		;;
 esac
 
-VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
-	sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+# The latest release's tag comes from the redirect of the releases/latest page, which
+# needs no GitHub API call: the API allows an unauthenticated client only 60 requests an
+# hour per address, so an installer that used it failed behind a shared address.
+VERSION=$(curl -fsSI -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest" |
+	sed -n 's#.*/releases/tag/\([^/?]*\).*#\1#p')
 if [ -z "$VERSION" ]; then
 	echo "Could not determine the latest comlink version" >&2
 	exit 1
