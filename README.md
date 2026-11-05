@@ -557,6 +557,12 @@ platform into `dist/` with the latest Go, adds the SBOM and checksums, and publi
 the tests and `govulncheck`, and attests the archives between `build` and `publish`. Locally it needs
 `go`, `npx`, `zip` and an authenticated `gh`; it uses no other secret.
 
+## License
+
+[FSL-1.1-MIT](LICENSE.md): you may read, use and modify the source, but not
+offer it as a competing product or service. Each version becomes MIT two years
+after it is released.
+
 ## Tooling
 
 | Package | Version | Release date | Deciding criterion |
