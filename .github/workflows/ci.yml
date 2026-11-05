@@ -5,14 +5,19 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ${{ fromJSON(vars.LINUX_RUNNER) }}
+    # GitHub-hosted: a public repository's pull requests must not run on Circles' self-hosted runners.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
+          check-latest: true
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - uses: golangci/golangci-lint-action@v9
@@ -25,8 +30,42 @@ jobs:
           go tool cover -func=coverage.out | tail -1
           total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub("%", "", $NF); print $NF }')
           awk -v total="$total" 'BEGIN { exit !(total >= 80) }'
-      - name: build and run the binary
+      - name: no known vulnerabilities in called code
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  targets:
+    # GitHub offers its Arm Linux and Windows runners to public repositories only, so a private
+    # repository smoke-tests the other targets.
+    runs-on: ubuntu-24.04
+    outputs:
+      include: ${{ steps.list.outputs.include }}
+    steps:
+      - id: list
+        env:
+          PRIVATE: ${{ github.event.repository.private }}
         run: |
-          go build -o comlink .
-          ./comlink --help
-          ./comlink --version
+          all='[{"runner":"ubuntu-24.04","target":"linux/amd64"},{"runner":"ubuntu-24.04-arm","target":"linux/arm64","public_only":true},{"runner":"macos-15","target":"darwin/arm64"},{"runner":"macos-15-intel","target":"darwin/amd64"},{"runner":"windows-2025","target":"windows/amd64"},{"runner":"windows-11-arm","target":"windows/arm64","public_only":true}]'
+          if [ "$PRIVATE" = true ]; then all=$(echo "$all" | jq -c 'map(select(.public_only != true))'); fi
+          echo "include=$all" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    # Every released target is built and run on its own platform.
+    needs: targets
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.targets.outputs.include) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      - name: build and run the binary
+        shell: bash
+        run: |
+          test "$(go env GOOS)/$(go env GOARCH)" = "${{ matrix.target }}"
+          go build -o comlink-smoke .
+          ./comlink-smoke --help
+          ./comlink-smoke --version

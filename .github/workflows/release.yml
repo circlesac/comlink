@@ -1,0 +1,36 @@
+name: release
+
+# A production release: started by a person, from main only. The procedure is scripts/release.sh.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+      - run: go test ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - run: scripts/release.sh build
+      # GitHub attestations need a public repository on the Free plan.
+      - if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - run: scripts/release.sh publish
+        env:
+          GH_TOKEN: ${{ github.token }}

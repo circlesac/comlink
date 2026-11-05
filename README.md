@@ -75,22 +75,20 @@ test/                  all tests, black-box through the exported API and the bui
 
 ## Install
 
-Build from a checkout:
+Releases carry a binary for macOS, Linux and Windows on `amd64` and `arm64`,
+with `checksums.txt`, an SBOM and, once published from a public build, a
+GitHub build-provenance attestation. On macOS or Linux:
 
 ```sh
-go build -o comlink .
+curl -fsSL https://github.com/circlesac/comlink/releases/latest/download/install.sh | sh
 ```
 
-Alternatively, since the repository is private, tell Go not to use the
-module proxy for it and install directly:
-
-```sh
-GOPRIVATE=github.com/circlesac go install github.com/circlesac/comlink@latest
-```
-
-This needs `git` to be able to authenticate to GitHub (for example through
-`gh auth setup-git` or an SSH key with a `url.<ssh>.insteadOf` rewrite),
-because `go install` fetches the module with git.
+The script installs the latest release into `~/.local/bin` (set
+`INSTALL_DIR` to change it) after checking the archive against
+`checksums.txt`. On Windows, download `comlink-windows-<arch>.zip` from the
+[releases](https://github.com/circlesac/comlink/releases). With Go installed,
+`go install github.com/circlesac/comlink@latest` also works, and
+`go build -o comlink .` builds a checkout.
 
 ## Codex app
 
@@ -545,7 +543,19 @@ CI fails when the total statement coverage is below 80%. `main.go` is only
 exercised through the tests that run the built binary, so it does not count
 towards the profile; it stays thin and the command bodies live in
 `internal/session` and `internal/upstream`, where the in-process tests reach them. CI runs the same
-commands and then builds the binary and runs `--help` and `--version`.
+commands with the latest stable Go, fails on a known vulnerability in code comlink calls
+(`govulncheck`), and builds and runs `--help` and `--version` on every released platform. CI uses
+GitHub-hosted runners; GitHub offers its Arm Linux and Windows runners to public repositories only,
+so a private copy of the repository smoke-tests the other four platforms.
+
+## Release
+
+`scripts/release.sh` is the whole procedure. From a clean `main` it computes the next CalVer version
+from the git tags with `@circlesac/oneup`, writes it into `version.go` for the build only, builds every
+platform into `dist/` with the latest Go, adds the SBOM and checksums, and publishes the GitHub Release
+`v<version>` on that commit. The `release` workflow runs it when dispatched by hand from `main`, after
+the tests and `govulncheck`, and attests the archives between `build` and `publish`. Locally it needs
+`go`, `npx`, `zip` and an authenticated `gh`; it uses no other secret.
 
 ## Tooling
 
@@ -555,3 +565,6 @@ commands and then builds the binary and runs `--help` and `--version`.
 | `golang.org/x/crypto/ssh` | v0.58.0 | 2026-10-09 | The SSH server implementation; the maintained Go SSH library. |
 | `github.com/coder/websocket` | v1.8.15 | 2026-06-15 | Chosen over gorilla/websocket, whose last release (v1.5.3) is 2024-06-14, more than twelve months ago. |
 | `golangci-lint` | v2.15.0 | 2026-10-16 | Linter in the test gate with the default linter set and `gofmt`. |
+| `golang.org/x/vuln` (`govulncheck`) | v1.9.0 | 2026-10-11 | The Go team's vulnerability checker; reports only vulnerabilities in code comlink actually calls. |
+| `github.com/CycloneDX/cyclonedx-gomod` | v1.12.0 | 2026-08-22 | Builds the release SBOM from the Go module graph in the CycloneDX format. |
+| `@circlesac/oneup` | latest | — | The Circles CalVer calculator the release policy requires. |
