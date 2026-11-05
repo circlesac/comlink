@@ -87,8 +87,11 @@ The script installs the latest release into `~/.local/bin` (set
 `INSTALL_DIR` to change it) after checking the archive against
 `checksums.txt`. On Windows, download `comlink-windows-<arch>.zip` from the
 [releases](https://github.com/circlesac/comlink/releases). With Go installed,
-`go install github.com/circlesac/comlink@latest` also works, and
-`go build -o comlink .` builds a checkout.
+`go install github.com/circlesac/comlink@latest` builds the latest `main`
+and `go build -o comlink .` builds a checkout; both report version `0.0.0`.
+Go modules read a `v26.11.0` tag as major version 26, which would need a
+`/v26` module path, so `go install` cannot select a release; use the release
+binaries for a versioned install.
 
 ## Codex app
 
