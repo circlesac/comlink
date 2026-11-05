@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -830,9 +831,11 @@ func TestClaudeServesSFTPOnTheVirtualTree(t *testing.T) {
 	if prune.Kept != 1 || prune.Root == "" {
 		t.Fatalf("plugins.prune: %+v", prune)
 	}
-	// A plugin arrives as a tar over SFTP and is unpacked by files.extract_tar.
+	// A plugin arrives as a gzip-compressed tar over SFTP and is unpacked by
+	// files.extract_tar.
 	var tarBuf bytes.Buffer
-	tw := tar.NewWriter(&tarBuf)
+	gz := gzip.NewWriter(&tarBuf)
+	tw := tar.NewWriter(gz)
 	for _, e := range []struct {
 		name string
 		mode int64
@@ -842,7 +845,8 @@ func TestClaudeServesSFTPOnTheVirtualTree(t *testing.T) {
 		_, _ = tw.Write([]byte(e.body))
 	}
 	_ = tw.Close()
-	archive := "/home/comlink/.claude/remote/plugins/02b2e3e9/abc.tar"
+	_ = gz.Close()
+	archive := "/home/comlink/.claude/remote/plugins/02b2e3e9/abc.tar.gz"
 	typ, payload = c.request(3, sftpString(archive), binary.BigEndian.AppendUint32(nil, 2|8|16), binary.BigEndian.AppendUint32(nil, 0))
 	if typ != 102 {
 		t.Fatalf("OPEN archive: type %d", typ)
@@ -875,6 +879,24 @@ func TestClaudeServesSFTPOnTheVirtualTree(t *testing.T) {
 	_ = json.Unmarshal(b.call("files.extract_tar", map[string]any{"archivePath": archive + ".missing", "destDir": "/home/comlink/x"}), &extracted)
 	if extracted.Success || !strings.Contains(extracted.Error, "archive not found") {
 		t.Fatalf("extract_tar of a missing archive: %+v", extracted)
+	}
+	// A plain tar is unpacked as well.
+	var plain bytes.Buffer
+	ptw := tar.NewWriter(&plain)
+	_ = ptw.WriteHeader(&tar.Header{Name: "note.txt", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg})
+	_, _ = ptw.Write([]byte("hi"))
+	_ = ptw.Close()
+	typ, payload = c.request(3, sftpString(archive+".plain"), binary.BigEndian.AppendUint32(nil, 2|8|16), binary.BigEndian.AppendUint32(nil, 0))
+	if typ != 102 {
+		t.Fatalf("OPEN plain archive: type %d", typ)
+	}
+	handle = payload
+	c.request(6, handle, binary.BigEndian.AppendUint64(nil, 0), sftpString(plain.String()))
+	c.request(4, handle)
+	_ = json.Unmarshal(b.call("files.extract_tar", map[string]any{"archivePath": archive + ".plain", "destDir": "/home/comlink/.claude/remote/plugins/02b2e3e9/def"}), &extracted)
+	_ = json.Unmarshal(b.call("files.read", map[string]any{"path": "/home/comlink/.claude/remote/plugins/02b2e3e9/def/note.txt"}), &read)
+	if !extracted.Success || read.Content != "hi" {
+		t.Fatalf("plain tar: %+v %+v", extracted, read)
 	}
 	if msg := b.callErr("files.extract_tar", map[string]any{"archivePath": archive}); msg != "archivePath and destDir are required" {
 		t.Fatalf("extract_tar without destDir: %q", msg)
