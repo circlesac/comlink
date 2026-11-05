@@ -3,6 +3,7 @@ package claude
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"io"
 	"path"
@@ -230,11 +231,11 @@ func (fs *vfs) glob(pattern string) []string {
 	return out
 }
 
-// extractTar unpacks the tar archive at archivePath into destDir: regular
-// files with their executable bit, directories, nothing else. An archive
-// whose bytes were not kept (over fileCap) or an entry that leaves destDir
-// is an error. A top-level .synced in the archive is skipped: only the
-// helper writes that marker.
+// extractTar unpacks the tar archive at archivePath, plain or gzip-compressed
+// (the app uploads its plugins compressed), into destDir: regular files with
+// their executable bit, directories, nothing else. An archive whose bytes
+// were not kept (over fileCap) is an error. A top-level .synced in the
+// archive is skipped: only the helper writes that marker.
 func (fs *vfs) extractTar(archivePath, destDir string) error {
 	n, ok := fs.stat(archivePath)
 	if !ok || n.dir {
@@ -247,7 +248,15 @@ func (fs *vfs) extractTar(archivePath, destDir string) error {
 	if destDir == "/" {
 		return errors.New("destDir must be an absolute, non-root path")
 	}
-	tr := tar.NewReader(bytes.NewReader(n.data))
+	var archive io.Reader = bytes.NewReader(n.data)
+	if bytes.HasPrefix(n.data, []byte{0x1f, 0x8b}) {
+		gz, err := gzip.NewReader(archive)
+		if err != nil {
+			return errors.New("read archive: " + err.Error())
+		}
+		archive = gz
+	}
+	tr := tar.NewReader(archive)
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
