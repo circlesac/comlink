@@ -13,6 +13,7 @@
 //	                        with (JSON), run for each connection, mode 0600
 //	run/NAME.lock   held with flock by the session process for its lifetime
 //	ssh/NAME.conf   the ~/.ssh/config Host block for the Codex app
+//	claude/chats/   the agent session each Claude app chat uses (see internal/claude)
 //
 // The record, the token (or token command) file and the ssh config file are each written to a
 // temporary file in the same directory and renamed into place, so ssh, the

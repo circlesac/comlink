@@ -206,29 +206,42 @@ func (fs *vfs) list(dir string) ([]string, bool) {
 	return names, true
 }
 
-// glob returns the paths pattern names: the path itself when it exists, or
-// the entries of its directory its last component matches ('*' and '?'
-// as in path.Match). Nothing when neither.
+// glob returns the paths pattern names, sorted: the path itself when it
+// exists, otherwise every existing path whose components match the
+// pattern's ('*' and '?' as in path.Match, in any component). Nothing when
+// none does.
 func (fs *vfs) glob(pattern string) []string {
 	pattern = clean(pattern)
 	if _, ok := fs.stat(pattern); ok {
 		return []string{pattern}
 	}
-	dir, base := path.Split(pattern)
-	if !strings.ContainsAny(base, "*?[") {
+	if !strings.ContainsAny(pattern, "*?[") {
 		return nil
 	}
-	names, ok := fs.list(dir)
-	if !ok {
-		return nil
-	}
-	var out []string
-	for _, name := range names {
-		if ok, _ := path.Match(base, name); ok {
-			out = append(out, clean(dir)+"/"+name)
+	paths := []string{"/"}
+	for _, part := range strings.Split(strings.TrimPrefix(pattern, "/"), "/") {
+		var next []string
+		for _, dir := range paths {
+			if !strings.ContainsAny(part, "*?[") {
+				if _, ok := fs.stat(path.Join(dir, part)); ok {
+					next = append(next, path.Join(dir, part))
+				}
+				continue
+			}
+			names, ok := fs.list(dir)
+			if !ok {
+				continue
+			}
+			for _, name := range names {
+				if ok, _ := path.Match(part, name); ok {
+					next = append(next, path.Join(dir, name))
+				}
+			}
 		}
+		paths = next
 	}
-	return out
+	sort.Strings(paths)
+	return paths
 }
 
 // extractTar unpacks the tar archive at archivePath, plain or gzip-compressed

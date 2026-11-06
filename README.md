@@ -166,6 +166,7 @@ Codex version `codex --version` reports, default `0.165.0`).
 | `~/.ssh/config` | the `Include` line, added once at the top; backup in `~/.ssh/config.comlink-bak` |
 | `~/.local/state/comlink/ssh/NAME.conf` | the session's `Host` block (mode 0600) while it runs |
 | `~/.local/state/comlink/run/` | the session's record, token or token command and lock (0600) while it runs |
+| `~/.local/state/comlink/claude/chats/` | which agent session each Claude app chat uses and its transcript, so a reopened chat shows its history and continues (0600 files) |
 | `~/.local/state/comlink/host_ed25519` | the SSH host key comlink pins for every session, made on first use |
 
 `$XDG_STATE_HOME` replaces `~/.local/state`. A session is up while its

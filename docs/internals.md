@@ -268,8 +268,30 @@ app keeps the connection as an ssh control master and opens channels on it:
   permission request as the app's own permission prompt (allow picks the
   agent's allow option, deny its reject option). The app's interrupt
   cancels the prompt. `process.spawn` of the shell commands the app runs to
-  read transcripts is answered as a host without transcripts would answer
-  it, so the app shows the chat from its own stream.
+  read transcripts is answered from the virtual tree: the transcripts comlink
+  recorded for chats on this upstream are there, anything else is missing
+  as on a host without transcripts.
+- A chat keeps its agent session across connections. The app's Claude Code
+  process carries the chat's id (`--session-id` for a new chat, `--resume`
+  when it reopens one), and comlink records under
+  `claude/chats/` in the state directory which ACP session holds that chat
+  on that upstream. When a later process for the same chat dials, it sends
+  `session/load` for the recorded session if the agent announces
+  `loadSession`, and drops the updates the agent replays before it answers.
+  An agent that refuses the load gets a new session, which is recorded in
+  its place.
+- A chat keeps its history too. The app shows a chat it reopens (after its
+  own restart) from the Claude Code transcript on the host, which it finds
+  with `for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/<id>.jsonl`
+  and reads with `wc -c` and `head -c`. comlink appends each user and
+  assistant message it renders to `claude/chats/<hash>.jsonl` in the
+  transcript's line format and puts those files into each connection's
+  virtual tree under `~/.claude/projects/`. Without them the app reports
+  "Couldn't load this session" even though the agent still has the
+  conversation. A transcript over 1 MiB is not kept in the virtual tree
+  (the virtual file cap), so the app cannot show it. The app lists only chats it started: it never asks the host
+  for others, so a session another client opened on the agent (an
+  orchestrator's delegation, say) cannot be picked up from the app.
 
 What is not there: no files beyond the virtual home (the app's folder
 picker shows an empty home), no git, no plugins or skills on the agent side
