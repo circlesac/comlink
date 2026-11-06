@@ -36,7 +36,10 @@ type cli struct {
 	pending    map[string]chan json.RawMessage // the app's control_responses by request_id
 	acp        *acpConn
 	acpSession string
-	turn       *turn // the turn in progress, for ACP updates
+	resume     string // the ACP session this chat last used, loaded again when the upstream is dialled anew
+	replaying  bool   // session/load is replaying history the app already shows
+	turn       *turn  // the turn in progress, for ACP updates
+	parent     string // the last transcript line's uuid
 }
 
 func newCLI(r *Route, p *proc, stdin io.Reader, args []string, cwd string) *cli {
@@ -56,6 +59,16 @@ func newCLI(r *Route, p *proc, stdin io.Reader, args []string, cwd string) *cli 
 	}
 	if c.session == "" {
 		c.session = uuid()
+	}
+	// A reopened chat continues its transcript after the last line.
+	if n, ok := r.fs.stat(r.transcriptPath(cwd, c.session)); ok {
+		lines := strings.Split(strings.TrimSpace(string(n.data)), "\n")
+		var last struct {
+			UUID string `json:"uuid"`
+		}
+		if json.Unmarshal([]byte(lines[len(lines)-1]), &last) == nil {
+			c.parent = last.UUID
+		}
 	}
 	return c
 }
@@ -131,6 +144,30 @@ func (c *cli) emit(m map[string]any) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	_, _ = c.out.Write(append(b, '\n'))
+	if t, _ := m["type"].(string); t == "user" || t == "assistant" {
+		c.record(t, m)
+	}
+}
+
+// record adds a user or assistant message to the chat's transcript, kept in
+// the chats directory and on the virtual tree, so the app can show the chat
+// again after its process is gone. It is called with wmu held.
+func (c *cli) record(kind string, m map[string]any) {
+	var parent any
+	if c.parent != "" {
+		parent = c.parent
+	}
+	line, err := json.Marshal(map[string]any{"parentUuid": parent, "isSidechain": false, "userType": "external", "cwd": c.cwd, "sessionId": c.session, "version": c.version, "type": kind, "message": m["message"], "uuid": m["uuid"], "timestamp": time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		return
+	}
+	c.parent, _ = m["uuid"].(string)
+	if err := (chats{c.route.Chats}).appendLine(c.route.Upstream, c.session, line); err != nil {
+		c.route.Logger.Printf("session %s: transcript not kept: %v", c.session, err)
+	}
+	p := c.route.transcriptPath(c.cwd, c.session)
+	old, _ := c.route.fs.stat(p)
+	c.route.fs.put(p, append(append(old.data, line...), '\n'), 0o600)
 }
 
 func (c *cli) respond(requestID string, response any) {
@@ -230,24 +267,61 @@ func (c *cli) connect() error {
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, 60*time.Second)
 	defer cancel()
-	if _, err := acp.call(ctx, "initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{"fs": map[string]any{"readTextFile": false, "writeTextFile": false}, "terminal": false}, "clientInfo": map[string]any{"name": "comlink", "version": c.route.Version}}); err != nil {
-		acp.close()
-		return err
-	}
-	result, err := acp.call(ctx, "session/new", map[string]any{"cwd": c.cwd, "mcpServers": []any{}})
+	init, err := acp.call(ctx, "initialize", map[string]any{"protocolVersion": 1, "clientCapabilities": map[string]any{"fs": map[string]any{"readTextFile": false, "writeTextFile": false}, "terminal": false}, "clientInfo": map[string]any{"name": "comlink", "version": c.route.Version}})
 	if err != nil {
 		acp.close()
 		return err
 	}
-	var sess struct {
-		SessionID string `json:"sessionId"`
+	var caps struct {
+		AgentCapabilities struct {
+			LoadSession bool `json:"loadSession"`
+		} `json:"agentCapabilities"`
 	}
-	if err := json.Unmarshal(result, &sess); err != nil || sess.SessionID == "" {
-		acp.close()
-		return errors.New("session/new: no sessionId in the result")
+	_ = json.Unmarshal(init, &caps)
+	store := chats{c.route.Chats}
+	c.mu.Lock()
+	previous := c.resume
+	c.mu.Unlock()
+	if previous == "" {
+		previous = store.get(c.route.Upstream, c.session)
+	}
+	session := ""
+	if previous != "" && caps.AgentCapabilities.LoadSession {
+		// The chat had an agent session: continue it. Its history replays as
+		// updates the app already shows, so they are not rendered again.
+		c.mu.Lock()
+		c.replaying = true
+		c.mu.Unlock()
+		_, err := acp.call(ctx, "session/load", map[string]any{"sessionId": previous, "cwd": c.cwd, "mcpServers": []any{}})
+		c.mu.Lock()
+		c.replaying = false
+		c.mu.Unlock()
+		if err == nil {
+			session = previous
+		} else {
+			c.route.Logger.Printf("session %s: agent session %s could not be loaded, starting a new one: %v", c.session, previous, err)
+		}
+	}
+	if session == "" {
+		result, err := acp.call(ctx, "session/new", map[string]any{"cwd": c.cwd, "mcpServers": []any{}})
+		if err != nil {
+			acp.close()
+			return err
+		}
+		var sess struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(result, &sess); err != nil || sess.SessionID == "" {
+			acp.close()
+			return errors.New("session/new: no sessionId in the result")
+		}
+		session = sess.SessionID
+		if err := store.put(c.route.Upstream, c.session, session); err != nil {
+			c.route.Logger.Printf("session %s: the chat will not resume its agent session: %v", c.session, err)
+		}
 	}
 	c.mu.Lock()
-	c.acp, c.acpSession = acp, sess.SessionID
+	c.acp, c.acpSession, c.resume = acp, session, session
 	c.mu.Unlock()
 	return nil
 }
@@ -382,9 +456,9 @@ func (c *cli) notification(method string, params json.RawMessage) {
 		return
 	}
 	c.mu.Lock()
-	t := c.turn
+	t, replaying := c.turn, c.replaying
 	c.mu.Unlock()
-	if t == nil {
+	if t == nil || replaying {
 		return
 	}
 	u := p.Update

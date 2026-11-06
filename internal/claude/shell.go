@@ -101,15 +101,24 @@ func block(segs []segment, start int, open, closing string) (body []segment, end
 // forLoop runs `for VAR in WORDS` (head) over body, whose first segment
 // starts with `do`.
 func (s *shell) forLoop(head string, body []segment) (status int, stop bool) {
-	w, _ := s.words(strings.TrimPrefix(head, "for "))
+	w, patterns, _ := s.splitWords(strings.TrimPrefix(head, "for "))
 	if len(w) < 2 || w[1] != "in" {
 		return 2, false
+	}
+	// A pattern names the paths it matches, or itself when none does.
+	var items []string
+	for i, word := range w[2:] {
+		if matches := s.fs.glob(word); patterns[i+2] && len(matches) > 0 {
+			items = append(items, matches...)
+		} else {
+			items = append(items, word)
+		}
 	}
 	body = stripKeyword(body, "do")
 	if s.vars == nil {
 		s.vars = map[string]string{}
 	}
-	for _, item := range w[2:] {
+	for _, item := range items {
 		s.vars[w[0]] = item
 		if status, stop = s.exec(body); stop {
 			return status, true
@@ -237,10 +246,19 @@ func splitLine(line string) []segment {
 // redirections out. Other variables expand to nothing, as they would in the
 // app's own environment here.
 func (s *shell) words(text string) ([]string, redirs) {
+	out, _, rd := s.splitWords(text)
+	return out, rd
+}
+
+// splitWords is words that also reports, for each word, whether it holds an
+// unquoted '*', '?' or '[' and so is a pathname pattern.
+func (s *shell) splitWords(text string) ([]string, []bool, redirs) {
 	var out []string
+	var patterns []bool
 	var rd redirs
 	var cur strings.Builder
 	inWord := false
+	pattern := false
 	pendingStdin := false // a lone < : the next word is the file
 	flush := func() {
 		if inWord {
@@ -262,9 +280,11 @@ func (s *shell) words(text string) ([]string, redirs) {
 				}
 			default:
 				out = append(out, w)
+				patterns = append(patterns, pattern)
 			}
 			cur.Reset()
 			inWord = false
+			pattern = false
 		}
 	}
 	for i := 0; i < len(text); i++ {
@@ -312,11 +332,12 @@ func (s *shell) words(text string) ([]string, redirs) {
 			cur.WriteString(s.fs.home)
 		default:
 			inWord = true
+			pattern = pattern || c == '*' || c == '?' || c == '['
 			cur.WriteByte(c)
 		}
 	}
 	flush()
-	return out, rd
+	return out, patterns, rd
 }
 
 func isRedirection(w string) bool {
@@ -365,7 +386,18 @@ func (s *shell) expand(t string) (string, int) {
 		name, def, hasDefault := strings.Cut(ref, ":-")
 		v := s.lookup(name)
 		if v == "" && hasDefault {
-			v = def
+			// The default is expanded too: ${CLAUDE_CONFIG_DIR:-$HOME/.claude}.
+			var b strings.Builder
+			for i := 0; i < len(def); i++ {
+				if def[i] == '$' {
+					x, n := s.expand(def[i:])
+					b.WriteString(x)
+					i += n - 1
+					continue
+				}
+				b.WriteByte(def[i])
+			}
+			v = b.String()
 		}
 		return v, end + 1
 	}

@@ -35,6 +35,7 @@ type Route struct {
 	Logger     *log.Logger         // diagnostics; never given the token
 	Home       string              // home directory reported to the app; DefaultHome when empty
 	Version    string              // comlink's version, sent to the upstream as the ACP client version
+	Chats      string              // directory mapping the app's chats to upstream ACP sessions, for resuming them; empty keeps none
 
 	once     sync.Once
 	fs       *vfs
@@ -56,8 +57,17 @@ func (r *Route) init() {
 			r.Home = DefaultHome
 		}
 		r.fs = newVFS(r.Home)
+		// The app shows a chat it reopens from its transcript on the host.
+		for _, t := range (chats{r.Chats}).transcripts(r.Upstream) {
+			r.fs.put(r.transcriptPath(t.cwd, t.chat), t.data, 0o600)
+		}
 		r.procs = newProcs(r)
 	})
+}
+
+// transcriptPath is where Claude Code would keep chat's transcript for cwd.
+func (r *Route) transcriptPath(cwd, chat string) string {
+	return r.Home + "/.claude/projects/" + projectDir(cwd) + "/" + chat + ".jsonl"
 }
 
 // helperVersion is the helper hash the app named last, or a fixed one

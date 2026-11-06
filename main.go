@@ -18,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -137,7 +138,13 @@ func (c *claudeCmd) Run(kctx *kong.Context) error {
 		return nil
 	}
 	return run(c.flags(), func(url string, cred upstream.Credential, logger *log.Logger) sshd.Route {
-		return &claude.Route{Upstream: url, Credential: cred, Logger: logger, Version: Version}
+		r := &claude.Route{Upstream: url, Credential: cred, Logger: logger, Version: Version}
+		if store, err := session.Open(); err == nil {
+			r.Chats = filepath.Join(store.Dir, "claude", "chats")
+		} else {
+			logger.Printf("chats will not resume their agent sessions: %v", err)
+		}
+		return r
 	})
 }
 

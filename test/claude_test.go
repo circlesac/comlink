@@ -14,6 +14,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -60,6 +62,11 @@ type agentUpstream struct {
 	prompts  []string
 	cancels  int
 	scenario func(s *acpConvo, prompt string)
+	// session/load: offered when loadSession is set, refused when loadFails is
+	news        int
+	loads       []string
+	loadSession bool
+	loadFails   bool
 }
 
 // acpConvo is one upstream connection's side of the ACP conversation.
@@ -165,9 +172,32 @@ func newAgentUpstream(t *testing.T) *agentUpstream {
 				u.mu.Lock()
 				u.inits = append(u.inits, m.Params)
 				u.mu.Unlock()
-				s.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "result": map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{}}})
+				u.mu.Lock()
+				caps := map[string]any{"loadSession": u.loadSession}
+				u.mu.Unlock()
+				s.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "result": map[string]any{"protocolVersion": 1, "agentCapabilities": caps}})
 			case "session/new":
-				s.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "result": map[string]any{"sessionId": "sess-1"}})
+				u.mu.Lock()
+				u.news++
+				id := fmt.Sprintf("sess-%d", u.news)
+				u.mu.Unlock()
+				s.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "result": map[string]any{"sessionId": id}})
+			case "session/load":
+				var p struct {
+					SessionID string `json:"sessionId"`
+				}
+				_ = json.Unmarshal(m.Params, &p)
+				u.mu.Lock()
+				u.loads = append(u.loads, p.SessionID)
+				fails := u.loadFails
+				u.mu.Unlock()
+				if fails {
+					s.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "error": map[string]any{"code": -32004, "message": "session_not_available"}})
+					continue
+				}
+				// An agent replays the session's history before it answers.
+				s.text("earlier answer")
+				s.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "result": map[string]any{}})
 			case "session/prompt":
 				var p struct {
 					Prompt []struct {
@@ -1207,5 +1237,206 @@ func TestClaudeAnswersShellSpawns(t *testing.T) {
 	}
 	if msg := b.callErr("files.read", json.RawMessage(`"x"`)); msg != "invalid params" {
 		t.Fatalf("bad params: %q", msg)
+	}
+}
+
+// chatTurn spawns a Claude Code stand-in with args on a fresh connection of
+// route, sends one user message and returns the turn's result text.
+func chatTurn(t *testing.T, route *claude.Route, sessionArg, text string) string {
+	t.Helper()
+	client, _ := startClaude(t, route)
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	spawn := claudeSpawn("proc-1", "unused")
+	args := spawn["args"].([]string)
+	for i, a := range args {
+		if strings.HasPrefix(a, "--session-id=") {
+			args[i] = sessionArg
+		}
+	}
+	b.call("process.spawn", spawn)
+	cli := &cliReader{b: b, id: "proc-1"}
+	b.stdin_("proc-1", `{"type":"user","uuid":"u-1","message":{"role":"user","content":`+strconv.Quote(text)+`}}`+"\n")
+	result := cli.expect("result", "")
+	if result["is_error"] != false {
+		t.Fatalf("turn failed: %v", result)
+	}
+	return result["result"].(string)
+}
+
+func TestClaudeChatResumesItsAgentSession(t *testing.T) {
+	const chat = "11111111-2222-4333-8444-555555555555"
+	newUpstream := func() *agentUpstream {
+		up := newAgentUpstream(t)
+		up.scenario = func(s *acpConvo, prompt string) { s.text("reply to " + prompt) }
+		return up
+	}
+	route := func(up *agentUpstream, dir string) *claude.Route {
+		return &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Version: "test", Chats: dir}
+	}
+
+	t.Run("a resumed chat loads the agent session it used", func(t *testing.T) {
+		up, dir := newUpstream(), t.TempDir()
+		up.loadSession = true
+		if got := chatTurn(t, route(up, dir), "--session-id="+chat, "first"); got != "reply to first" {
+			t.Fatalf("first turn %q", got)
+		}
+		// A new connection and a new comlink process: only the directory remains.
+		if got := chatTurn(t, route(up, dir), "--resume="+chat, "second"); got != "reply to second" {
+			t.Fatalf("resumed turn %q (replayed history must not be shown again)", got)
+		}
+		// Another chat gets its own agent session.
+		chatTurn(t, route(up, dir), "--session-id=22222222-2222-4333-8444-555555555555", "other")
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		if up.news != 2 || strings.Join(up.loads, ",") != "sess-1" {
+			t.Fatalf("session/new %d times, session/load %v; want 2 and [sess-1]", up.news, up.loads)
+		}
+		files, _ := os.ReadDir(dir)
+		for _, f := range files {
+			if info, _ := f.Info(); info.Mode().Perm() != 0o600 {
+				t.Errorf("chat file %s mode %v, want 0600", f.Name(), info.Mode().Perm())
+			}
+		}
+	})
+
+	t.Run("an agent that cannot load sessions gets a new one", func(t *testing.T) {
+		up, dir := newUpstream(), t.TempDir()
+		chatTurn(t, route(up, dir), "--session-id="+chat, "first")
+		chatTurn(t, route(up, dir), "--resume="+chat, "second")
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		if up.news != 2 || len(up.loads) != 0 {
+			t.Fatalf("session/new %d times, session/load %v; want 2 and none", up.news, up.loads)
+		}
+	})
+
+	t.Run("a session the agent no longer has is replaced", func(t *testing.T) {
+		up, dir := newUpstream(), t.TempDir()
+		up.loadSession = true
+		chatTurn(t, route(up, dir), "--session-id="+chat, "first")
+		up.mu.Lock()
+		up.loadFails = true
+		up.mu.Unlock()
+		if got := chatTurn(t, route(up, dir), "--resume="+chat, "second"); got != "reply to second" {
+			t.Fatalf("turn after a failed load %q", got)
+		}
+		up.mu.Lock()
+		up.loadFails = false
+		up.mu.Unlock()
+		// The replacement is what the chat resumes next.
+		chatTurn(t, route(up, dir), "--resume="+chat, "third")
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		if up.news != 2 || strings.Join(up.loads, ",") != "sess-1,sess-2" {
+			t.Fatalf("session/new %d times, session/load %v; want 2 and [sess-1 sess-2]", up.news, up.loads)
+		}
+	})
+
+	t.Run("without a chats directory every connection starts anew", func(t *testing.T) {
+		up := newUpstream()
+		up.loadSession = true
+		chatTurn(t, route(up, ""), "--session-id="+chat, "first")
+		chatTurn(t, route(up, ""), "--resume="+chat, "second")
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		if up.news != 2 || len(up.loads) != 0 {
+			t.Fatalf("session/new %d times, session/load %v; want 2 and none", up.news, up.loads)
+		}
+	})
+}
+
+// shRun runs `sh -c script` through the bridge and returns its stdout and
+// exit code.
+func shRun(t *testing.T, b *bridge, id, script string) (string, int) {
+	t.Helper()
+	b.call("process.spawn", map[string]any{"id": id, "command": "sh", "args": []string{"-c", script}})
+	var out []byte
+	for {
+		rec := b.record(id, "")
+		if rec.Stream == "exit" {
+			return string(out), rec.ExitCode
+		}
+		if rec.Stream == "stdout" {
+			data, _ := base64.StdEncoding.DecodeString(rec.Data)
+			out = append(out, data...)
+		}
+	}
+}
+
+func TestClaudeChatTranscriptSurvivesTheProcess(t *testing.T) {
+	const chat = "11111111-2222-4333-8444-555555555555"
+	const path = "/home/comlink/.claude/projects/-home-comlink-project/" + chat + ".jsonl"
+	up := newAgentUpstream(t)
+	up.loadSession = true
+	up.scenario = func(s *acpConvo, prompt string) { s.text("reply to " + prompt) }
+	dir := t.TempDir()
+	route := func() *claude.Route {
+		return &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Version: "test", Chats: dir}
+	}
+	chatTurn(t, route(), "--session-id="+chat, "first")
+
+	// A new comlink process: the app finds the chat's transcript where Claude
+	// Code keeps it, with the search the app runs, and reads it.
+	client, _ := startClaude(t, route())
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	found, code := shRun(t, b, "sh-1", `for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/'`+chat+`'.jsonl; do [ -f "$f" ] && printf "%s\n" "$f"; done`)
+	if found != path+"\n" || code != 0 {
+		t.Fatalf("transcript search printed %q (exit %d), want %q", found, code, path+"\n")
+	}
+	read, code := shRun(t, b, "sh-2", `LC_ALL=C sh -c 'wc -c < "$1" && head -c 65536 "$1"' sh '`+path+`'`)
+	if code != 0 {
+		t.Fatalf("transcript read exit %d: %q", code, read)
+	}
+	type line struct {
+		Type       string          `json:"type"`
+		UUID       string          `json:"uuid"`
+		ParentUUID *string         `json:"parentUuid"`
+		SessionID  string          `json:"sessionId"`
+		Cwd        string          `json:"cwd"`
+		Message    json.RawMessage `json:"message"`
+	}
+	parse := func(s string) []line {
+		var out []line
+		for _, l := range strings.Split(strings.TrimSpace(s), "\n") {
+			var x line
+			if json.Unmarshal([]byte(l), &x) == nil && x.Type != "" {
+				out = append(out, x)
+			}
+		}
+		return out
+	}
+	lines := parse(read)
+	if len(lines) != 2 || lines[0].Type != "user" || lines[1].Type != "assistant" || lines[0].ParentUUID != nil || lines[1].ParentUUID == nil || *lines[1].ParentUUID != lines[0].UUID {
+		t.Fatalf("transcript lines %+v", lines)
+	}
+	for _, l := range lines {
+		if l.SessionID != chat || l.Cwd != "/home/comlink/project" {
+			t.Fatalf("transcript line %+v", l)
+		}
+	}
+	if !strings.Contains(string(lines[0].Message), "first") || !strings.Contains(string(lines[1].Message), "reply to first") {
+		t.Fatalf("transcript messages %s / %s", lines[0].Message, lines[1].Message)
+	}
+
+	// The resumed chat continues the same transcript after its last line.
+	chatTurn(t, route(), "--resume="+chat, "second")
+	files, _ := os.ReadDir(dir)
+	var record []byte
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".jsonl") {
+			record, _ = os.ReadFile(dir + "/" + f.Name())
+		}
+	}
+	all := parse(string(record))
+	if len(all) != 4 || *all[2].ParentUUID != all[1].UUID || !strings.Contains(string(all[3].Message), "reply to second") {
+		t.Fatalf("transcript after the resumed turn %+v", all)
+	}
+
+	// Another upstream's transcripts are not shown.
+	other := &claude.Route{Upstream: "ws://127.0.0.1:1/acp", Chats: dir}
+	client, _ = startClaude(t, other)
+	b = openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	if out, code := shRun(t, b, "sh-3", `for f in "$HOME"/.claude/projects/*/'`+chat+`'.jsonl; do [ -f "$f" ] && printf "%s\n" "$f"; done`); out != "" || code != 1 {
+		t.Fatalf("other upstream found %q (exit %d)", out, code)
 	}
 }
