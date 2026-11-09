@@ -304,6 +304,29 @@ func openBridge(t *testing.T, client *ssh.Client, exec, last string) *bridge {
 	return b
 }
 
+// The actual desktop app's reattach parser searches for this literal prefix
+// before parsing JSON. Valid JSON with id before jsonrpc is ignored until its
+// bridge startup timeout, even though the initial connection accepts it.
+func TestClaudeReattachReplyPrefix(t *testing.T) {
+	client, _ := startClaude(t, &claude.Route{})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	for _, method := range []string{"server.capabilities", "unknown.method"} {
+		id := "reattach-example-nonce-0"
+		request, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "auth": "example-token"})
+		if _, err := b.stdin.Write(append(request, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		line := b.line()
+		prefix := `{"jsonrpc":"2.0","id":"` + id + `"`
+		if !strings.HasPrefix(line, prefix) {
+			t.Fatalf("desktop reattach parser cannot recognize %s reply: %s", method, line)
+		}
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("invalid JSON reply: %s", line)
+		}
+	}
+}
+
 // line reads one output line without its newline; it fails the test after
 // 10 seconds.
 func (b *bridge) line() string {
@@ -1345,6 +1368,69 @@ func TestClaudeChatResumesItsAgentSession(t *testing.T) {
 	})
 }
 
+func TestClaudeLiveChatReconnectsAnAlreadyClosedIdleUpstream(t *testing.T) {
+	up := newAgentUpstream(t)
+	up.loadSession = true
+	firstConnection := make(chan *acpConvo, 1)
+	up.scenario = func(s *acpConvo, text string) {
+		if text == "first" {
+			firstConnection <- s
+		}
+		s.text("reply to " + text)
+	}
+	client, _ := startClaude(t, &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Chats: t.TempDir()})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	b.call("process.spawn", claudeSpawn("proc-1", "11111111-2222-4333-8444-555555555555"))
+	cli := &cliReader{b: b, id: "proc-1"}
+	send := func(text string) map[string]any {
+		b.stdin_("proc-1", `{"type":"user","uuid":`+strconv.Quote(text)+`,"message":{"role":"user","content":`+strconv.Quote(text)+`}}`+"\n")
+		return cli.expect("result", "")
+	}
+	if result := send("first"); result["is_error"] != false {
+		t.Fatalf("initial turn failed: %v", result)
+	}
+	// The app and its stand-in remain alive. Complete the close handshake
+	// while idle, then require the very next unsent prompt to load the session.
+	connection := <-firstConnection
+	_ = connection.conn.Close(websocket.StatusGoingAway, "Worker restart")
+	if result := send("second"); result["is_error"] != false || result["result"] != "reply to second" {
+		t.Fatalf("first message after idle disconnect failed: %v", result)
+	}
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if up.news != 1 || strings.Join(up.loads, ",") != "sess-1" || strings.Join(up.prompts, ",") != "first,second" {
+		t.Fatalf("session identity or delivery changed: new=%d load=%v prompts=%v", up.news, up.loads, up.prompts)
+	}
+}
+
+func TestClaudeDoesNotReplayAPromptLostInFlight(t *testing.T) {
+	up := newAgentUpstream(t)
+	up.loadSession = true
+	up.scenario = func(s *acpConvo, text string) {
+		if text == "interrupted" {
+			_ = s.conn.CloseNow()
+			return
+		}
+		s.text("reply to " + text)
+	}
+	client, _ := startClaude(t, &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Chats: t.TempDir()})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	b.call("process.spawn", claudeSpawn("proc-1", "11111111-2222-4333-8444-555555555555"))
+	cli := &cliReader{b: b, id: "proc-1"}
+	for _, text := range []string{"interrupted", "next"} {
+		b.stdin_("proc-1", `{"type":"user","uuid":`+strconv.Quote(text)+`,"message":{"role":"user","content":`+strconv.Quote(text)+`}}`+"\n")
+		result := cli.expect("result", "")
+		if result["is_error"] != (text == "interrupted") {
+			t.Fatalf("unexpected result for %s: %v", text, result)
+		}
+	}
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if strings.Join(up.prompts, ",") != "interrupted,next" || up.news != 1 || strings.Join(up.loads, ",") != "sess-1" {
+		t.Fatalf("in-flight request was replayed or session replaced: prompts=%v new=%d load=%v", up.prompts, up.news, up.loads)
+	}
+}
+
 // shRun runs `sh -c script` through the bridge and returns its stdout and
 // exit code.
 func shRun(t *testing.T, b *bridge, id, script string) (string, int) {
@@ -1439,4 +1525,46 @@ func TestClaudeChatTranscriptSurvivesTheProcess(t *testing.T) {
 	if out, code := shRun(t, b, "sh-3", `for f in "$HOME"/.claude/projects/*/'`+chat+`'.jsonl; do [ -f "$f" ] && printf "%s\n" "$f"; done`); out != "" || code != 1 {
 		t.Fatalf("other upstream found %q (exit %d)", out, code)
 	}
+}
+
+func TestClaudeApprovalCancelledByUpstream(t *testing.T) {
+	up := newAgentUpstream(t)
+	ready := make(chan *acpConvo, 1)
+	outcomes := make(chan string, 1)
+	up.scenario = func(s *acpConvo, prompt string) {
+		if prompt == "approval" {
+			s.update(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "Write a file", "kind": "edit", "status": "pending"})
+			ready <- s
+			outcomes <- s.askPermission("Write a file", "allow_once", "reject_once")
+			s.text("cancelled approval")
+			return
+		}
+		s.text("following work")
+	}
+	client, _ := startClaude(t, &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Version: "test"})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	b.call("process.spawn", claudeSpawn("cancel-proc", "11111111-2222-4333-8444-555555555555"))
+	reader := &cliReader{b: b, id: "cancel-proc"}
+	b.stdin_("cancel-proc", `{"type":"user","uuid":"cancel-user","message":{"role":"user","content":[{"type":"text","text":"approval"}]}}`+"\n")
+	permission := reader.expect("control_request", "")
+	convo := <-ready
+	convo.mu.Lock()
+	requestID := fmt.Sprintf("up-%d", convo.next)
+	convo.mu.Unlock()
+	convo.write(map[string]any{"jsonrpc": "2.0", "method": "$/cancel_request", "params": map[string]any{"requestId": requestID}})
+	cancelled := reader.expect("control_cancel_request", "")
+	if cancelled["request_id"] != permission["request_id"] {
+		t.Fatalf("cancelled another app approval: %v, expected %v", cancelled, permission)
+	}
+	// A late app approval must not become an upstream allow or block the next turn.
+	b.stdin_("cancel-proc", `{"type":"control_response","response":{"subtype":"success","request_id":"`+permission["request_id"].(string)+`","response":{"behavior":"allow"}}}`+"\n")
+	if got := <-outcomes; got == "allow_once" {
+		t.Fatal("late app approval was accepted after upstream cancellation")
+	}
+	reader.expect("result", "")
+	b.stdin_("cancel-proc", `{"type":"user","uuid":"following-user","message":{"role":"user","content":[{"type":"text","text":"next"}]}}`+"\n")
+	if result := reader.expect("result", ""); result["result"] != "following work" {
+		t.Fatalf("following work failed: %v", result)
+	}
+	b.call("process.killAndWait", map[string]any{"id": "cancel-proc"})
 }

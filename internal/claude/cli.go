@@ -253,10 +253,19 @@ func (c *cli) loop() {
 func (c *cli) connect() error {
 	c.mu.Lock()
 	acp := c.acp
-	c.mu.Unlock()
 	if acp != nil {
-		return nil
+		select {
+		case <-acp.closed:
+			// An idle connection can close while the app and stand-in live.
+			// Reopen it before submitting this new prompt, retaining the saved
+			// session. Requests already sent are never replayed here.
+			c.acp, c.acpSession = nil, ""
+		default:
+			c.mu.Unlock()
+			return nil
+		}
 	}
+	c.mu.Unlock()
 	token, err := c.route.Credential.Bearer()
 	if err != nil {
 		return err
@@ -506,7 +515,7 @@ func textOf(raw json.RawMessage) string {
 
 // request answers the upstream's requests: a permission request becomes
 // the app's can_use_tool prompt.
-func (c *cli) request(method string, params json.RawMessage) (any, *rpcError) {
+func (c *cli) request(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
 	if method != "session/request_permission" {
 		return nil, &rpcError{-32601, "method not found: " + method}
 	}
@@ -543,6 +552,14 @@ func (c *cli) request(method string, params json.RawMessage) (any, *rpcError) {
 	c.mu.Lock()
 	c.pending[requestID] = ch
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, requestID)
+		c.mu.Unlock()
+		if ctx.Err() != nil || c.ctx.Err() != nil {
+			c.emit(map[string]any{"type": "control_cancel_request", "request_id": requestID})
+		}
+	}()
 	input := any(map[string]any{"title": p.ToolCall.Title})
 	if len(p.ToolCall.RawInput) > 0 {
 		input = p.ToolCall.RawInput
@@ -567,9 +584,8 @@ func (c *cli) request(method string, params json.RawMessage) (any, *rpcError) {
 		}
 		return map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": pick("reject_once", "reject_always")}}, nil
 	case <-c.ctx.Done():
-		c.mu.Lock()
-		delete(c.pending, requestID)
-		c.mu.Unlock()
+		return map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}, nil
+	case <-ctx.Done():
 		return map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}, nil
 	}
 }

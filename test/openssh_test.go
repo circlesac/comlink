@@ -320,7 +320,7 @@ func TestOpenSSHClaudeProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh: %v\nstdout: %s\nstderr: %s", err, out, stderr.String())
 	}
-	for _, want := range []string{"__PRBG__\n", "\n/home/comlink\n", "\nclaude-ssh b3081b512da230f24d74a2082a678246a89685ee (built ", "__PRBEND__\n{\"id\":\"reattach-0\",\"jsonrpc\":\"2.0\",\"result\":{", "\"version\":\"b3081b512da230f24d74a2082a678246a89685ee\"}", "\"end\":{\"at\":0,\"len\":"} {
+	for _, want := range []string{"__PRBG__\n", "\n/home/comlink\n", "\nclaude-ssh b3081b512da230f24d74a2082a678246a89685ee (built ", "__PRBEND__\n{\"jsonrpc\":\"2.0\",\"id\":\"reattach-0\",\"result\":{", "\"version\":\"b3081b512da230f24d74a2082a678246a89685ee\"}", "\"end\":{\"at\":0,\"len\":"} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("stdout lacks %q:\n%s", want, out)
 		}

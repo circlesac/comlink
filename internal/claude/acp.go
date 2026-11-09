@@ -20,10 +20,11 @@ type acpConn struct {
 	mu        sync.Mutex
 	next      int
 	pending   map[string]chan acpReply
+	inbound   map[string]context.CancelFunc
 	closed    chan struct{}
 	err       error
 	onNotify  func(method string, params json.RawMessage)
-	onRequest func(method string, params json.RawMessage) (any, *rpcError)
+	onRequest func(context.Context, string, json.RawMessage) (any, *rpcError)
 }
 
 type acpReply struct {
@@ -40,12 +41,12 @@ type acpMessage struct {
 }
 
 // dialACP connects to url with token and starts reading.
-func dialACP(url, token string, onNotify func(string, json.RawMessage), onRequest func(string, json.RawMessage) (any, *rpcError)) (*acpConn, error) {
+func dialACP(url, token string, onNotify func(string, json.RawMessage), onRequest func(context.Context, string, json.RawMessage) (any, *rpcError)) (*acpConn, error) {
 	conn, err := upstream.Dial(url, token)
 	if err != nil {
 		return nil, err
 	}
-	c := &acpConn{conn: conn, pending: map[string]chan acpReply{}, closed: make(chan struct{}), onNotify: onNotify, onRequest: onRequest}
+	c := &acpConn{conn: conn, pending: map[string]chan acpReply{}, inbound: map[string]context.CancelFunc{}, closed: make(chan struct{}), onNotify: onNotify, onRequest: onRequest}
 	go c.read()
 	return c, nil
 }
@@ -57,6 +58,9 @@ func (c *acpConn) read() {
 			ch <- acpReply{err: &rpcError{-32000, "upstream closed"}}
 		}
 		c.pending = map[string]chan acpReply{}
+		for _, cancel := range c.inbound {
+			cancel()
+		}
 		c.mu.Unlock()
 		close(c.closed)
 	}()
@@ -77,8 +81,28 @@ func (c *acpConn) read() {
 		}
 		switch {
 		case m.Method != "" && len(m.ID) > 0:
+			ctx, cancel := context.WithCancel(context.Background())
+			key := string(m.ID)
+			c.mu.Lock()
+			if _, exists := c.inbound[key]; exists {
+				c.mu.Unlock()
+				cancel()
+				_ = c.write(map[string]any{"jsonrpc": "2.0", "id": m.ID, "error": &rpcError{-32600, "duplicate request id"}})
+				continue
+			}
+			c.inbound[key] = cancel
+			c.mu.Unlock()
 			go func() {
-				result, rpcErr := c.onRequest(m.Method, m.Params)
+				defer func() {
+					c.mu.Lock()
+					delete(c.inbound, key)
+					c.mu.Unlock()
+					cancel()
+				}()
+				result, rpcErr := c.onRequest(ctx, m.Method, m.Params)
+				if ctx.Err() != nil {
+					rpcErr = &rpcError{-32800, "request cancelled"}
+				}
 				resp := map[string]any{"jsonrpc": "2.0", "id": m.ID}
 				if rpcErr != nil {
 					resp["error"] = rpcErr
@@ -87,6 +111,18 @@ func (c *acpConn) read() {
 				}
 				_ = c.write(resp)
 			}()
+		case m.Method == "$/cancel_request":
+			var params struct {
+				RequestID json.RawMessage `json:"requestId"`
+			}
+			if json.Unmarshal(m.Params, &params) == nil {
+				c.mu.Lock()
+				cancel := c.inbound[string(params.RequestID)]
+				c.mu.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+			}
 		case m.Method != "":
 			c.onNotify(m.Method, m.Params)
 		default:
