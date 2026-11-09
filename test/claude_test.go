@@ -1368,6 +1368,69 @@ func TestClaudeChatResumesItsAgentSession(t *testing.T) {
 	})
 }
 
+func TestClaudeLiveChatReconnectsAnAlreadyClosedIdleUpstream(t *testing.T) {
+	up := newAgentUpstream(t)
+	up.loadSession = true
+	firstConnection := make(chan *acpConvo, 1)
+	up.scenario = func(s *acpConvo, text string) {
+		if text == "first" {
+			firstConnection <- s
+		}
+		s.text("reply to " + text)
+	}
+	client, _ := startClaude(t, &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Chats: t.TempDir()})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	b.call("process.spawn", claudeSpawn("proc-1", "11111111-2222-4333-8444-555555555555"))
+	cli := &cliReader{b: b, id: "proc-1"}
+	send := func(text string) map[string]any {
+		b.stdin_("proc-1", `{"type":"user","uuid":`+strconv.Quote(text)+`,"message":{"role":"user","content":`+strconv.Quote(text)+`}}`+"\n")
+		return cli.expect("result", "")
+	}
+	if result := send("first"); result["is_error"] != false {
+		t.Fatalf("initial turn failed: %v", result)
+	}
+	// The app and its stand-in remain alive. Complete the close handshake
+	// while idle, then require the very next unsent prompt to load the session.
+	connection := <-firstConnection
+	_ = connection.conn.Close(websocket.StatusGoingAway, "Worker restart")
+	if result := send("second"); result["is_error"] != false || result["result"] != "reply to second" {
+		t.Fatalf("first message after idle disconnect failed: %v", result)
+	}
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if up.news != 1 || strings.Join(up.loads, ",") != "sess-1" || strings.Join(up.prompts, ",") != "first,second" {
+		t.Fatalf("session identity or delivery changed: new=%d load=%v prompts=%v", up.news, up.loads, up.prompts)
+	}
+}
+
+func TestClaudeDoesNotReplayAPromptLostInFlight(t *testing.T) {
+	up := newAgentUpstream(t)
+	up.loadSession = true
+	up.scenario = func(s *acpConvo, text string) {
+		if text == "interrupted" {
+			_ = s.conn.CloseNow()
+			return
+		}
+		s.text("reply to " + text)
+	}
+	client, _ := startClaude(t, &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Chats: t.TempDir()})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	b.call("process.spawn", claudeSpawn("proc-1", "11111111-2222-4333-8444-555555555555"))
+	cli := &cliReader{b: b, id: "proc-1"}
+	for _, text := range []string{"interrupted", "next"} {
+		b.stdin_("proc-1", `{"type":"user","uuid":`+strconv.Quote(text)+`,"message":{"role":"user","content":`+strconv.Quote(text)+`}}`+"\n")
+		result := cli.expect("result", "")
+		if result["is_error"] != (text == "interrupted") {
+			t.Fatalf("unexpected result for %s: %v", text, result)
+		}
+	}
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if strings.Join(up.prompts, ",") != "interrupted,next" || up.news != 1 || strings.Join(up.loads, ",") != "sess-1" {
+		t.Fatalf("in-flight request was replayed or session replaced: prompts=%v new=%d load=%v", up.prompts, up.news, up.loads)
+	}
+}
+
 // shRun runs `sh -c script` through the bridge and returns its stdout and
 // exit code.
 func shRun(t *testing.T, b *bridge, id, script string) (string, int) {

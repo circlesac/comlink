@@ -253,10 +253,19 @@ func (c *cli) loop() {
 func (c *cli) connect() error {
 	c.mu.Lock()
 	acp := c.acp
-	c.mu.Unlock()
 	if acp != nil {
-		return nil
+		select {
+		case <-acp.closed:
+			// An idle connection can close while the app and stand-in live.
+			// Reopen it before submitting this new prompt, retaining the saved
+			// session. Requests already sent are never replayed here.
+			c.acp, c.acpSession = nil, ""
+		default:
+			c.mu.Unlock()
+			return nil
+		}
 	}
+	c.mu.Unlock()
 	token, err := c.route.Credential.Bearer()
 	if err != nil {
 		return err
