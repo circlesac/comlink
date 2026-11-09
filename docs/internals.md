@@ -540,3 +540,9 @@ commands with the latest stable Go, fails on a known vulnerability in code comli
 (`govulncheck`), and builds and runs `--help` and `--version` on every released platform. CI uses
 GitHub-hosted runners; GitHub offers its Arm Linux and Windows runners to public repositories only,
 so a private copy of the repository smoke-tests the other four platforms.
+
+### Upstream permission cancellation
+
+The Claude ACP connection tracks a context for each incoming server request. An upstream `$/cancel_request` cancels only the matching request, and closing the connection cancels all remaining incoming requests. A cancelled permission emits Claude Code's `control_cancel_request` with the app control request's original ID, removes that pending control and returns a cancellation error upstream. A late app approval cannot become a successful upstream response. Ordinary resolved approvals do not emit cancellation.
+
+`TestClaudeApprovalCancelledByUpstream` drives the real SSH/helper/stream-json boundary, observes the matching cancellation control, sends a late allow and completes another turn. Suppressing the cancellation control makes it fail; restoring it passes. The actual Linux Claude app also dismisses a pending permission after upstream cancellation and completes following work with the rebuilt adapter.

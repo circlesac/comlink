@@ -1440,3 +1440,45 @@ func TestClaudeChatTranscriptSurvivesTheProcess(t *testing.T) {
 		t.Fatalf("other upstream found %q (exit %d)", out, code)
 	}
 }
+
+func TestClaudeApprovalCancelledByUpstream(t *testing.T) {
+	up := newAgentUpstream(t)
+	ready := make(chan *acpConvo, 1)
+	outcomes := make(chan string, 1)
+	up.scenario = func(s *acpConvo, prompt string) {
+		if prompt == "approval" {
+			s.update(map[string]any{"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "Write a file", "kind": "edit", "status": "pending"})
+			ready <- s
+			outcomes <- s.askPermission("Write a file", "allow_once", "reject_once")
+			s.text("cancelled approval")
+			return
+		}
+		s.text("following work")
+	}
+	client, _ := startClaude(t, &claude.Route{Upstream: up.wsURL(), Credential: upstream.Credential{Token: testToken}, Version: "test"})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	b.call("process.spawn", claudeSpawn("cancel-proc", "11111111-2222-4333-8444-555555555555"))
+	reader := &cliReader{b: b, id: "cancel-proc"}
+	b.stdin_("cancel-proc", `{"type":"user","uuid":"cancel-user","message":{"role":"user","content":[{"type":"text","text":"approval"}]}}`+"\n")
+	permission := reader.expect("control_request", "")
+	convo := <-ready
+	convo.mu.Lock()
+	requestID := fmt.Sprintf("up-%d", convo.next)
+	convo.mu.Unlock()
+	convo.write(map[string]any{"jsonrpc": "2.0", "method": "$/cancel_request", "params": map[string]any{"requestId": requestID}})
+	cancelled := reader.expect("control_cancel_request", "")
+	if cancelled["request_id"] != permission["request_id"] {
+		t.Fatalf("cancelled another app approval: %v, expected %v", cancelled, permission)
+	}
+	// A late app approval must not become an upstream allow or block the next turn.
+	b.stdin_("cancel-proc", `{"type":"control_response","response":{"subtype":"success","request_id":"`+permission["request_id"].(string)+`","response":{"behavior":"allow"}}}`+"\n")
+	if got := <-outcomes; got == "allow_once" {
+		t.Fatal("late app approval was accepted after upstream cancellation")
+	}
+	reader.expect("result", "")
+	b.stdin_("cancel-proc", `{"type":"user","uuid":"following-user","message":{"role":"user","content":[{"type":"text","text":"next"}]}}`+"\n")
+	if result := reader.expect("result", ""); result["result"] != "following work" {
+		t.Fatalf("following work failed: %v", result)
+	}
+	b.call("process.killAndWait", map[string]any{"id": "cancel-proc"})
+}
