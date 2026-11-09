@@ -215,13 +215,18 @@ func (b *bridge) reply(id json.RawMessage, result any, rpcErr *rpcError) error {
 	if len(id) == 0 {
 		id = json.RawMessage("null")
 	}
-	if rpcErr != nil {
-		return b.writeLine(map[string]any{"jsonrpc": "2.0", "id": id, "error": rpcErr})
-	}
-	if result == nil {
+	if result == nil && rpcErr == nil {
 		result = map[string]any{}
 	}
-	return b.writeLine(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	// The desktop reattach handshake locates replies by the literal
+	// {"jsonrpc":"2.0","id": prefix before parsing them. A map sorts id
+	// first and makes a valid capabilities reply invisible to that parser.
+	return b.writeLine(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  any             `json:"result,omitempty"`
+		Error   *rpcError       `json:"error,omitempty"`
+	}{"2.0", id, result, rpcErr})
 }
 
 // stream writes one process record.

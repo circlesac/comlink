@@ -304,6 +304,29 @@ func openBridge(t *testing.T, client *ssh.Client, exec, last string) *bridge {
 	return b
 }
 
+// The actual desktop app's reattach parser searches for this literal prefix
+// before parsing JSON. Valid JSON with id before jsonrpc is ignored until its
+// bridge startup timeout, even though the initial connection accepts it.
+func TestClaudeReattachReplyPrefix(t *testing.T) {
+	client, _ := startClaude(t, &claude.Route{})
+	b := openBridge(t, client, readFixture(t, "claude-app-bridge.txt"), "")
+	for _, method := range []string{"server.capabilities", "unknown.method"} {
+		id := "reattach-example-nonce-0"
+		request, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "auth": "example-token"})
+		if _, err := b.stdin.Write(append(request, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		line := b.line()
+		prefix := `{"jsonrpc":"2.0","id":"` + id + `"`
+		if !strings.HasPrefix(line, prefix) {
+			t.Fatalf("desktop reattach parser cannot recognize %s reply: %s", method, line)
+		}
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("invalid JSON reply: %s", line)
+		}
+	}
+}
+
 // line reads one output line without its newline; it fails the test after
 // 10 seconds.
 func (b *bridge) line() string {
