@@ -5,6 +5,7 @@
 package sshd
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -28,6 +29,13 @@ type SubsystemRoute interface {
 	Subsystem(name string) (handler func(ssh.Channel) int, ok bool)
 }
 
+// DirectRoute optionally serves a client-requested direct TCP channel. The
+// route authorizes the destination; sshd never opens an arbitrary socket.
+type DirectRoute interface {
+	Route
+	DirectTCPIP(context.Context, string, uint32) (func(ssh.Channel), bool)
+}
+
 // Serve speaks the server side of SSH on conn for one connection and returns
 // when the client disconnects. No client authentication is performed: the
 // transport is the user's own ProxyCommand process, not a network listener.
@@ -42,9 +50,39 @@ func Serve(conn net.Conn, hostKey ssh.Signer, route Route) error {
 	defer func() { _ = sconn.Close() }()
 
 	go handleGlobalRequests(reqs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var wg sync.WaitGroup
 	for newCh := range chans {
+		if newCh.ChannelType() == "direct-tcpip" {
+			var target struct {
+				Host       string
+				Port       uint32
+				Origin     string
+				OriginPort uint32
+			}
+			forward, ok := route.(DirectRoute)
+			if ssh.Unmarshal(newCh.ExtraData(), &target) != nil || !ok {
+				_ = newCh.Reject(ssh.Prohibited, "forwarding is unavailable")
+				continue
+			}
+			handler, allowed := forward.DirectTCPIP(ctx, target.Host, target.Port)
+			if !allowed {
+				_ = newCh.Reject(ssh.Prohibited, "destination is not permitted")
+				continue
+			}
+			ch, requests, err := newCh.Accept()
+			if err != nil {
+				continue
+			}
+			wg.Go(func() {
+				defer func() { _ = ch.Close() }()
+				go ssh.DiscardRequests(requests)
+				handler(ch)
+			})
+			continue
+		}
 		if newCh.ChannelType() != "session" {
 			_ = newCh.Reject(ssh.UnknownChannelType, "comlink only opens session channels")
 			continue
@@ -55,6 +93,7 @@ func Serve(conn net.Conn, hostKey ssh.Signer, route Route) error {
 		}
 		wg.Go(func() { handleSession(ch, chReqs, route) })
 	}
+	cancel()
 	wg.Wait()
 	return nil
 }
