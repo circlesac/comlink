@@ -47,7 +47,12 @@ func Endpoint(server, protocol string) (string, error) {
 // ReadLimit. An error names the upstream without its query or userinfo and
 // never carries the header.
 func Dial(rawURL, token string) (*websocket.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return DialContext(context.Background(), rawURL, token)
+}
+
+// DialContext also ends a pending dial when its owning SSH connection closes.
+func DialContext(parent context.Context, rawURL, token string) (*websocket.Conn, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	var header http.Header
 	if token != "" {

@@ -207,6 +207,8 @@ contracts in [AGENTS.md](AGENTS.md); the session files, the ssh config
 handling and the Claude bridge in detail are in
 [docs/internals.md](docs/internals.md).
 
+Browser sign-in over a Codex SSH connection also requires the server’s callback-forwarding endpoint. comlink relays the app’s local callback on port 1455; other destinations are refused. No additional flag or local service is required.
+
 ## Development
 
 ```sh

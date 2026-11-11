@@ -9,7 +9,7 @@ comlink is a front door that relays coding-agent clients to WebSocket agent endp
 - Commands are matched against what the client actually sends. Keep the captured commands under `test/testdata/` as the fixtures the tests run against, and refresh them from a real client when it changes (see `docs/internals.md`).
 - `README.md` is for users: install, each client's setup, tokens, where files are, what to do when something fails. Design detail that a user does not need (session files and locking, the ssh config scan, how each app's connection is served, the fixtures procedure, what each test file covers) goes to `docs/internals.md`; the contracts stay here.
 - An unrecognised command is logged to stderr and exits 127. It is never run.
-- The upstream token is a secret: never print it, log it, or put it in an error. Read it from a file, the environment or the stdout of `--token-command`. A token command runs when comlink dials (for the Codex route only in the relay, for the Claude route only when a chat's first message dials, never for the probe, version or setup commands), in the working directory and with the `PATH` comlink was started with, in a process group that a 30 s timeout kills whole; a session stores the command with that directory and `PATH` (`run/NAME.token-command`, JSON), never its output.
+- The upstream token is a secret: never print it, log it, or put it in an error. Read it from a file, the environment or the stdout of `--token-command`. A token command runs when comlink dials (for the Codex route only in a relay or callback-forward request, for the Claude route only when a chat's first message dials, never for the probe, version or setup commands), in the working directory and with the `PATH` comlink was started with, in a process group that a 30 s timeout kills whole; a session stores the command with that directory and `PATH` (`run/NAME.token-command`, JSON), never its output.
 
 ## Codex desktop app contract (ChatGPT.app 26.1023, Codex 0.165.0-alpha)
 
@@ -23,6 +23,7 @@ Verified 2026-10-28 by recording an SSH host the app connected to:
   - app-server bootstrap (contains `CODEX_SSH_SKIP_APP_SERVER_BOOT` / `app-server --listen`) → exit 0.
   - `pkill ... app-server ... --listen` → exit 0.
   - a payload ending in `exec codex app-server proxy` (possibly preceded by a remote-forward listener check and an ssh-agent symlink) → write the marker, then relay. On this route the client speaks WebSocket (HTTP Upgrade to `ws://codex-app-server/rpc`, then JSON-RPC text frames) over the channel; terminate that WebSocket locally and relay each message to the upstream WebSocket with `Authorization: Bearer <token>`.
+- Browser sign-in creates another SSH connection with `-N -L 1455:127.0.0.1:1455`. Its `direct-tcpip` channel is accepted only for `127.0.0.1`, `localhost` or `::1` on port 1455. The route forwards one HTTP GET through the authenticated `<server>/codex/forward` WebSocket; it never dials the requested socket locally. The endpoint owns login/actor/path authorization. Other destinations remain refused.
 - `subsystem sftp`, `shell` and `pty-req` are refused.
 
 ## Claude desktop app contract (Claude.app 4.4212.0, claude-ssh b3081b512da230f24d74a2082a678246a89685ee, Claude Code 2.1.317)
@@ -47,7 +48,7 @@ Verified 2026-11-05 by recording an SSH host the app connected to (a logging ssh
 
 ## comlink server contract
 
-- A comlink server is one base URL (`ws://` or `wss://`, optionally with a path prefix) that serves the Codex app-server protocol at `<server>/codex` and ACP at `<server>/acp`, each a WebSocket with `Authorization: Bearer <token>`. The paths are joined onto the base whether or not it has a trailing slash or its own prefix (`wss://h/x/` and `wss://h/x` both give `wss://h/x/codex`). A server that supports only one protocol rejects the other when a client uses it; there are no flags to choose protocols.
+- A comlink server is one base URL (`ws://` or `wss://`, optionally with a path prefix) that serves the Codex app-server protocol at `<server>/codex` and ACP at `<server>/acp`, each a WebSocket with `Authorization: Bearer <token>`. Codex browser callbacks use `<server>/codex/forward` with the same authentication and the transient HTTP contract in `docs/internals.md`. The paths are joined onto the base whether or not it has a trailing slash or its own prefix (`wss://h/x/` and `wss://h/x` both give `wss://h/x/codex`). A server that supports only one protocol rejects the other when a client uses it; there are no flags to choose protocols.
 
 ## Sessions (`comlink codex`, `comlink claude`)
 

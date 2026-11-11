@@ -58,10 +58,15 @@ func LoadCredential(file, command string, logger *log.Logger) (Credential, error
 // is an error, so a broken helper never dials without a token. Errors never
 // carry the output.
 func (c Credential) Bearer() (string, error) {
+	return c.BearerContext(context.Background())
+}
+
+// BearerContext lets a relay owner cancel a credential command on disconnect.
+func (c Credential) BearerContext(parent context.Context) (string, error) {
 	if c.Command == "" {
 		return c.Token, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), TokenCommandTimeout)
+	ctx, cancel := context.WithTimeout(parent, TokenCommandTimeout)
 	defer cancel()
 	cmd := shellCommand(ctx, c.Command)
 	// A grandchild that keeps stdout open would otherwise hold Run past the timeout.
@@ -75,6 +80,8 @@ func (c Credential) Bearer() (string, error) {
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	switch {
+	case errors.Is(parent.Err(), context.Canceled):
+		return "", errors.New("token command cancelled")
 	case ctx.Err() != nil:
 		return "", fmt.Errorf("token command timed out after %s", TokenCommandTimeout)
 	case err != nil:

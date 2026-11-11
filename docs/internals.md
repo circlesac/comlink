@@ -540,3 +540,14 @@ commands with the latest stable Go, fails on a known vulnerability in code comli
 (`govulncheck`), and builds and runs `--help` and `--version` on every released platform. CI uses
 GitHub-hosted runners; GitHub offers its Arm Linux and Windows runners to public repositories only,
 so a private copy of the repository smoke-tests the other four platforms.
+
+
+## Codex browser callback forwarding
+
+The packaged Linux Codex app creates a separate SSH local forward for browser sign-in: `-N -L 1455:127.0.0.1:1455`, with its ordinary batch/connection lifetime options. `sshd` offers direct TCP channels only to a route implementing `DirectRoute`. The Codex route authorizes only loopback names on port 1455; other routes and destinations remain refused. There is no local socket dial, shell command or general network proxy.
+
+Each accepted channel reads one origin-form HTTP GET, without a body, under a 32 KiB input limit and a sixty-second connection-owned deadline. It sends a text frame `{host,port,path}` to the route's upstream URL with `/forward` appended, resolving the normal credential only for that request. `path` is the original request URI, including the one-time query. OAuth codes/state never become upstream URL query parameters or diagnostics. The endpoint must authorize the destination, current login, native process and path; comlink implements only the HTTP transport.
+
+A successful response is one text frame `{status,headers,bodyBase64}`. Status must be 200 through 599, decoded body at most 1 MiB and each header value at most 8 KiB without CR/LF. Only content-type, location, cache-control, content-security-policy and x-content-type-options are forwarded. The WebSocket response limit is 2 MiB; malformed/trailing JSON, binary frames and forbidden headers fail as HTTP 502. Redirects go back to the browser; comlink does not follow them. The HTTP connection closes after the response and carries `Cache-Control: no-store`. Parent SSH disconnect cancels a pending credential command or upstream dial/read.
+
+`test/forward_test.go` drives real SSH direct channels, checks authenticated prefix-preserving endpoint selection, exact URI/body/redirect transfer, refused destinations, malformed replies and disconnect cleanup. Its binary case compiles comlink and runs system OpenSSH with `-W 127.0.0.1:1455`, exercising the same direct channel used by the app's `-L` listener, including stdin EOF before the response. These tests use a stand-in forwarding endpoint; the agent endpoint owns native login/callback verification.
